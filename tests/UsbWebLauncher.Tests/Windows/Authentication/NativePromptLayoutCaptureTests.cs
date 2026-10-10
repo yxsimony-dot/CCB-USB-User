@@ -1,10 +1,17 @@
 using System.Runtime.InteropServices;
+using System.Diagnostics;
+using UsbWebLauncher.Core.Configuration;
 using UsbWebLauncher.Windows.Authentication.NativePrompt;
+using Xunit.Abstractions;
 
 namespace UsbWebLauncher.Tests.Windows.Authentication;
 
 public sealed class NativePromptLayoutCaptureTests
 {
+    private readonly ITestOutputHelper output;
+
+    public NativePromptLayoutCaptureTests(ITestOutputHelper output) => this.output = output;
+
     [Theory]
     [InlineData("网银盾验证密码", true, 1, false, true)]
     [InlineData("网银盾验证密码", true, 1, true, true)]
@@ -35,7 +42,7 @@ public sealed class NativePromptLayoutCaptureTests
                 Assert.True(snapshot.UsesDialogEnterSubmit);
                 Assert.Equal(IntPtr.Zero, snapshot.SubmitControlHandle);
                 Assert.Equal(0, snapshot.SubmitControlId);
-                Assert.True(NativePromptWindowMatcher.IsMatch(policy, snapshot, Environment.ProcessId));
+                AssertCapturedLayoutMatch(policy, snapshot, title, expected: true);
                 Assert.False(new WindowsNativePromptApi().IsSubmitControlReady(snapshot));
             }
             else Assert.Null(snapshot);
@@ -65,6 +72,7 @@ public sealed class NativePromptLayoutCaptureTests
                 Assert.NotNull(snapshot);
                 Assert.False(snapshot.UsesDialogEnterSubmit);
                 Assert.NotEqual(IntPtr.Zero, snapshot.SubmitControlHandle);
+                AssertCapturedLayoutMatch(policy, snapshot, "网银盾验证密码", expected: true);
             }
             else Assert.Null(snapshot);
         }
@@ -117,7 +125,7 @@ public sealed class NativePromptLayoutCaptureTests
 
             Assert.Equal(inputId, snapshot.InputControlId);
             Assert.Equal(submitId, snapshot.SubmitControlId);
-            Assert.Equal(expectedMatch, NativePromptWindowMatcher.IsMatch(policy, snapshot, Environment.ProcessId));
+            AssertCapturedLayoutMatch(policy, snapshot, title, expectedMatch);
             var fresh = new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId);
             Assert.NotNull(fresh);
             Assert.True(NativePromptWindowMatcher.HasSameIdentity(policy, snapshot, fresh!));
@@ -131,6 +139,29 @@ public sealed class NativePromptLayoutCaptureTests
         {
             DestroyWindow(dialog);
         }
+    }
+
+    private void AssertCapturedLayoutMatch(ClientCertificateNativePromptOptions policy,
+        NativePromptWindowSnapshot snapshot, string title, bool expected)
+    {
+        Assert.Equal(title, snapshot.WindowTitle);
+        Assert.Equal(Environment.ProcessId, snapshot.ProcessId);
+        using var process = Process.GetCurrentProcess();
+        Assert.Equal(process.SessionId, snapshot.ProcessSessionId);
+        Assert.Equal(process.SessionId, snapshot.CurrentInteractiveSessionId);
+        Assert.Equal(snapshot.CurrentUserSid, snapshot.ProcessOwnerSid);
+        Assert.True(snapshot.IntegrityRid > 0);
+        output.WriteLine($"Captured test process integrity: 0x{snapshot.IntegrityRid:X}; session: {process.SessionId}");
+
+        // Hosted Windows runners are elevated; the production matcher correctly refuses
+        // their real high-integrity windows. Test the captured layout under the explicit
+        // medium-integrity client fixture as well, without relaxing the production gate.
+        Assert.Equal(expected && snapshot.IntegrityRid == NativePromptWindowMatcher.MediumIntegrityRid,
+            NativePromptWindowMatcher.IsMatch(policy, snapshot, Environment.ProcessId));
+        Assert.Equal(expected, NativePromptWindowMatcher.IsMatch(policy,
+            snapshot with { IntegrityRid = NativePromptWindowMatcher.MediumIntegrityRid }, Environment.ProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(policy,
+            snapshot with { IntegrityRid = NativePromptWindowMatcher.HighIntegrityRid }, Environment.ProcessId));
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]

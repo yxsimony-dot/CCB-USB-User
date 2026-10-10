@@ -43,7 +43,7 @@ MM-公司全名-建行账号后4位-回单.pdf
 - 建行官方 E 路护航及对应 Key 驱动、浏览器认证组件；本项目不能替代银行官方组件。
 - 自包含发布目录携带 .NET 运行时，使用者无需另装 .NET SDK。
 
-当前从发布目录运行的步骤：
+普通用户使用安装包并按 [安装与升级](docs/installation.md) 操作。开发者从自包含发布目录运行时：
 
 1. 安装 WebView2 和银行官方组件，确认银行工具能识别自己的 Key。
 2. 以普通用户身份运行 `UsbWebLauncher.App.exe`，保留完整发布目录及 `broker` 子目录。
@@ -53,7 +53,7 @@ MM-公司全名-建行账号后4位-回单.pdf
 
 本机认证代理安装在 `%ProgramFiles%\UsbWebLauncher\NativePromptBroker`，计划任务绑定安装时的交互用户。当前不承诺多个 Windows 用户可同时独立使用该代理。主程序及 WebView2 使用普通用户权限，代理安装需要管理员确认。
 
-代理校验调用程序的最终路径和文件哈希。**更新或移动应用目录后，应在新版本重新点击“安装环境”刷新绑定。** PIN 不随发布目录转移；其他电脑或其他 Windows 用户需要自行设置。目录设置及浏览器临时数据位于当前用户的 `%LOCALAPPDATA%\UsbWebLauncher` 下。
+代理校验调用程序的最终路径和文件哈希。完整安装器会刷新代理绑定；开发者手动更新或移动发布目录后，应在新版本重新点击“安装环境”刷新绑定。PIN 不随发布目录转移；其他电脑或其他 Windows 用户需要自行设置。目录设置及浏览器临时数据位于当前用户的 `%LOCALAPPDATA%\UsbWebLauncher` 下。
 
 需要移除本机代理时，使用“安装环境”旁菜单中的卸载入口。删除 PIN 使用“设置 PIN”旁的删除入口；卸载代理不会代替删除用户凭据。
 
@@ -99,4 +99,4 @@ dotnet publish src/UsbWebLauncher.NativePromptBroker/UsbWebLauncher.NativePrompt
 - `docs`：历史设计与验证记录，其中旧认证策略、个人开发路径和当时的部署状态不代表当前版本。
 - `artifacts`：本地构建、测试和诊断产物，不作为源码提交。
 
-[安装包与升级支持变更](openspec/changes/package-windows-installer-with-upgrade-support/) 记录统一版本号、稳定安装标识、保留用户设置的覆盖升级、升级后的代理重新绑定，以及未来 GitHub Releases 更新清单。当前没有自动更新器；尚未实测的目标机器场景在变更验证记录中单独列出。
+[安装包与升级支持变更](openspec/changes/package-windows-installer-with-upgrade-support/) 记录统一版本号、稳定安装标识、保留用户设置的覆盖升级和升级后的代理重新绑定。[客户端更新变更](openspec/changes/add-github-client-updates/) 接入 GitHub Releases、应用内更新和 main 自动发布；已验证项目及尚未实测的目标机器场景见 [更新验证记录](docs/update-validation.md)。
