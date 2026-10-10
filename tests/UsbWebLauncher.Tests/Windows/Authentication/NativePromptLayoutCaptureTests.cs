@@ -1,0 +1,146 @@
+using System.Runtime.InteropServices;
+using UsbWebLauncher.Windows.Authentication.NativePrompt;
+
+namespace UsbWebLauncher.Tests.Windows.Authentication;
+
+public sealed class NativePromptLayoutCaptureTests
+{
+    [Theory]
+    [InlineData("网银盾验证密码", true, 1, false, true)]
+    [InlineData("网银盾验证密码", true, 1, true, true)]
+    [InlineData("网银盾验证密码", true, 2, false, false)]
+    [InlineData("网银盾验证密码", false, 1, false, false)]
+    [InlineData("", true, 1, false, false)]
+    [InlineData("保存文件", true, 1, false, false)]
+    public void Capture_PasswordEditWithoutVisibleButtons_RequiresTitledUniquePassword(
+        string title, bool password, int inputCount, bool hiddenKeyboardButton, bool expected)
+    {
+        var dialog = CreateWindowExW(0x08000000, "#32770", title, 0x10000000,
+            -32000, -32000, 200, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        Assert.NotEqual(IntPtr.Zero, dialog);
+        try
+        {
+            for (var index = 0; index < inputCount; index++)
+                Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Edit", "", 0x50000000u | (password ? 0x20u : 0u),
+                    0, index * 25, 80, 20, dialog, new IntPtr(1000 + index), IntPtr.Zero, IntPtr.Zero));
+            if (hiddenKeyboardButton)
+                Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Button", "软键盘", 0x40000000,
+                    0, 50, 80, 20, dialog, new IntPtr(2000), IntPtr.Zero, IntPtr.Zero));
+            var policy = NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy() with
+            { ProcessFileName = Path.GetFileName(Environment.ProcessPath) };
+            var snapshot = new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId);
+            if (expected)
+            {
+                Assert.NotNull(snapshot);
+                Assert.True(snapshot.UsesDialogEnterSubmit);
+                Assert.Equal(IntPtr.Zero, snapshot.SubmitControlHandle);
+                Assert.Equal(0, snapshot.SubmitControlId);
+                Assert.True(NativePromptWindowMatcher.IsMatch(policy, snapshot, Environment.ProcessId));
+                Assert.False(new WindowsNativePromptApi().IsSubmitControlReady(snapshot));
+            }
+            else Assert.Null(snapshot);
+        }
+        finally { DestroyWindow(dialog); }
+    }
+
+    [Theory]
+    [InlineData("确认", true)]
+    [InlineData("软键盘", false)]
+    public void Capture_VisibleButtonUsesStandardSubmitOrPreventsEnterFallback(string caption, bool expected)
+    {
+        var dialog = CreateWindowExW(0x08000000, "#32770", "网银盾验证密码", 0x10000000,
+            -32000, -32000, 200, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        Assert.NotEqual(IntPtr.Zero, dialog);
+        try
+        {
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Edit", "", 0x50000020,
+                0, 0, 80, 20, dialog, new IntPtr(10005), IntPtr.Zero, IntPtr.Zero));
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Button", caption, 0x50000000,
+                0, 25, 80, 20, dialog, new IntPtr(1), IntPtr.Zero, IntPtr.Zero));
+            var policy = NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy() with
+            { ProcessFileName = Path.GetFileName(Environment.ProcessPath) };
+            var snapshot = new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId);
+            if (expected)
+            {
+                Assert.NotNull(snapshot);
+                Assert.False(snapshot.UsesDialogEnterSubmit);
+                Assert.NotEqual(IntPtr.Zero, snapshot.SubmitControlHandle);
+            }
+            else Assert.Null(snapshot);
+        }
+        finally { DestroyWindow(dialog); }
+    }
+
+    [Theory]
+    [InlineData(false, "", "确  定", 1010, 1, 1, true)]
+    [InlineData(false, "", "确  定", 2222, 88, 1, true)]
+    [InlineData(false, "验证网银盾密码", "确  认", 2222, 88, 0, true)]
+    [InlineData(false, "", "确  定", 1010, 1, 0, false)]
+    [InlineData(false, "", "确  定", 1010, 1, 2, false)]
+    [InlineData(false, "保存文件", "确  定", 2222, 88, 1, false)]
+    [InlineData(false, "", "取消", 1010, 1, 1, false)]
+    [InlineData(true, "", "取消", 1010, 1, 1, false)]
+    [InlineData(true, "", "确  定", 2222, 88, 1, true)]
+    [InlineData(true, "验证网银盾密码", "确  定", 3743, 4000, 0, true)]
+    public void Capture_ObservedDialog_ValidatesLayoutBeforeAcceptingEmptyTitle(
+        bool configuredAlternative, string title, string buttonText, int inputId, int submitId,
+        int cancelCount, bool expectedMatch)
+    {
+        // Off-screen, non-activating test windows exercise the actual Win32 capture path.
+        // No PIN is read or sent, and the window is always destroyed on this same thread.
+        var dialog = CreateWindowExW(0x08000000, "#32770", title, 0x10000000,
+            -32000, -32000, 200, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        Assert.NotEqual(IntPtr.Zero, dialog);
+        try
+        {
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Edit", "", 0x50000000,
+                0, 0, 80, 20, dialog, new IntPtr(inputId), IntPtr.Zero, IntPtr.Zero));
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Button", buttonText, 0x50000000,
+                0, 25, 80, 20, dialog, new IntPtr(submitId), IntPtr.Zero, IntPtr.Zero));
+            for (var index = 0; index < cancelCount; index++)
+            {
+                Assert.NotEqual(IntPtr.Zero, CreateWindowExW(0, "Button", "取  消", 0x50000000,
+                    90, 25 + index * 25, 80, 20, dialog, new IntPtr(900 + index), IntPtr.Zero, IntPtr.Zero));
+            }
+            var policy = NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy() with
+            {
+                ProcessFileName = Path.GetFileName(Environment.ProcessPath),
+                InputControlId = configuredAlternative ? inputId : 3743,
+                SubmitControlId = configuredAlternative ? submitId : 4000
+            };
+            var snapshot = new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId);
+            if (snapshot is null)
+            {
+                Assert.False(expectedMatch);
+                return;
+            }
+
+            Assert.Equal(inputId, snapshot.InputControlId);
+            Assert.Equal(submitId, snapshot.SubmitControlId);
+            Assert.Equal(expectedMatch, NativePromptWindowMatcher.IsMatch(policy, snapshot, Environment.ProcessId));
+            var fresh = new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId);
+            Assert.NotNull(fresh);
+            Assert.True(NativePromptWindowMatcher.HasSameIdentity(policy, snapshot, fresh!));
+            if (expectedMatch && title.Length == 0)
+            {
+                Assert.True(DestroyWindow(GetDlgItem(dialog, 900)));
+                Assert.Null(new WindowsNativePromptApi().CaptureWindowSnapshot(dialog, policy, Environment.ProcessId));
+            }
+        }
+        finally
+        {
+            DestroyWindow(dialog);
+        }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowExW(uint exStyle, string className, string text, uint style,
+        int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDlgItem(IntPtr window, int controlId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyWindow(IntPtr window);
+}

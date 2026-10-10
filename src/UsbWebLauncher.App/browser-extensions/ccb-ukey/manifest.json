@@ -1,0 +1,33 @@
+{
+   "background": {
+      "persistent": true,
+      "scripts": [ "background.js" ]
+   },
+   "content_scripts": [ {
+      "all_frames": true,
+      "js": [ "content.js" ],
+      "matches": [ "*://*.ccb.com.cn/*", "*://*.ccb.com/*", "*://*.want.ccb.com/*", "*://*.ccb.cn/*", "*://*.cbmcscf.cn/*", "*://*.ccbscf.cn/*", "*://*.cbmcscf.com/*", "*://*.ccbscf.com/*", "http://testlb1.ccb.com/*", "https://wj.zfgjj.cn/*", "https://test.zfgjj.cn/*", "https://jdgc.ccb.com/*", "https://caizi.want.ccb.com/*", "https://bg.gjj.dl.gov.cn/*" ]
+   } ],
+   "default_locale": "zh_CN",
+   "description": "中国建设银行Ukey扩展",
+   "externally_connectable": {
+      "ids": [ "*" ],
+      "matches": [ "*://*.ccb.com.cn/*", "*://*.ccb.com/*", "*://*.want.ccb.com/*", "*://*.ccb.cn/*", "*://*.cbmcscf.cn/*", "*://*.ccbscf.cn/*", "*://*.cbmcscf.com/*", "*://*.ccbscf.com/*", "http://testlb1.ccb.com/*", "https://wj.zfgjj.cn/*", "https://test.zfgjj.cn/*", "https://jdgc.ccb.com/*", "https://caizi.want.ccb.com/*", "https://bg.gjj.dl.gov.cn/*" ]
+   },
+   "icons": {
+      "128": "icon-128.png",
+      "16": "icon-16.png",
+      "48": "icon-48.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5Q2XCcKExQ4pi2vmtOvHHeerDSh3FJvYLPIZXypeSxuPjMG+evrLCGD+zJ+D1sHR+AiRv+4v3QQKemUSQzrhBEH61/qEeaNQmSnafZDb43hQPlb4E4EoMPLzKgXuNG1xXqSXQjt/rEtcef4yq6E99+q70etthoJPLCY5EiezsZFtWF+y51OLq0+LlUX40PBZoNgd93nZzq2tBqYfn3E9fi1aq+1rqQFDdyLxJCH3LUjAToK0lyZGqHHogjmaDM5FNdnhHTG9mBX7xZ24KrZZP3iwAc9RL8+HAkpRRUH8KM3ByhR/Ukpqlf/YVRutcEyUyO3pgcgBQwQkjKqbbAqRWwIDAQAB",
+   "manifest_version": 2,
+   "name": "中国建设银行Ukey扩展",
+   "page_action": {
+      "default_icon": "icon-128.png",
+      "default_title": "中国建设银行Ukey扩展"
+   },
+   "permissions": [ "nativeMessaging" ],
+   "update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
+   "version": "1.0.0.9",
+   "web_accessible_resources": [ "icon-128.png" ]
+}

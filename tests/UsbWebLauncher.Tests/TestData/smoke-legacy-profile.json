@@ -1,0 +1,8 @@
+{
+  "targetUrl": "https://smoke.invalid/",
+  "usbDevice": {
+    "vendorId": "FFFE",
+    "productId": "FFFD",
+    "busReportedDescription": "UsbWebLauncher smoke device"
+  }
+}

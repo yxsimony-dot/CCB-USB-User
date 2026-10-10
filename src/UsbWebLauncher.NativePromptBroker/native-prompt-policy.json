@@ -1,0 +1,24 @@
+{
+  "ProtocolVersion": 1,
+  "PolicyHash": "8A988F8C8B6E69AC527E225814D61CAE64F1CDFC4A911E1EC51E98B3CC92F722",
+  "Prompt": {
+    "Enabled": true,
+    "BrokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
+    "PolicyId": "ccb-hdzb-client-certificate-v1",
+    "ProcessPath": "",
+    "ProcessSha256": "",
+    "PublisherCertificateThumbprint": "",
+    "WindowTitle": "验证通用盾密码",
+    "WindowClass": "#32770",
+    "RequiredChildWindowClasses": [],
+    "TimeoutMilliseconds": 30000,
+    "WindowScope": "TrustedClientTopLevel",
+    "ProcessFileName": "msedgewebview2.exe",
+    "TrustedRootWindowTitle": "",
+    "TrustedRootWindowClassPrefix": "",
+    "InputWindowClass": "Edit",
+    "InputControlId": 3743,
+    "SubmitWindowClass": "Button",
+    "SubmitControlId": 4000
+  }
+}

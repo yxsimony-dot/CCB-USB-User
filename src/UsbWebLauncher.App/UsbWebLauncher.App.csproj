@@ -1,0 +1,38 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4191.47" />
+    <ProjectReference Include="..\UsbWebLauncher.Core\UsbWebLauncher.Core.csproj" />
+    <ProjectReference Include="..\UsbWebLauncher.Windows\UsbWebLauncher.Windows.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Browser\CcbCertificateLogin.js" />
+    <EmbeddedResource Include="Browser\CcbPopupDiagnostics.js" />
+    <EmbeddedResource Include="Browser\CcbStatementDiagnostics.js" />
+    <EmbeddedResource Include="Browser\CcbStatementExport.js" />
+    <EmbeddedResource Include="Browser\CcbReceiptExport.js" />
+    <EmbeddedResource Include="Browser\CcbCurrentCompany.js" />
+    <EmbeddedResource Include="Browser\CcbKnownPopupDismiss.js" />
+    <EmbeddedResource Include="Browser\CcbKnownPopupBootstrap.js" />
+    <None Update="launcher-profile.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Update="browser-extensions\ccb-ukey\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,38 @@
+**/bin/
+**/obj/
+artifacts/
+*.WebView2/
+.worktrees/
+
+# Local build, editor and agent state
+.vs/
+.idea/
+.superpowers/
+node_modules/
+TestResults/
+coverage/
+*.user
+*.suo
+*.bak
+*.tmp
+*.log
+
+# Local handoff notes and runtime / bank data
+handoff/
+browser-sessions/
+download-settings.json
+*.pdf
+*.pfx
+*.p12
+*.key
+.env
+.env.*
+!.env.example
+
+# Generated installers, SDKs and signing inputs
+releases/
+dist/
+.tools/
+*.msi
+*.msix
+*.zip

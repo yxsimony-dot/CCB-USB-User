@@ -1,0 +1,52 @@
+{
+  "usbDetectionStrategy": "ccbUsbStor",
+  "targetUrl": "https://b2bbank.ccb.com/NCCB/MNECV6B2BMainPlat_UN?CCB_IBSVersion=V6&PT_LANGUAGE=CN&PT_STYLE=6&resType=jsp&TXCODE=N7N010&USERID=&i18n=true&LOGIN_TYPE=UC&dc=3",
+  "usbDevice": {
+    "vendorId": "1677",
+    "productId": "0054",
+    "busReportedDescription": "uKeyCI800-K156"
+  },
+  "additionalUsbDevices": [
+    {
+      "vendorId": "1780",
+      "productId": "0401",
+      "busReportedDescription": "Tendyron Token",
+      "cdRomName": "TENDYRON U-DISK USB Device",
+      "volumeLabel": "CCB",
+      "fileSystem": "CDFS"
+    }
+  ],
+  "clientCertificateAuthentication": {
+    "id": "ccb-client-certificate",
+    "host": "b2b3.ccb.com",
+    "port": 443,
+    "additionalEndpoints": [
+      {
+        "host": "xc.b2b3.ccb.com",
+        "port": 443
+      }
+    ],
+    "credentialTargetName": "UsbWebLauncher/ClientCertificate/ccb-client-certificate",
+    "nativePromptContinuation": {
+      "enabled": true,
+      "brokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
+      "policyId": "ccb-hdzb-client-certificate-v1",
+      "processPath": "",
+      "processSha256": "",
+      "publisherCertificateThumbprint": "",
+      "windowTitle": "验证通用盾密码",
+      "windowClass": "#32770",
+      "requiredChildWindowClasses": [],
+      "timeoutMilliseconds": 30000,
+      "windowScope": "TrustedClientTopLevel",
+      "processFileName": "msedgewebview2.exe",
+      "trustedRootWindowTitle": "",
+      "trustedRootWindowClassPrefix": "",
+      "inputWindowClass": "Edit",
+      "inputControlId": 3743,
+      "submitWindowClass": "Button",
+      "submitControlId": 4000
+    },
+    "authenticationMode": "BrowserNative"
+  }
+}
