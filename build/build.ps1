@@ -45,6 +45,7 @@ try {
     Run 'dotnet' @('test','UsbWebLauncher.sln','-c','Release','--no-restore','--filter','Category!=Hardware','--logger','trx','--results-directory',"$repo/artifacts/test-results")
     Run 'npm.cmd' @('test')
     Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/transaction.tests.ps1')
+    Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/install-directory.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-contract.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/version.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-entry.tests.ps1')

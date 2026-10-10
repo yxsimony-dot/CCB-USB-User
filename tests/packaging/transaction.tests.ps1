@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $module = Join-Path $PSScriptRoot '../../installer/Transaction.psm1'
 if (-not (Test-Path $module)) { throw 'FAIL: transaction module missing; rollback behavior is not implemented' }
 Import-Module $module -Force
@@ -10,7 +10,7 @@ function ExpectFailure([scriptblock]$action, [string]$pattern) {
 $root = Join-Path ([IO.Path]::GetTempPath()) ('uwl-test-' + [guid]::NewGuid())
 New-Item $root -ItemType Directory | Out-Null
 try {
-    $app = Join-Path $root 'app'; $payload = Join-Path $root 'payload'
+    $app = Join-Path $root 'custom app 名称'; $payload = Join-Path $root 'payload'
     New-Item $app,$payload -ItemType Directory | Out-Null
     Set-Content (Join-Path $app 'app.txt') 'old'
     Set-Content (Join-Path $app 'installed-version.json') '{"version":"1.0.0"}'

@@ -48,16 +48,12 @@ public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisp
     public double Progress { get; private set; }
     public string InstallationGuidance =>
         "1.0.0 没有更新入口，需要先手动安装一次支持更新的版本。安装器启动后本程序正常退出；若取消安装，可从原入口打开旧版重试。";
-    public string InstallationTargetNotice => GetInstallationTargetNotice(AppContext.BaseDirectory,
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+    public string InstallationTargetNotice => GetInstallationTargetNotice(AppContext.BaseDirectory);
 
-    public static string GetInstallationTargetNotice(string runningDirectory, string localApplicationData)
+    public static string GetInstallationTargetNotice(string runningDirectory)
     {
-        var target = Path.Combine(localApplicationData, "Programs", "UsbWebLauncher");
-        var development = !string.Equals(Path.GetFullPath(runningDirectory).TrimEnd(Path.DirectorySeparatorChar),
-            Path.GetFullPath(target).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
-        return (development ? "当前从开发或其他目录运行。更新不会覆盖此目录；安装目标：" : "安装目标：") + target +
-            "。沿用当前用户，保留 PIN、下载目录和已有 PDF。";
+        return "当前程序位置：" + Path.GetFullPath(runningDirectory).TrimEnd(Path.DirectorySeparatorChar) +
+            "。首次安装可在向导中选择安装位置；升级沿用已安装目录。保留 PIN、下载目录和已有 PDF。";
     }
 
     public static void LaunchInteractiveInstaller(string filePath)

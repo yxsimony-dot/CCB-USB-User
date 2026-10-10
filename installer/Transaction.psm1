@@ -38,7 +38,7 @@ function Remove-FinalizedTransaction([string]$AppDirectory) {
 function Assert-OwnedInstallation([string]$AppDirectory) {
     if (-not (Test-Path $AppDirectory)) { return }
     $files = @(Get-ChildItem -LiteralPath $AppDirectory -Recurse -File -Force)
-    if ($files.Count -eq 0) { return }
+    if (@(Get-ChildItem -LiteralPath $AppDirectory -Force).Count -eq 0) { return }
     if (-not (Test-Path "$AppDirectory/payload-manifest.json")) { throw 'Unowned installation directory: move its existing files elsewhere before installing' }
     $manifest = Get-Content "$AppDirectory/payload-manifest.json" -Raw | ConvertFrom-Json
     $owned = @($manifest.files | ForEach-Object { $_.path.Replace('/','\') }) + @('payload-manifest.json','installed-version.json')
@@ -183,4 +183,4 @@ function Complete-InstallTransaction([string]$AppDirectory, [scriptblock]$Commit
     }
     Remove-FinalizedTransaction $app
 }
-Export-ModuleMember -Function Invoke-InstallTransaction,Restore-InstallTransaction,Complete-InstallTransaction
+Export-ModuleMember -Function Invoke-InstallTransaction,Restore-InstallTransaction,Complete-InstallTransaction,Assert-TransactionPath,Assert-OwnedInstallation

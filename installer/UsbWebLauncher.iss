@@ -9,7 +9,7 @@ AppVerName=UsbWebLauncher {#ProductVersion}
 AppPublisher=UsbWebLauncher
 AppPublisherURL=https://github.com/yxsimony-dot/CCB-USB-User
 DefaultDirName={localappdata}\Programs\UsbWebLauncher
-DisableDirPage=yes
+DisableDirPage=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64os
@@ -25,11 +25,15 @@ SetupLogging=yes
 CloseApplications=no
 RestartApplications=no
 VersionInfoVersion={#FileVersion}
-UsePreviousAppDir=no
+UsePreviousAppDir=yes
 UsePreviousGroup=no
 DisableReadyMemo=no
 
 [Files]
+; Keep the small preflight helpers before the solid-compressed application payload.
+Source: "{#PayloadDirectory}\installer\Validate-InstallDirectory.ps1"; Flags: dontcopy
+Source: "{#PayloadDirectory}\installer\InstallDirectory.psm1"; Flags: dontcopy
+Source: "{#PayloadDirectory}\installer\Transaction.psm1"; Flags: dontcopy
 Source: "{#PayloadDirectory}\*"; DestDir: "{tmp}\payload"; Flags: dontcopy recursesubdirs createallsubdirs
 
 [Icons]
@@ -62,6 +66,11 @@ ButtonFinish=完成(&F)
 ClickNext=点击“下一步”继续，或点击“取消”退出。
 WelcomeLabel1=欢迎使用 [name] 安装向导
 WelcomeLabel2=即将在此电脑上安装 [name/ver]。%n%n请先正常关闭本应用。仅支持同一 Windows 用户在本机使用。
+WizardSelectDir=选择安装位置
+SelectDirDesc=您希望将 [name] 安装在哪里？
+SelectDirLabel3=请选择本机可写入的专用文件夹。点击“下一步”检查位置；点击“浏览”选择其他文件夹。
+SelectDirBrowseLabel=安装目录：
+ButtonBrowse=浏览(&B)...
 WizardReady=准备安装
 ReadyLabel1=现在可以开始安装 [name]。
 ReadyLabel2a=点击“安装”继续，或点击“上一步”查看设置。
@@ -85,6 +94,7 @@ UninstalledAll=%1 已卸载。个人数据已保留。
 [Code]
 var
   PayloadExtracted, TransactionStarted, TransactionCommitted: Boolean;
+  ExistingDirectory: String;
 
 function Quote(Value: String): String;
 begin
@@ -117,9 +127,64 @@ begin
     Result := Result + #13#10 + String(Text);
 end;
 
+function ValidateDirectory: Boolean;
+var
+  Params: String;
+  ExitCode: Integer;
+begin
+  Result := False;
+  if Pos('"', WizardDirValue) > 0 then begin
+    MsgBox('安装路径不能包含双引号。', mbError, MB_OK);
+    exit;
+  end;
+  ExtractTemporaryFile('Validate-InstallDirectory.ps1');
+  ExtractTemporaryFile('InstallDirectory.psm1');
+  ExtractTemporaryFile('Transaction.psm1');
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    Quote(ExpandConstant('{tmp}\Validate-InstallDirectory.ps1')) +
+    ' -AppDirectory ' + Quote(WizardDirValue) + ' -InstallerAppId {#InstallerAppId}';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+  Result := Result and (ExitCode = 0);
+  if not Result then MsgBox('此安装位置无法使用，请选择其他专用文件夹。' + #13#10 + FailureDetail, mbError, MB_OK);
+end;
+
+procedure InitializeWizard;
+var
+  LegacyDirectory: String;
+begin
+  ExistingDirectory := '';
+  RegQueryStringValue(HKCU64, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{' + '{#InstallerAppId}' + '}_is1', 'InstallLocation', ExistingDirectory);
+  if ExistingDirectory = '' then begin
+    RegQueryStringValue(HKCU64, 'Software\UsbWebLauncher\Installer', 'PendingInstallLocation', ExistingDirectory);
+    if (ExistingDirectory <> '') and not (DirExists(ExistingDirectory + '.transaction') or
+      FileExists(ExistingDirectory + '\payload-manifest.json') or FileExists(ExistingDirectory + '\installed-version.json')) then
+      ExistingDirectory := '';
+  end;
+  LegacyDirectory := ExpandConstant('{localappdata}\Programs\UsbWebLauncher');
+  if (ExistingDirectory = '') and (FileExists(LegacyDirectory + '\installed-version.json') or
+    FileExists(LegacyDirectory + '\payload-manifest.json') or DirExists(LegacyDirectory + '.transaction')) then
+    ExistingDirectory := LegacyDirectory;
+  if ExistingDirectory <> '' then begin
+    WizardForm.DirEdit.Text := ExistingDirectory;
+    WizardForm.DirEdit.ReadOnly := True;
+    WizardForm.DirBrowseButton.Enabled := False;
+    WizardForm.SelectDirLabel.Caption := '检测到现有或未完成安装，本次将在以下位置升级或恢复。若要更换位置，请先卸载，再重新安装；PIN、个人设置和已下载 PDF 会保留。';
+  end;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID = wpSelectDir then Result := ValidateDirectory;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  if not ValidateDirectory then begin
+    Result := '请返回选择可用的安装位置。';
+    exit;
+  end;
   if not PayloadExtracted then begin
     ExtractTemporaryFiles('{tmp}\payload\*');
     PayloadExtracted := True;

@@ -2,7 +2,7 @@
 
 面向建设银行企业网银的 Windows 桌面工具：检测 USB Key，在内嵌 WebView2 中启动网银、填写已保存的 PIN，并按所选月份导出流水和电子回单。
 
-本仓库保存源码、测试、安装包构建脚本及需求设计。Windows x64 安装包提供固定目录安装、环境准备和保留用户数据的覆盖升级；使用方法见 [安装与升级](docs/installation.md)，构建方法见 [构建说明](build/README.md)。main 推送通过完整测试与构建后自动发布到 GitHub Releases，客户端可检查并下载安装新版，见 [检查更新与自动发布](docs/updates.md)。
+本仓库保存源码、测试、安装包构建脚本及需求设计。Windows x64 安装包支持首次选择安装目录、环境准备和保留用户数据的原目录覆盖升级；使用方法见 [安装与升级](docs/installation.md)，构建方法见 [构建说明](build/README.md)。main 推送通过完整测试与构建后自动发布到 GitHub Releases，客户端可检查并下载安装新版，见 [检查更新与自动发布](docs/updates.md)。
 
 ## 当前功能
 

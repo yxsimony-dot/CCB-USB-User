@@ -64,7 +64,7 @@ node --test tests/packaging/release.test.cjs
 
 ## 安装事务维护说明
 
-载荷固定装到当前用户 `LocalAppData/Programs/UsbWebLauncher`；普通卸载仅删除清单登记的产品文件、当前 owner 的 broker 和 Inno 登记，保留用户数据及第三方组件。目录内出现非清单文件时升级会停止，提示用户先移走自己的文件，不擅自删除。
+首次安装显示目录选择页，默认当前用户 `LocalAppData/Programs/UsbWebLauncher`，允许选择当前用户可写的本地磁盘子目录；升级沿用 HKCU 安装登记中的原目录，不在安装过程中迁移。目录检查先于载荷安装及认证组件变更。普通卸载仅删除清单登记的产品文件、当前 owner 的 broker 和 Inno 登记，保留用户数据及第三方组件。目录内出现非清单文件时升级会停止，提示用户先移走自己的文件，不擅自删除。
 
 `<app>.transaction` 保存已验证暂存载荷、旧完整 App、技术状态、原 HKCU 卸载登记。broker 通过独立受保护快照保存组件及任务状态。暂存开始即保存 `staging` 状态；最终目录注册和非业务健康验证后，Inno 完成卸载登记，再先记录 `committing`、清理 broker 快照、记录 `committed`，最后清理应用备份。提交中断会检查当前版本健康并继续完成提交，不会尝试使用已删除的 broker 快照回滚。
 

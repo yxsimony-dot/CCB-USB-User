@@ -8,6 +8,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'Transaction.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'InstallDirectory.psm1') -Force
 function Run-App([string]$Directory,[string]$Command) {
     $exe = Join-Path $Directory 'UsbWebLauncher.App.exe'
     $process = Start-Process -FilePath $exe -ArgumentList $Command -PassThru -Wait
@@ -65,9 +66,24 @@ function Restore-UninstallRegistration {
         if ($LASTEXITCODE -ne 0) { throw 'Cannot restore uninstall registration; transaction retained' }
     }
 }
+function Remove-InstalledPayload([string]$Directory) {
+    $manifest = Get-Content -LiteralPath "$Directory/payload-manifest.json" -Raw | ConvertFrom-Json
+    $root = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+    foreach ($entry in $manifest.files) {
+        $path = [IO.Path]::GetFullPath((Join-Path $Directory $entry.path))
+        if (-not $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid uninstall manifest path' }
+    }
+    foreach ($entry in $manifest.files) {
+        $path = [IO.Path]::GetFullPath((Join-Path $Directory $entry.path))
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+    }
+    Remove-Item -LiteralPath "$Directory/payload-manifest.json","$Directory/installed-version.json" -Force -ErrorAction SilentlyContinue
+}
 try {
-    $expected = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs/UsbWebLauncher'
-    if (-not [string]::Equals([IO.Path]::GetFullPath($AppDirectory).TrimEnd('\'),[IO.Path]::GetFullPath($expected).TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)) { throw 'Only the fixed current-user installation directory is supported' }
+    $product = Get-Content (Join-Path $PSScriptRoot 'product.json') -Raw | ConvertFrom-Json
+    $existing = Get-ExistingInstallDirectory $product.installerAppId
+    $AppDirectory = Assert-InstallDirectory $AppDirectory -ExistingDirectory $existing -SkipOwnership:($Action -in @('Recover','Commit','Uninstall'))
+    if ($Action -eq 'Install') { Test-InstallDirectoryWritable $AppDirectory }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run the installer normally as the intended Windows user, not as administrator' }
@@ -84,24 +100,20 @@ try {
             if ($drive.AvailableFreeSpace -lt ($payloadBytes * 1.1 + 50MB)) { throw 'Insufficient free disk space for verified staging and installation' }
             $prepare = { param($path) Run-App $helper '--installer-prepare'; Close-Application $path }
             $backup = { param($path) Save-UninstallRegistration; Run-App $helper '--installer-backup-broker' }
-            Invoke-InstallTransaction $AppDirectory $PayloadDirectory $Version $prepare $register $health $backup $restore -DeferCommit -FinishRecovery $finishRecovery -ValidateStaged { param($path) Assert-Payload $path }
+            Set-PendingInstallDirectory $AppDirectory
+            try { Invoke-InstallTransaction $AppDirectory $PayloadDirectory $Version $prepare $register $health $backup $restore -DeferCommit -FinishRecovery $finishRecovery -ValidateStaged { param($path) Assert-Payload $path } }
+            finally { if (-not (Test-Path -LiteralPath "$AppDirectory.transaction")) { Set-PendingInstallDirectory '' } }
         }
-        'Recover' { Close-Application $AppDirectory; Restore-InstallTransaction $AppDirectory $register $health $restore $finishRecovery }
-        'Commit' { Complete-InstallTransaction $AppDirectory { param($path) Run-App $helper '--installer-commit-broker' } }
+        'Recover' { Close-Application $AppDirectory; Restore-InstallTransaction $AppDirectory $register $health $restore $finishRecovery; Set-PendingInstallDirectory '' }
+        'Commit' { Complete-InstallTransaction $AppDirectory { param($path) Run-App $helper '--installer-commit-broker' }; Set-PendingInstallDirectory '' }
         'Uninstall' {
             Run-App $helper '--installer-prepare'
             if (Test-Path "$AppDirectory.transaction") { throw 'An interrupted installation requires recovery before uninstalling' }
             Close-Application $AppDirectory
             if (Get-ChildItem -LiteralPath $AppDirectory -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) { throw 'Application directory contains a reparse point; uninstall stopped' }
             Run-App $helper '--installer-uninstall-broker'
-            $manifest = Get-Content "$AppDirectory/payload-manifest.json" -Raw | ConvertFrom-Json
-            $root = [IO.Path]::GetFullPath($AppDirectory).TrimEnd('\') + '\'
-            foreach ($entry in $manifest.files) {
-                $path = [IO.Path]::GetFullPath((Join-Path $AppDirectory $entry.path))
-                if (-not $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid uninstall manifest path' }
-                if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
-            }
-            Remove-Item -LiteralPath "$AppDirectory/payload-manifest.json","$AppDirectory/installed-version.json" -Force -ErrorAction SilentlyContinue
+            Remove-InstalledPayload $AppDirectory
+            Set-PendingInstallDirectory ''
         }
     }
     exit 0

@@ -2,21 +2,23 @@
 
 ## 首次安装
 
-1. 将 `UsbWebLauncher-1.0.0-win-x64-setup.exe` 发给使用者，在 Windows x64 电脑上双击运行。主程序自带 .NET 运行库，无需安装开发工具。
+1. 将正式版本的 `UsbWebLauncher-<版本>-win-x64-setup.exe` 发给使用者，在 Windows x64 电脑上双击运行。主程序自带 .NET 运行库，无需安装开发工具。
 2. 使用自己平时登录的 Windows 管理员账户正常双击安装包；需要时确认 UAC。不要右键选择“以管理员身份运行”整个安装包，也不要改用另一个管理员账号。当前认证组件只支持一台电脑的一个指定 Windows 使用者。
-3. 按向导完成安装。备份、注册、提交认证组件时可能分别请求管理员确认。
+3. 在“选择安装位置”页面选择主程序目录，例如 `D:\应用\UsbWebLauncher`，再点击“下一步”和“安装”。安装器先检查目录，确认后才开始安装。备份、注册、提交认证组件时可能分别请求管理员确认。
 4. 完成页打开“环境准备”。若缺少 WebView2 或建行组件，点击对应官方安装入口，完成安装后返回“重新检查”；银行安装器要求重启时先重启。
 5. 环境就绪后打开应用，点击“设置 PIN”输入本人 PIN，选择下载目录，插入 Key，再点击“启动业务”。安装过程不会替用户登录银行或下载流水。
 
 支持的目标为 Windows 10 build 19041 及以上、Windows 11 的 x64 系统。运行时及银行驱动仍需满足各自的系统要求；本次构建验证不等同于已在所有目标系统与所有 Key 上实测。
 
-主程序固定安装到 `%LOCALAPPDATA%\Programs\UsbWebLauncher`。认证组件仍在 `%ProgramFiles%\UsbWebLauncher\NativePromptBroker`。已存在其他 Windows 用户的认证组件时会停止安装，避免覆盖对方环境。
+主程序默认目录为 `%LOCALAPPDATA%\Programs\UsbWebLauncher`，首次安装可改为当前用户可写的本地磁盘子目录，支持中文和空格。请选择独立的程序目录，不要选择盘符根目录、系统目录、用户数据目录或网络目录。认证组件仍在 `%ProgramFiles%\UsbWebLauncher\NativePromptBroker`，自动绑定到实际主程序位置。已存在其他 Windows 用户的认证组件时会停止安装，避免覆盖对方环境。
 
 WebView2 官方部署说明：[Microsoft 文档](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution)。银行组件来源：[建设银行企业下载中心](https://ccb.com/cn/html1/office/ebank/dzb/subject/center/download/corporate_index.html)。Key 被识别与银行认证组件就绪是两项检查；实际 Key 通信仍在启动业务时确认。
 
 ## 覆盖升级与修复
 
 正常关闭应用后，双击同一产品的新安装包即可。安装器沿用产品标识和目录，重新绑定新版主程序与认证组件，保留当前 Windows 用户的 PIN、下载目录和已有 PDF。同版本安装可用于修复，低版本安装被拒绝。
+
+升级时仍显示安装位置，但锁定为已安装的目录，避免产生两个程序目录和冲突的认证绑定。如果需要搬到另一个目录，请先正常卸载，再运行新安装包选择新目录；普通卸载保留 PIN、下载目录设置和已有 PDF。
 
 不要把下载的 PDF 或其他个人文件放在程序安装目录。升级发现不属于安装清单的文件会停止，要求先移到自己的文档目录；不会为了升级将这些文件删除。
 
