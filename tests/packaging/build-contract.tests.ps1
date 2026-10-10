@@ -25,5 +25,19 @@ try {
     }
     Set-Content "$dir/version.json" '{"version":"1.0.0-beta"}'
     Reject { Get-ProductVersion "$dir/version.json" '' }
+    foreach ($name in @('Microsoft.Web.WebView2.Core.xml','Microsoft.Web.WebView2.WinForms.xml','Microsoft.Web.WebView2.Wpf.xml')) {
+        Set-Content (Join-Path $dir $name) '<doc>Vendor example: C:\example</doc>'
+    }
+    Set-Content "$dir/application.xml" '<configuration>Keep this runtime configuration</configuration>'
+    Assert ([bool](Get-Command Remove-PublishedSdkDocumentation -ErrorAction SilentlyContinue)) 'explicit SDK documentation pruning is missing'
+    Remove-PublishedSdkDocumentation $dir
+    Assert (-not (Test-Path "$dir/Microsoft.Web.WebView2.Core.xml")) 'SDK Core documentation retained'
+    Assert (-not (Test-Path "$dir/Microsoft.Web.WebView2.WinForms.xml")) 'SDK WinForms documentation retained'
+    Assert (-not (Test-Path "$dir/Microsoft.Web.WebView2.Wpf.xml")) 'SDK WPF documentation retained'
+    Assert (Test-Path "$dir/application.xml") 'runtime XML configuration was removed'
+    Set-Content "$dir/metadata.json" '{}'
+    Assert-CleanPayload $dir -SkipRequiredFiles
+    Set-Content "$dir/application.xml" '<configuration>C:\private-machine-path</configuration>'
+    Reject { Assert-CleanPayload $dir -SkipRequiredFiles }
     Write-Host 'PASS: version derivation, tag mismatch, unstable version, PDF, developer path and debugging payload rejection'
 } finally { Remove-Item -LiteralPath $dir -Recurse -Force }

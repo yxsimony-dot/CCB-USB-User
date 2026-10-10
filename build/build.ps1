@@ -45,6 +45,7 @@ try {
     # Each publish restores only from committed locks, into a completely new directory.
     Run 'dotnet' @('publish','src/UsbWebLauncher.App','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',$payload)
     Run 'dotnet' @('publish','src/UsbWebLauncher.NativePromptBroker','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',"$payload/broker")
+    Remove-PublishedSdkDocumentation $payload
     New-Item "$payload/installer" -ItemType Directory | Out-Null
     Copy-Item "$repo/installer/*.ps1","$repo/installer/*.psm1" "$payload/installer"
     Copy-Item "$PSScriptRoot/version.json" "$payload/installer/product.json"

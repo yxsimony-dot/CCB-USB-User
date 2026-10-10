@@ -49,4 +49,12 @@ function Write-PayloadManifest([string]$Directory) {
     })
     @{ schemaVersion = 1; files = $entries } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $root 'payload-manifest.json') -Encoding UTF8
 }
-Export-ModuleMember -Function Get-ProductVersion,Assert-CleanPayload,Write-PayloadManifest
+function Remove-PublishedSdkDocumentation([string]$Directory) {
+    # These SDK IntelliSense documents are not runtime assets and contain vendor
+    # sample machine paths. Remove only these exact root files, never XML configs.
+    foreach ($name in @('Microsoft.Web.WebView2.Core.xml','Microsoft.Web.WebView2.WinForms.xml','Microsoft.Web.WebView2.Wpf.xml')) {
+        $path = Join-Path ([IO.Path]::GetFullPath($Directory)) $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+    }
+}
+Export-ModuleMember -Function Get-ProductVersion,Assert-CleanPayload,Write-PayloadManifest,Remove-PublishedSdkDocumentation
