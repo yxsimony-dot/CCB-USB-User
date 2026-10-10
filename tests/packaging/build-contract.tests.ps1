@@ -5,7 +5,7 @@ Import-Module $module -Force
 function Assert($condition,$message) { if (-not $condition) { throw "FAIL: $message" } }
 function Reject([scriptblock]$action) { try { & $action } catch { return }; throw 'FAIL: invalid input accepted' }
 $version = Get-ProductVersion (Join-Path $PSScriptRoot '../../build/version.json') ''
-Assert ($version.fileVersion -eq '1.0.0.0') 'file version derivation'
+Assert ($version.fileVersion -eq '1.1.0.0') 'file version derivation'
 Reject { Get-ProductVersion (Join-Path $PSScriptRoot '../../build/version.json') 'v9.0.0' }
 $dir = Join-Path ([IO.Path]::GetTempPath()) ('uwl-payload-test-' + [guid]::NewGuid())
 New-Item $dir -ItemType Directory | Out-Null

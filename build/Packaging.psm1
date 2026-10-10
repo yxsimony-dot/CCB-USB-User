@@ -8,10 +8,23 @@ function Assert-NoSecrets($Value, [string]$RelativePath) {
         Assert-NoSecrets $property.Value $RelativePath
     }
 }
-function Get-ProductVersion([string]$Path, [string]$Tag) {
+function Get-ProductVersion {
+    [CmdletBinding()]
+    param([string]$Path, [string]$Tag, [Nullable[long]]$ReleaseSequence)
+
     $value = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     if ($value.version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw 'Only stable three-part versions are supported' }
     foreach ($part in $value.version.Split('.')) { if ([long]$part -gt 65535) { throw 'Version exceeds Windows file version range' } }
+    $baseVersion = $value.version
+    if ($null -ne $ReleaseSequence) {
+        if ($ReleaseSequence -le 0 -or $ReleaseSequence -gt 65535) { throw 'Release sequence must be between 1 and 65535' }
+        $parts = $value.version.Split('.')
+        $patch = [long]$parts[2] + $ReleaseSequence
+        if ($patch -gt 65535) { throw 'Effective version exceeds Windows file version range' }
+        $value.version = "$($parts[0]).$($parts[1]).$patch"
+    }
+    $value | Add-Member -NotePropertyName baseVersion -NotePropertyValue $baseVersion
+    $value | Add-Member -NotePropertyName releaseSequence -NotePropertyValue $ReleaseSequence
     if ($Tag -and $Tag -ne "v$($value.version)") { throw 'Git tag differs from product version' }
     if ($value.productId -ne 'usb-web-launcher' -or $value.channel -ne 'stable') { throw 'Invalid product identity or channel' }
     $id = [guid]$value.installerAppId

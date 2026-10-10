@@ -10,6 +10,7 @@ using UsbWebLauncher.Core.Authentication;
 using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.Core.Devices;
 using UsbWebLauncher.Windows.Devices;
+using UsbWebLauncher.App.Updates;
 
 namespace UsbWebLauncher.App;
 
@@ -40,6 +41,7 @@ public partial class App : Application
     private UsbKeyPresenceObserver? _keyPresenceObserver;
     private long _keyPresenceRevision;
     private readonly ApplicationExitWatchdog _exitWatchdog = new();
+    private UpdatePresentationController? _updates;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -66,12 +68,18 @@ public partial class App : Application
         MainWindow = _window;
         _window.Closing += OnMainWindowClosing;
         _window.RetryRequested += OnRetryRequested;
+        _updates = new UpdatePresentationController(GitHubApplicationUpdateService.CreateDefault(ProductVersion.Display),
+            _window.ViewModel, ProductVersion.Display, UpdatePresentationController.LaunchInteractiveInstaller,
+            () => _window.Close());
+        _window.ConfigureUpdates(_updates);
         _presenter = new LauncherUiPresenter(
             _window.ViewModel,
             new WpfUiDispatcher(Dispatcher),
             _window.ActivateForBrowser);
 
         _window.Show();
+        // Independent of initialization and USB Key observation; never download on startup.
+        _ = _updates.CheckOnStartupAsync();
         await RunSerializedAsync(InitializeLauncherCoreAsync);
 
         if (_launchOptions.UseEmptyDeviceMonitor &&
@@ -365,7 +373,8 @@ public partial class App : Application
     {
         var session = _session;
         var actions = _actions;
-        if (_shutdownStarted || session?.IsCurrent != true || actions is null) return;
+        if (_shutdownStarted || _window?.ViewModel.UpdateInstallInProgress == true ||
+            session?.IsCurrent != true || actions is null) return;
         _stopTask = null;
         _window!.ViewModel.UpdateSessionState(BusinessSessionState.Active);
         CertificateLoginDiagnostics.Write("session-start", new { session.Id });
@@ -428,6 +437,7 @@ public partial class App : Application
     private async void OnRetryRequested(object? sender, EventArgs eventArgs)
     {
         if (_initializing || _retryInProgress || _shutdownStarted ||
+            _window?.ViewModel.UpdateInstallInProgress == true ||
             _window?.ViewModel.SessionState is BusinessSessionState.Stopping or BusinessSessionState.StopFailed) return;
         var retryInitialization = _actions is null;
         var retrySession = _session;
@@ -437,12 +447,12 @@ public partial class App : Application
         {
             await RunSerializedAsync(async () =>
             {
-                if (_shutdownStarted) return;
+                if (_shutdownStarted || _window?.ViewModel.UpdateInstallInProgress == true) return;
                 if (retryInitialization)
                     await InitializeLauncherCoreAsync();
                 else if (_actions is not null && retrySession?.IsCurrent == true &&
                     ReferenceEquals(retrySession, _session))
-                    await _actions.StartBusinessAsync(retrySession.Token);
+                    await StartBusinessSessionAsync(retrySession.Token);
             });
         }
         catch (OperationCanceledException) when (retrySession?.IsCurrent != true) { }
@@ -465,6 +475,7 @@ public partial class App : Application
         _shutdownStarted = true;
         _exitWatchdog.Arm();
         _window?.ViewModel.UpdateSessionState(BusinessSessionState.Closing);
+        _updates?.Dispose();
         _ = _session?.RevokeAsync();
         _ = _lifetime.CancelAsync();
         CertificateLoginDiagnostics.Write("application-closing");

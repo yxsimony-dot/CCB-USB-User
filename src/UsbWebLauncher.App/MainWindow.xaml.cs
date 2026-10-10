@@ -5,11 +5,31 @@ using Microsoft.Web.WebView2.Wpf;
 using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.App.Configuration;
 using Microsoft.Win32;
+using UsbWebLauncher.App.Updates;
 
 namespace UsbWebLauncher.App;
 
 public partial class MainWindow : Window
 {
+    private UpdatePresentationController? _updates;
+    private UpdateWindow? _updateWindow;
+
+    public void ConfigureUpdates(UpdatePresentationController updates)
+    {
+        _updates = updates;
+        UpdateNotice.DataContext = updates;
+    }
+
+    private async void OnCheckUpdatesClicked(object sender, RoutedEventArgs e)
+    {
+        if (_updates is null) return;
+        if (_updateWindow is not null) { _updateWindow.Activate(); return; }
+        _updateWindow = new UpdateWindow(_updates) { Owner = this };
+        _updateWindow.Closed += (_, _) => _updateWindow = null;
+        _updateWindow.Show();
+        if (string.IsNullOrEmpty(_updates.AvailableVersion)) await _updates.CheckAsync();
+    }
+
     public event EventHandler? RetryRequested;
 
     public MainWindow()

@@ -32,4 +32,4 @@ WebView2 官方部署说明：[Microsoft 文档](https://learn.microsoft.com/mic
 
 安装包旁的 `SHA256SUMS` 和 `release-manifest.json` 提供文件完整性校验、版本与源码提交信息。当前构建未配置产品代码签名证书，安装包为未签名文件；哈希校验不等于发行者签名。
 
-后续统一修改 `build/version.json` 并执行 [构建说明](../build/README.md) 生成新版。产品 AppId 保持不变，GitHub Releases 接口已预留；本期不自动检查更新或上传安装包。
+带更新功能的版本支持启动后台检查及手动“检查更新”。main 推送通过测试和构建后自动生成版本并发布，产品 AppId 保持不变；用户确认后下载完整安装包，业务空闲时执行覆盖升级。原 1.0.0 需先手动安装一次新版，详见 [检查更新与自动发布](updates.md)。本地构建方式仍见 [构建说明](../build/README.md)。

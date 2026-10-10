@@ -10,6 +10,48 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
 {
     private BusinessSessionState _sessionState;
     private Func<CancellationToken, Task>? _stopBusiness;
+    private readonly object _handoffGate = new();
+    private bool _businessStartRunning;
+    private bool _updateInstallInProgress;
+
+    public bool UpdateInstallInProgress => _updateInstallInProgress;
+    private bool IsIdleForUpdate => _initialized && _sessionState == BusinessSessionState.Idle &&
+        !_started && !IsBusy && !_businessStartRunning;
+    public bool CanInstallUpdate => IsIdleForUpdate && !_updateInstallInProgress;
+    public bool CanContinueUpdateInstall => IsIdleForUpdate && _updateInstallInProgress;
+
+    public bool TryBeginUpdateInstall()
+    {
+        lock (_handoffGate)
+        {
+            if (!CanInstallUpdate) return false;
+            _updateInstallInProgress = true;
+        }
+        PublishCommandAvailability();
+        return true;
+    }
+
+    public void EndUpdateInstall()
+    {
+        lock (_handoffGate) _updateInstallInProgress = false;
+        PublishCommandAvailability();
+    }
+
+    private bool TryBeginBusinessStart()
+    {
+        lock (_handoffGate)
+        {
+            if (!CanStartBusiness || _businessStartRunning) return false;
+            _businessStartRunning = true;
+            return true;
+        }
+    }
+
+    private void EndBusinessStart()
+    {
+        lock (_handoffGate) _businessStartRunning = false;
+        RaisePropertyChanged(nameof(CanInstallUpdate));
+    }
 
     public BusinessSessionState SessionState => _sessionState;
     public string BusinessButtonText => _sessionState switch
@@ -156,7 +198,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
             () => CanUninstallNativePromptBroker);
         StartBusinessCommand = new AsyncDelegateCommand(
             cancellationToken => _startBusiness!(cancellationToken),
-            () => CanStartBusiness);
+            () => CanStartBusiness, TryBeginBusinessStart, EndBusinessStart);
         StopBusinessCommand = new AsyncDelegateCommand(
             cancellationToken => _stopBusiness!(cancellationToken),
             () => CanStopBusiness, TryBeginStopCommand);
@@ -224,7 +266,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
 
     public bool IsBrowserVisible => _state.IsBrowserVisible;
 
-    public bool CanRetry => _state.CanRetry && !IsBusy;
+    public bool CanRetry => _state.CanRetry && !IsBusy && !_updateInstallInProgress;
 
     public bool CanStartBusiness => CanOperate && _startBusiness is not null &&
         (_stopBusiness is null || _sessionState == BusinessSessionState.Idle) &&
@@ -241,7 +283,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
 
     public string CurrentPinText => _currentPinText;
 
-    private bool CanOperate => _initialized && !IsBusy && SessionAllowsOperations;
+    private bool CanOperate => _initialized && !IsBusy && SessionAllowsOperations && !_updateInstallInProgress;
 
     public AuthenticationStage AuthenticationStage => _authenticationState.Stage;
 
@@ -405,6 +447,8 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
 
     private void PublishCommandAvailability()
     {
+        RaisePropertyChanged(nameof(CanInstallUpdate));
+        RaisePropertyChanged(nameof(UpdateInstallInProgress));
         RaisePropertyChanged(nameof(IsBusy));
         RaisePropertyChanged(nameof(CanRetry));
         RaisePropertyChanged(nameof(CanStartBusiness));

@@ -3,6 +3,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$IsccPath,
     [string]$OutputDirectory,
+    [Nullable[long]]$ReleaseSequence,
+    [string]$WorkflowRunId,
     [string]$SigningCertificateThumbprint,
     [string]$TimestampUrl = 'http://timestamp.digicert.com'
 )
@@ -26,10 +28,13 @@ try {
     if ($LASTEXITCODE -ne 0 -or $sdk -ne '10.0.100') { throw '.NET SDK 10.0.100 is required by global.json' }
     $commit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'A Git checkout with source commit is required' }
+    $version = Get-ProductVersion "$PSScriptRoot/version.json" '' -ReleaseSequence $ReleaseSequence
     $tags = @(& git tag --points-at HEAD)
-    foreach ($tag in $tags) { if ($tag -match '^v\d') { $null = Get-ProductVersion "$PSScriptRoot/version.json" $tag } }
-    $version = Get-ProductVersion "$PSScriptRoot/version.json" ''
+    foreach ($tag in $tags) { if ($tag -match '^v\d') { $null = Get-ProductVersion "$PSScriptRoot/version.json" $tag -ReleaseSequence $ReleaseSequence } }
     $dirty = [bool](& git status --porcelain)
+    if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'A clean Git checkout is required; commit source changes before building' }
+    if ($WorkflowRunId -and ($WorkflowRunId -notmatch '^[1-9]\d*$' -or $null -eq $ReleaseSequence)) { throw 'WorkflowRunId requires a positive run identity and ReleaseSequence' }
+    if ($env:GITHUB_ACTIONS -eq 'true' -and ($commit -ne $env:GITHUB_SHA -or $WorkflowRunId -ne $env:GITHUB_RUN_ID -or [string]$ReleaseSequence -ne $env:GITHUB_RUN_NUMBER)) { throw 'Source/version must match the immutable GitHub workflow run' }
     $buildRoot = Join-Path $repo ('artifacts/installer-build/' + [guid]::NewGuid())
     $payload = Join-Path $buildRoot 'payload'
     $release = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $repo "artifacts/releases/$($version.version)" }
@@ -37,18 +42,24 @@ try {
     New-Item -ItemType Directory -Path $payload,$release -Force | Out-Null
     Run 'dotnet' @('restore','UsbWebLauncher.sln','--locked-mode')
     Run 'npm.cmd' @('ci','--ignore-scripts','--no-audit','--no-fund')
-    Run 'dotnet' @('test','UsbWebLauncher.sln','-c','Release','--no-restore','--filter','Category!=Hardware')
+    Run 'dotnet' @('test','UsbWebLauncher.sln','-c','Release','--no-restore','--filter','Category!=Hardware','--logger','trx','--results-directory',"$repo/artifacts/test-results")
     Run 'npm.cmd' @('test')
     Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/transaction.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-contract.tests.ps1')
+    Run 'pwsh' @('-NoProfile','-File','tests/packaging/version.tests.ps1')
+    Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-entry.tests.ps1')
+    Run 'node' @('--test','tests/packaging/release.test.cjs')
     Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/payload-integrity.tests.ps1')
     # Each publish restores only from committed locks, into a completely new directory.
-    Run 'dotnet' @('publish','src/UsbWebLauncher.App','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',$payload)
-    Run 'dotnet' @('publish','src/UsbWebLauncher.NativePromptBroker','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',"$payload/broker")
+    Run 'dotnet' @('publish','src/UsbWebLauncher.App','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:ReleaseVersion=$($version.version)","-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',$payload)
+    Run 'dotnet' @('publish','src/UsbWebLauncher.NativePromptBroker','-c','Release','-r','win-x64','--self-contained','true','-p:RestoreLockedMode=true',"-p:ReleaseVersion=$($version.version)","-p:SourceRevisionId=$commit",'-p:DebugType=None','-p:DebugSymbols=false','-o',"$payload/broker")
     Remove-PublishedSdkDocumentation $payload
     New-Item "$payload/installer" -ItemType Directory | Out-Null
     Copy-Item "$repo/installer/*.ps1","$repo/installer/*.psm1" "$payload/installer"
-    Copy-Item "$PSScriptRoot/version.json" "$payload/installer/product.json"
+    $version | ConvertTo-Json -Depth 6 | Set-Content "$payload/installer/product.json" -Encoding utf8
+    foreach ($assembly in @("$payload/UsbWebLauncher.App.dll","$payload/UsbWebLauncher.Core.dll","$payload/UsbWebLauncher.Windows.dll","$payload/broker/UsbWebLauncher.NativePromptBroker.exe")) {
+        if ([Diagnostics.FileVersionInfo]::GetVersionInfo($assembly).FileVersion.Trim() -ne $version.fileVersion) { throw "Published assembly version mismatch: $assembly" }
+    }
     if ($SigningCertificateThumbprint) {
         $null = Get-Command signtool.exe -ErrorAction Stop
         foreach ($file in @("$payload/UsbWebLauncher.App.exe","$payload/broker/UsbWebLauncher.NativePromptBroker.exe")) {
@@ -61,12 +72,17 @@ try {
     $installerName = "UsbWebLauncher-$($version.version)-win-x64-setup.exe"
     $installer = Join-Path $release $installerName
     if ($SigningCertificateThumbprint) { Run 'signtool.exe' @('sign','/sha1',$SigningCertificateThumbprint,'/fd','SHA256','/tr',$TimestampUrl,'/td','SHA256',$installer) }
+    if ([Diagnostics.FileVersionInfo]::GetVersionInfo($installer).FileVersion.Trim() -ne $version.fileVersion) { throw 'Compiled installer version mismatch' }
+    if ((& git rev-parse HEAD).Trim() -ne $commit -or [bool](& git status --porcelain)) { throw 'Source changed during build; refusing release metadata' }
     $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $installerName" | Set-Content "$release/SHA256SUMS" -Encoding ascii
     $manifest = [ordered]@{
         schemaVersion=1; productId=$version.productId; version=$version.version; channel=$version.channel
         platform='windows'; architecture='x64'; minimumOsVersion='10.0.19041'
         sourceRepository=$version.sourceRepository; sourceCommit=$commit; sourceDirty=$dirty
+        baseVersion=$version.baseVersion; releaseSequence=$version.releaseSequence
+        workflowRunId=$WorkflowRunId; workflowRunNumber=$version.releaseSequence
+        workflowRunUrl=$(if ($WorkflowRunId) { "$($version.sourceRepository)/actions/runs/$WorkflowRunId" } else { $null })
         installerFileName=$installerName; size=(Get-Item $installer).Length; sha256=$hash
         brokerProtocolVersion=$version.brokerProtocolVersion; settingsSchemaVersion=$version.settingsSchemaVersion
         signatureStatus=$(if ($SigningCertificateThumbprint) { 'signed' } else { 'unsigned' })
