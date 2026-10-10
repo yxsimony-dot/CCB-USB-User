@@ -79,7 +79,9 @@ internal sealed class WindowsNativePromptBrokerElevationLauncher
                 return new(NativePromptBrokerElevationResult.Failed);
             }
 
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            // Once an elevated mutation starts, cancellation must not let an outer
+            // installer restore files while this child is still changing them.
+            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
             return new(
                 process.ExitCode == 0
                     ? NativePromptBrokerElevationResult.Success
@@ -103,7 +105,7 @@ internal sealed class WindowsNativePromptBrokerElevationLauncher
 
     private static bool IsAllowedArguments(IReadOnlyList<string> arguments) =>
         (arguments.Count == 1 &&
-         string.Equals(arguments[0], "--uninstall", StringComparison.Ordinal)) ||
+         arguments[0] is "--uninstall" or "--backup" or "--restore" or "--commit") ||
         (arguments.Count == 2 &&
          string.Equals(arguments[0], "--install", StringComparison.Ordinal) &&
          IsAbsoluteLocalPath(arguments[1]));

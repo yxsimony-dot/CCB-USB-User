@@ -69,8 +69,10 @@ public sealed class WindowsNativePromptBrokerInstallerTests
         }
     }
 
-    [Fact]
-    public async Task ProductionUpdateBackup_PreservesOriginalAcrossRetryAndCanRestoreThenFinalize()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProductionUpdateBackup_PreservesOriginalAcrossRetryAndCanRestoreThenFinalize(bool hadOwner)
     {
         var programFiles = Path.Combine(
             Path.GetTempPath(),
@@ -83,12 +85,14 @@ public sealed class WindowsNativePromptBrokerInstallerTests
         var policyPath = Path.Combine(
             installDirectory,
             WindowsNativePromptBrokerInstaller.PolicyFileName);
+        var ownerPath = Path.Combine(installDirectory, WindowsNativePromptBrokerInstallationApi.OwnerFileName);
         var oldBroker = RandomNumberGenerator.GetBytes(64);
         var oldPolicy = RandomNumberGenerator.GetBytes(64);
         try
         {
             await File.WriteAllBytesAsync(brokerPath, oldBroker);
             await File.WriteAllBytesAsync(policyPath, oldPolicy);
+            if (hadOwner) await File.WriteAllTextAsync(ownerPath, "original-owner");
             var api = new WindowsNativePromptBrokerInstallationApi(
                 new StubHealthClient(),
                 new StubInteractiveUserResolver("SESSION\\User"),
@@ -97,12 +101,15 @@ public sealed class WindowsNativePromptBrokerInstallerTests
             await api.PrepareUpdateBackupAsync(installDirectory, CancellationToken.None);
             await File.WriteAllBytesAsync(brokerPath, RandomNumberGenerator.GetBytes(64));
             await File.WriteAllBytesAsync(policyPath, RandomNumberGenerator.GetBytes(64));
+            await File.WriteAllTextAsync(ownerPath, "replacement-owner");
             await api.PrepareUpdateBackupAsync(installDirectory, CancellationToken.None);
             await api.RestoreUpdateBackupAsync(installDirectory, CancellationToken.None);
 
             Assert.Equal(oldBroker, await File.ReadAllBytesAsync(brokerPath));
             Assert.Equal(oldPolicy, await File.ReadAllBytesAsync(policyPath));
-            Assert.Equal(2, Directory.GetFiles(installDirectory, "*.update-backup").Length);
+            Assert.Equal(hadOwner ? 3 : 2, Directory.GetFiles(installDirectory, "*.update-backup").Length);
+            if (hadOwner) Assert.Equal("original-owner", await File.ReadAllTextAsync(ownerPath));
+            else Assert.False(File.Exists(ownerPath));
 
             await api.DeleteUpdateBackupAsync(installDirectory, CancellationToken.None);
             Assert.Empty(Directory.GetFiles(installDirectory, "*.update-backup"));
@@ -203,6 +210,9 @@ public sealed class WindowsNativePromptBrokerInstallerTests
     [InlineData("--server", null, 0)]
     [InlineData("--install", PolicySource, 1)]
     [InlineData("--uninstall", null, 2)]
+    [InlineData("--backup", null, 3)]
+    [InlineData("--restore", null, 4)]
+    [InlineData("--commit", null, 5)]
     public void CommandParser_AcceptsOnlyFixedNonSecretForms(
         string verb,
         string? argument,
@@ -528,6 +538,37 @@ public sealed class WindowsNativePromptBrokerInstallerTests
         Assert.Equal(NativePromptBrokerInstallationStatus.UninstallFailed, result.Status);
     }
 
+    [Theory]
+    [InlineData(NativePromptBrokerInstallationStatus.OwnershipMismatch)]
+    [InlineData(NativePromptBrokerInstallationStatus.OwnershipInspectionFailed)]
+    public async Task OwnershipFailure_PreventsAllInstallAndUninstallMutations(NativePromptBrokerInstallationStatus status)
+    {
+        var api = new RecordingInstallationApi { OwnershipStatus = status };
+        var installer = new WindowsNativePromptBrokerInstaller(api);
+        Assert.Equal(status, (await installer.InstallAsync(Package())).Status);
+        Assert.Equal(status, (await installer.UninstallAsync()).Status);
+        Assert.Empty(api.Events);
+    }
+
+    [Fact]
+    public async Task PrepareInstallation_DoesNotRequireElevationOrMutateMachine()
+    {
+        var api = new RecordingInstallationApi { IsHighIntegrity = false };
+        Assert.True((await new WindowsNativePromptBrokerInstaller(api).PrepareInstallationAsync()).IsSuccess);
+        Assert.Empty(api.Events);
+    }
+
+    [Fact]
+    public async Task OuterSnapshotCommands_RequireElevationBeforeInvokingApi()
+    {
+        var api = new RecordingInstallationApi { IsHighIntegrity = false };
+        var installer = new WindowsNativePromptBrokerInstaller(api);
+        Assert.Equal(NativePromptBrokerInstallationStatus.NotElevated, (await installer.BackupInstallationAsync()).Status);
+        Assert.Equal(NativePromptBrokerInstallationStatus.NotElevated, (await installer.RestoreInstallationAsync()).Status);
+        Assert.Equal(NativePromptBrokerInstallationStatus.NotElevated, (await installer.CommitInstallationAsync()).Status);
+        Assert.Empty(api.Events);
+    }
+
     private const string ProgramFiles = @"D:\Program Files";
     private const string BrokerSource = @"D:\Bundle\UsbWebLauncher.NativePromptBroker.exe";
     private const string PolicySource = @"D:\Bundle\native-prompt-policy.json";
@@ -555,6 +596,14 @@ public sealed class WindowsNativePromptBrokerInstallerTests
 
     private sealed class RecordingInstallationApi : INativePromptBrokerInstallationApi
     {
+        public NativePromptBrokerInstallationStatus OwnershipStatus { get; set; } = NativePromptBrokerInstallationStatus.Success;
+        public ValueTask<NativePromptBrokerInstallationStatus> CheckOwnershipAsync(CancellationToken cancellationToken) => ValueTask.FromResult(OwnershipStatus);
+        public ValueTask WriteOwnerAsync(byte[] policy, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask ExecuteTransactionAsync(NativePromptBrokerCommandKind command, CancellationToken cancellationToken)
+        {
+            Events.Add(command.ToString());
+            return ValueTask.CompletedTask;
+        }
         public bool IsHighIntegrity { get; set; } = true;
         public string ProgramFilesPath => ProgramFiles;
         public string CurrentInteractiveUser => "DOMAIN\\User";

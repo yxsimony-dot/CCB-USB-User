@@ -1,0 +1,8 @@
+{
+  "name": "usb-web-launcher-tests",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "test": "node --test tests/browser/*.test.cjs" },
+  "devDependencies": { "jsdom": "26.1.0" },
+  "engines": { "node": ">=22" }
+}

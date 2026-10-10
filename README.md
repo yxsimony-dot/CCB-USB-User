@@ -2,7 +2,7 @@
 
 面向建设银行企业网银的 Windows 桌面工具：检测 USB Key，在内嵌 WebView2 中启动网银、填写已保存的 PIN，并按所选月份导出流水和电子回单。
 
-本仓库保存源码、测试及需求设计。当前可以从源码发布应用目录；通用安装包和版本升级支持正在规划，尚未交付安装包。后续安装包发布入口为 [GitHub Releases](https://github.com/yxsimony-dot/CCB-USB-User/releases)。
+本仓库保存源码、测试、安装包构建脚本及需求设计。Windows x64 安装包提供固定目录安装、环境准备和保留用户数据的覆盖升级；使用方法见 [安装与升级](docs/installation.md)，构建方法见 [构建说明](build/README.md)。GitHub Releases 为后续分发入口，源码提交本身不会自动发布安装文件。
 
 ## 当前功能
 
@@ -58,14 +58,13 @@ MM-公司全名-建行账号后4位-回单.pdf
 
 ## 开发与测试
 
-开发环境需要 Windows x64、.NET 8 SDK；页面脚本测试另需 Node.js 22 或更新版本及 npm。在仓库根目录运行：
+开发环境需要 Windows x64、global.json 固定的 .NET SDK 10.0.100（应用仍以 .NET 8 为目标）；页面脚本测试另需 Node.js 22 或更新版本及 npm。在仓库根目录运行：
 
 ```powershell
-dotnet test UsbWebLauncher.sln -c Release
+dotnet test UsbWebLauncher.sln -c Release --filter 'Category!=Hardware'
 
-npm install --prefix artifacts/test-tools --no-save jsdom@26.1.0
-$env:NODE_PATH = (Resolve-Path artifacts/test-tools/node_modules).Path
-node --test tests/browser/*.test.cjs
+npm ci --ignore-scripts
+npm test
 ```
 
 自动测试覆盖状态机、设备匹配、认证代理及合成页面交互。它们不能替代真实 Key、银行页面和全新电脑的安装验证。
@@ -99,4 +98,4 @@ dotnet publish src/UsbWebLauncher.NativePromptBroker/UsbWebLauncher.NativePrompt
 - `docs`：历史设计与验证记录，其中旧认证策略、个人开发路径和当时的部署状态不代表当前版本。
 - `artifacts`：本地构建、测试和诊断产物，不作为源码提交。
 
-[安装包与升级支持变更](openspec/changes/package-windows-installer-with-upgrade-support/) 规划统一版本号、稳定安装标识、保留用户设置的覆盖升级、升级后的代理重新绑定，以及将来对接 GitHub Releases 的更新入口。这些属于后续交付范围，当前尚无自动更新器或通用安装包。
+[安装包与升级支持变更](openspec/changes/package-windows-installer-with-upgrade-support/) 记录统一版本号、稳定安装标识、保留用户设置的覆盖升级、升级后的代理重新绑定，以及未来 GitHub Releases 更新清单。当前没有自动更新器；尚未实测的目标机器场景在变更验证记录中单独列出。

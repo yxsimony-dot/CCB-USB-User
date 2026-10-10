@@ -15,6 +15,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        Title = "USB Web Launcher " + ProductVersion.Display;
         DataContext = ViewModel;
         RefreshDownloadDirectory();
     }
@@ -78,6 +79,9 @@ public partial class MainWindow : Window
     {
         RetryRequested?.Invoke(this, EventArgs.Empty);
     }
+
+    private void OnDependencyPreparationClicked(object sender, RoutedEventArgs e) =>
+        new DependencyPreparationWindow(canOpenApplication: false) { Owner = this }.ShowDialog();
 
     private void OnMaintenanceMenuClicked(object sender, RoutedEventArgs e)
     {

@@ -93,7 +93,8 @@
                                     AutomationProperties.Name="环境维护菜单" ToolTip="环境维护">
                                 <Button.ContextMenu>
                                     <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
-                                        <MenuItem Header="安装 / 更新环境" Command="{Binding InstallNativePromptBrokerCommand}" />
+                                        <MenuItem Header="检查完整环境 / 官方安装入口" Click="OnDependencyPreparationClicked" />
+                                        <MenuItem Header="安装 / 更新认证组件" Command="{Binding InstallNativePromptBrokerCommand}" />
                                         <MenuItem Header="卸载环境" Command="{Binding UninstallNativePromptBrokerCommand}" />
                                     </ContextMenu>
                                 </Button.ContextMenu>

@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <Deterministic>true</Deterministic>
+    <VersionSourceText>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)build/version.json'))</VersionSourceText>
+    <Version>$([System.Text.RegularExpressions.Regex]::Match('$(VersionSourceText)', '&quot;version&quot;\s*:\s*&quot;([0-9]+\.[0-9]+\.[0-9]+)&quot;').Groups[1].Value)</Version>
+    <AssemblyVersion>$(Version).0</AssemblyVersion>
+    <FileVersion>$(Version).0</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <InformationalVersion Condition="'$(SourceRevisionId)' != ''">$(Version)+$(SourceRevisionId)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+</Project>

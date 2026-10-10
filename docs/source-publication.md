@@ -11,6 +11,6 @@
 
 ## 安装包与后续更新
 
-当前上传的是源码，尚未生成通用安装包。安装、依赖准备、版本源、保留设置的覆盖升级和代理重新绑定，见 [安装包变更](../openspec/changes/package-windows-installer-with-upgrade-support/)。
+首次源码上传没有包含安装文件。现有安装包构建入口、依赖准备、版本源、覆盖升级和代理重新绑定说明，见 [安装与升级](installation.md) 与 [安装包变更](../openspec/changes/package-windows-installer-with-upgrade-support/)。安装 EXE 及附属清单在本地 artifacts/releases 生成，不作为源码提交。
 
 后续安装包拟通过本仓库 GitHub Releases 交付。仓库地址不携带令牌，运行程序不依赖 Git 登录；将来的签名材料与发布凭据应在本机或 CI 密钥存储中配置。

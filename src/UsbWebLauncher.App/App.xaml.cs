@@ -45,9 +45,22 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
-        CertificateLoginDiagnostics.BeginRun();
-
         _launchOptions = ApplicationLaunchOptions.Parse(e.Args);
+        if (_launchOptions.IsHeadless)
+        {
+            Shutdown(await InstallerCommandRunner.Create().RunAsync(_launchOptions.InstallerCommand));
+            return;
+        }
+        if (_launchOptions.ShowDependencyPreparation)
+        {
+            var preparation = new DependencyPreparationWindow();
+            MainWindow = preparation;
+            preparation.Closed += (_, _) => Shutdown();
+            preparation.Show();
+            return;
+        }
+
+        CertificateLoginDiagnostics.BeginRun();
 
         _window = new MainWindow();
         MainWindow = _window;

@@ -11,7 +11,10 @@ internal enum NativePromptBrokerCommandKind
 {
     Server = 0,
     Install = 1,
-    Uninstall = 2
+    Uninstall = 2,
+    Backup = 3,
+    Restore = 4,
+    Commit = 5
 }
 
 internal sealed record NativePromptBrokerCommand(
@@ -41,6 +44,13 @@ internal sealed record NativePromptBrokerCommand(
             return true;
         }
 
+        if (args.Count == 1)
+        {
+            var kind = args[0] switch { "--backup" => NativePromptBrokerCommandKind.Backup,
+                "--restore" => NativePromptBrokerCommandKind.Restore,
+                "--commit" => NativePromptBrokerCommandKind.Commit, _ => (NativePromptBrokerCommandKind?)null };
+            if (kind.HasValue) { command = new(kind.Value); return true; }
+        }
         return false;
     }
 
@@ -68,7 +78,10 @@ public enum NativePromptBrokerInstallationStatus
     TaskInspectionFailed = 12,
     DirectoryCreationFailed = 13,
     PolicyWriteFailed = 14,
-    ExistingInstallationPreparationFailed = 15
+    ExistingInstallationPreparationFailed = 15,
+    OwnershipMismatch = 16,
+    OwnershipInspectionFailed = 17,
+    TransactionFailed = 18
 }
 
 public sealed record NativePromptBrokerInstallationResult(
@@ -101,6 +114,10 @@ internal sealed record BrokerScheduledTaskDefinition(
 
 internal interface INativePromptBrokerInstallationApi
 {
+    ValueTask<NativePromptBrokerInstallationStatus> CheckOwnershipAsync(CancellationToken cancellationToken);
+    ValueTask WriteOwnerAsync(byte[] policy, CancellationToken cancellationToken);
+    ValueTask ExecuteTransactionAsync(NativePromptBrokerCommandKind command, CancellationToken cancellationToken);
+
     bool IsHighIntegrity { get; }
 
     string ProgramFilesPath { get; }
@@ -193,6 +210,33 @@ public sealed class WindowsNativePromptBrokerInstaller
         CancellationToken cancellationToken = default) =>
         _api.CheckHealthAsync(BrokerPipeName, cancellationToken);
 
+    /// <summary>Read-only check for the original interactive user and existing machine-wide broker ownership.</summary>
+    public async ValueTask<NativePromptBrokerInstallationResult> PrepareInstallationAsync(CancellationToken cancellationToken = default)
+    {
+        try { return new(await _api.CheckOwnershipAsync(cancellationToken).ConfigureAwait(false)); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return new(NativePromptBrokerInstallationStatus.OwnershipInspectionFailed); }
+    }
+
+    public ValueTask<NativePromptBrokerInstallationResult> BackupInstallationAsync(CancellationToken cancellationToken = default) =>
+        ExecuteTransactionAsync(NativePromptBrokerCommandKind.Backup, cancellationToken);
+    public ValueTask<NativePromptBrokerInstallationResult> RestoreInstallationAsync(CancellationToken cancellationToken = default) =>
+        ExecuteTransactionAsync(NativePromptBrokerCommandKind.Restore, cancellationToken);
+    public ValueTask<NativePromptBrokerInstallationResult> CommitInstallationAsync(CancellationToken cancellationToken = default) =>
+        ExecuteTransactionAsync(NativePromptBrokerCommandKind.Commit, cancellationToken);
+
+    private async ValueTask<NativePromptBrokerInstallationResult> ExecuteTransactionAsync(NativePromptBrokerCommandKind command, CancellationToken cancellationToken)
+    {
+        if (!_api.IsHighIntegrity) return new(NativePromptBrokerInstallationStatus.NotElevated);
+        try
+        {
+            await _api.ExecuteTransactionAsync(command, cancellationToken).ConfigureAwait(false);
+            return new(NativePromptBrokerInstallationStatus.Success);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return new(NativePromptBrokerInstallationStatus.TransactionFailed); }
+    }
+
     internal ValueTask FinalizeUpdateAsync(CancellationToken cancellationToken = default) =>
         _api.DeleteUpdateBackupAsync(ExpectedInstallDirectory(), cancellationToken);
 
@@ -205,6 +249,9 @@ public sealed class WindowsNativePromptBrokerInstaller
         {
             return new(NativePromptBrokerInstallationStatus.NotElevated);
         }
+
+        var ownership = await PrepareInstallationAsync(cancellationToken).ConfigureAwait(false);
+        if (!ownership.IsSuccess) return ownership;
 
         if (!TryGetValidatedPaths(
                 package,
@@ -281,6 +328,8 @@ public sealed class WindowsNativePromptBrokerInstaller
             failure = NativePromptBrokerInstallationStatus.ProtectionFailed;
             await _api.ProtectDirectoryAsync(installDirectory, cancellationToken).ConfigureAwait(false);
 
+            await _api.WriteOwnerAsync(validatedPolicy, cancellationToken).ConfigureAwait(false);
+
             failure = NativePromptBrokerInstallationStatus.TaskRegistrationFailed;
             await _api.RegisterTaskAsync(task, cancellationToken).ConfigureAwait(false);
 
@@ -331,6 +380,9 @@ public sealed class WindowsNativePromptBrokerInstaller
         {
             return new(NativePromptBrokerInstallationStatus.NotElevated);
         }
+
+        var ownership = await PrepareInstallationAsync(cancellationToken).ConfigureAwait(false);
+        if (!ownership.IsSuccess) return ownership;
 
         var expected = ExpectedInstallDirectory();
         string resolved;
@@ -653,7 +705,7 @@ internal sealed class WindowsNativePromptScheduledTaskRegistrar : INativePromptS
     }
 }
 
-internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBrokerInstallationApi
+internal sealed partial class WindowsNativePromptBrokerInstallationApi : INativePromptBrokerInstallationApi
 {
     private const string BrokerUpdateBackupFileName = "UsbWebLauncher.NativePromptBroker.exe.update-backup";
     private const string PolicyUpdateBackupFileName = "native-prompt-policy.json.update-backup";
@@ -725,7 +777,7 @@ internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBr
             IntPtr.Zero);
         if (handle.IsInvalid)
         {
-            throw new IOException("Unable to resolve the protected broker path.");
+            throw new IOException("Unable to resolve the protected broker path.", Marshal.GetHRForLastWin32Error());
         }
 
         var buffer = new StringBuilder(32_768);
@@ -886,14 +938,19 @@ internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBr
 
             DeleteFileIfPresent(brokerBackup);
             DeleteFileIfPresent(policyBackup);
+            DeleteFileIfPresent(Path.Combine(expected, OwnerFileName + ".update-backup"));
             File.Copy(broker, brokerBackup, overwrite: false);
             File.Copy(policy, policyBackup, overwrite: false);
+            var owner = ValidateBackupFilePath(Path.Combine(expected, OwnerFileName));
+            var ownerBackup = ValidateBackupFilePath(Path.Combine(expected, OwnerFileName + ".update-backup"));
+            if (File.Exists(owner)) File.Copy(owner, ownerBackup, overwrite: false);
             return ValueTask.CompletedTask;
         }
         catch
         {
             DeleteFileIfPresent(brokerBackup);
             DeleteFileIfPresent(policyBackup);
+            DeleteFileIfPresent(Path.Combine(expected, OwnerFileName + ".update-backup"));
             throw;
         }
     }
@@ -912,6 +969,10 @@ internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBr
             Path.Combine(expected, PolicyUpdateBackupFileName),
             Path.Combine(expected, WindowsNativePromptBrokerInstaller.PolicyFileName),
             overwrite: true);
+        var owner = ValidateBackupFilePath(Path.Combine(expected, OwnerFileName));
+        var ownerBackup = ValidateBackupFilePath(Path.Combine(expected, OwnerFileName + ".update-backup"));
+        if (File.Exists(ownerBackup)) File.Copy(ownerBackup, owner, overwrite: true);
+        else if (File.Exists(owner)) File.Delete(owner);
         return ValueTask.CompletedTask;
     }
 
@@ -923,6 +984,7 @@ internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBr
         var expected = ValidateInstallDirectory(installDirectory);
         DeleteFileIfPresent(Path.Combine(expected, BrokerUpdateBackupFileName));
         DeleteFileIfPresent(Path.Combine(expected, PolicyUpdateBackupFileName));
+        DeleteFileIfPresent(Path.Combine(expected, OwnerFileName + ".update-backup"));
         return ValueTask.CompletedTask;
     }
 
@@ -943,24 +1005,17 @@ internal sealed class WindowsNativePromptBrokerInstallationApi : INativePromptBr
         await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async ValueTask ProtectDirectoryAsync(
-        string path,
-        CancellationToken cancellationToken)
+    public ValueTask ProtectDirectoryAsync(string path, CancellationToken cancellationToken)
     {
-        var icacls = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            "icacls.exe");
-        await RunProcessAsync(
-            icacls,
-            [
-                path,
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F"
-            ],
-            allowNonZeroExitCode: false,
-            cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var sid = ResolveAccountSid(CurrentInteractiveUser);
+        ProtectTransactionDirectory(path, sid);
+        foreach (var name in SnapshotFiles)
+        {
+            var file = ResolvePath(Path.Combine(path, name));
+            if (File.Exists(file)) ProtectFile(file, sid);
+        }
+        return ValueTask.CompletedTask;
     }
 
     public async ValueTask RegisterTaskAsync(

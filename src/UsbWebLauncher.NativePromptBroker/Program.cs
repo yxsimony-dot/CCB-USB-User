@@ -33,6 +33,18 @@ static async Task<int> RunAsync(string[] args)
                 var result = await installer.UninstallAsync(CancellationToken.None).ConfigureAwait(false);
                 return result.IsSuccess ? 0 : 30 + (int)result.Status;
             }
+            case NativePromptBrokerCommandKind.Backup:
+            case NativePromptBrokerCommandKind.Restore:
+            case NativePromptBrokerCommandKind.Commit:
+            {
+                var result = command.Kind switch
+                {
+                    NativePromptBrokerCommandKind.Backup => await installer.BackupInstallationAsync(),
+                    NativePromptBrokerCommandKind.Restore => await installer.RestoreInstallationAsync(),
+                    _ => await installer.CommitInstallationAsync()
+                };
+                return result.IsSuccess ? 0 : 50 + (int)result.Status;
+            }
             case NativePromptBrokerCommandKind.Server:
             {
                 var installDirectory = Path.GetFullPath(Path.Combine(
