@@ -1,8 +1,13 @@
 $ErrorActionPreference = 'Stop'
+function Assert($condition,$message) { if (-not $condition) { throw "FAIL: $message" } }
+$installerScript = Get-Content (Join-Path $PSScriptRoot '../../installer/UsbWebLauncher.iss') -Raw
+Assert ($installerScript -match '(?m)^Name:\s*"\{userdesktop\}\\UsbWebLauncher";\s*Filename:\s*"\{app\}\\UsbWebLauncher\.App\.exe"') 'desktop shortcut definition'
+Assert ($installerScript -match '(?m)^Name:\s*"\{userprograms\}\\UsbWebLauncher";\s*Filename:\s*"\{app\}\\UsbWebLauncher\.App\.exe"') 'start menu shortcut definition'
+Write-Host 'PASS: desktop and start menu shortcuts are defined'
+
 $module = Join-Path $PSScriptRoot '../../build/Packaging.psm1'
 if (-not (Test-Path $module)) { throw 'FAIL: version and payload validation missing' }
 Import-Module $module -Force
-function Assert($condition,$message) { if (-not $condition) { throw "FAIL: $message" } }
 function Reject([scriptblock]$action) { try { & $action } catch { return }; throw 'FAIL: invalid input accepted' }
 $version = Get-ProductVersion (Join-Path $PSScriptRoot '../../build/version.json') ''
 Assert ($version.fileVersion -eq '1.1.0.0') 'file version derivation'

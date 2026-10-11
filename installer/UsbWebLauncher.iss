@@ -38,6 +38,7 @@ Source: "{#PayloadDirectory}\*"; DestDir: "{tmp}\payload"; Flags: dontcopy recur
 
 [Icons]
 Name: "{userprograms}\UsbWebLauncher"; Filename: "{app}\UsbWebLauncher.App.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\UsbWebLauncher"; Filename: "{app}\UsbWebLauncher.App.exe"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\UsbWebLauncher.App.exe"; Parameters: "--installer-first-run"; Description: "打开应用并检查本机使用环境"; Flags: postinstall nowait skipifsilent runasoriginaluser; Check: IsCommitted
@@ -80,14 +81,14 @@ ReadyLabel1=现在可以开始安装 [name]。
 ReadyLabel2a=点击“安装”继续，或点击“上一步”查看设置。
 ReadyLabel2b=点击“安装”继续。
 ReadyMemoDir=安装位置：
-ReadyMemoGroup=开始菜单：
+ReadyMemoGroup=开始菜单和桌面快捷方式：
 WizardPreparing=正在准备安装
 PreparingDesc=正在检查并准备安装。
 WizardInstalling=正在安装
 InstallingLabel=正在安装 [name]，请稍候。
 FinishedHeadingLabel=[name] 安装向导已完成
 FinishedLabelNoIcons=[name] 已安装。
-FinishedLabel=[name] 已安装。请通过开始菜单打开应用。
+FinishedLabel=[name] 已安装。可通过桌面或开始菜单快捷方式打开应用。
 ClickFinish=点击“完成”退出安装向导。
 ExitSetupTitle=退出安装
 ExitSetupMessage=安装尚未完成。是否退出？%n%n如果存在未完成事务，请再次运行本安装程序恢复。
