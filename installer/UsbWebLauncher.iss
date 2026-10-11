@@ -39,6 +39,8 @@ Source: "{#PayloadDirectory}\*"; DestDir: "{tmp}\payload"; Flags: dontcopy recur
 [Icons]
 Name: "{userprograms}\UsbWebLauncher"; Filename: "{app}\UsbWebLauncher.App.exe"; WorkingDir: "{app}"
 Name: "{userdesktop}\UsbWebLauncher"; Filename: "{app}\UsbWebLauncher.App.exe"; WorkingDir: "{app}"
+Name: "{userprograms}\卸载 UsbWebLauncher"; Filename: "{uninstallexe}"; WorkingDir: "{app}"; Comment: "卸载程序；保留 PIN、个人设置和已下载文件。请先关闭程序。"
+Name: "{userdesktop}\卸载 UsbWebLauncher"; Filename: "{uninstallexe}"; WorkingDir: "{app}"; Comment: "卸载程序；保留 PIN、个人设置和已下载文件。请先关闭程序。"
 
 [Run]
 Filename: "{app}\UsbWebLauncher.App.exe"; Parameters: "--installer-first-run"; Description: "打开应用并检查本机使用环境"; Flags: postinstall nowait skipifsilent runasoriginaluser; Check: IsCommitted
