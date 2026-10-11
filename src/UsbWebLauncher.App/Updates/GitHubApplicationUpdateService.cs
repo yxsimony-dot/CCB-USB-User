@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -22,12 +23,18 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
     private readonly string cacheRoot;
     private readonly int maxPages;
     private readonly TimeSpan timeout;
+    private readonly Func<DateTimeOffset> utcNow;
+    private readonly SemaphoreSlim checkGate = new(1, 1);
+    private UpdateCheckResult? cachedCheck;
+    private DateTimeOffset cacheExpires;
+    private DateTimeOffset rateLimitUntil;
+    private static readonly Uri LatestManifest = new(Repository + "/releases/latest/download/release-manifest.json");
     private readonly ConcurrentDictionary<UpdateRelease, byte> selected = new();
     private readonly ConcurrentDictionary<string, UpdateRelease> downloads = new(StringComparer.OrdinalIgnoreCase);
 
     // Injected clients must disable automatic redirects; CreateDefault enforces this for production.
     public GitHubApplicationUpdateService(HttpClient client, string currentVersion, string cacheRoot,
-        Version? osVersion = null, int maxPages = 10, TimeSpan? timeout = null)
+        Version? osVersion = null, int maxPages = 10, TimeSpan? timeout = null, Func<DateTimeOffset>? utcNow = null)
     {
         this.client = client;
         this.currentVersion = ParseVersion(currentVersion) ?? throw new ArgumentException("Invalid current version.", nameof(currentVersion));
@@ -35,6 +42,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         this.osVersion = osVersion ?? Environment.OSVersion.Version;
         this.maxPages = maxPages > 0 ? maxPages : throw new ArgumentOutOfRangeException(nameof(maxPages));
         this.timeout = timeout ?? TimeSpan.FromSeconds(30);
+        this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     public static GitHubApplicationUpdateService CreateDefault(string currentVersion) => new(
@@ -46,56 +54,136 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(timeout);
         var ct = deadline.Token;
+        var entered = false;
         try
         {
-            var candidates = new List<(Version Version, JsonElement Release)>();
-            var next = new Uri(ApiRoot + "/releases?per_page=100&page=1");
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            for (var page = 0; next != null; page++)
+            await checkGate.WaitAsync(ct).ConfigureAwait(false);
+            entered = true;
+            ct.ThrowIfCancellationRequested();
+            var now = utcNow();
+            if (cachedCheck != null && now < cacheExpires)
+                return cachedCheck with { Message = cachedCheck.Message + "（使用最近一分钟内的检查结果。）" };
+            if (now < rateLimitUntil) return RateLimitedResult(now);
+            UpdateCheckResult result;
+            try { result = await CheckLatestManifestAsync(ct).ConfigureAwait(false); }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
-                if (page >= maxPages || !seen.Add(next.AbsoluteUri))
-                    return new(UpdateCheckStatus.Incomplete, "更新检查未完成：发布分页超过限制，请稍后重试。");
-                using var response = await SendAsync(next, false, ct).ConfigureAwait(false);
-                using var document = await ReadJsonAsync(response, ListLimit, ct).ConfigureAwait(false);
-                if (document.RootElement.ValueKind != JsonValueKind.Array) throw new InvalidDataException("发布列表格式异常。");
-                foreach (var release in document.RootElement.EnumerateArray())
-                {
-                    if (release.GetProperty("draft").GetBoolean() || release.GetProperty("prerelease").GetBoolean()) continue;
-                    var tag = release.GetProperty("tag_name").GetString() ?? "";
-                    var version = tag.StartsWith('v') ? ParseVersion(tag[1..]) : null;
-                    if (version != null) candidates.Add((version, release.Clone()));
-                }
-                next = NextPage(response);
+                // Only the latest-manifest endpoint being absent permits the older API discovery path.
+                result = await CheckLegacyReleasesAsync(ct).ConfigureAwait(false);
             }
-            if (candidates.Count == 0) return new(UpdateCheckStatus.NoReleases, "暂无已发布的正式版本。");
-            var warnings = new List<string>();
-            foreach (var candidate in candidates.Where(c => c.Version > currentVersion).OrderByDescending(c => c.Version))
+            ct.ThrowIfCancellationRequested();
+            if (result.Status is UpdateCheckStatus.UpdateAvailable or UpdateCheckStatus.UpToDate or UpdateCheckStatus.NoReleases)
             {
-                try
-                {
-                    var release = await ValidateReleaseAsync(candidate.Release, candidate.Version.ToString(3), ct).ConfigureAwait(false);
-                    selected.TryAdd(release, 0);
-                    return new(UpdateCheckStatus.UpdateAvailable,
-                        $"发现新版本 {release.Version}。" + (warnings.Count > 0 ? " 更高版本不可用：" + string.Join("；", warnings) : ""), release);
-                }
-                catch (Exception ex) when (ex is InvalidDataException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException)
-                {
-                    warnings.Add($"{candidate.Version.ToString(3)}：{ex.Message}");
-                }
-                catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-                {
-                    warnings.Add($"{candidate.Version.ToString(3)}：发布文件或 tag 已不存在。");
-                }
+                cachedCheck = result;
+                cacheExpires = utcNow().AddMinutes(1);
             }
-            return warnings.Count > 0
-                ? new(UpdateCheckStatus.InvalidRelease, "新版不兼容或发布文件异常：" + string.Join("；", warnings))
-                : new(UpdateCheckStatus.UpToDate, "当前已是最新正式版本。");
+            return result;
         }
-        catch (RateLimitException) { return new(UpdateCheckStatus.RateLimited, "GitHub 请求受限，请稍后重试。"); }
+        catch (RateLimitException ex)
+        {
+            rateLimitUntil = ex.RetryAt;
+            return RateLimitedResult(utcNow());
+        }
         catch (OperationCanceledException) { return new(cancellationToken.IsCancellationRequested ? UpdateCheckStatus.Cancelled : UpdateCheckStatus.Incomplete, cancellationToken.IsCancellationRequested ? "已取消更新检查。" : "更新检查超时，未完成检查，请重试。"); }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+        { return new(UpdateCheckStatus.NetworkError, "GitHub 拒绝访问更新文件，请检查网络、代理或访问权限后重试（HTTP 403）。"); }
         catch (HttpRequestException) { return new(UpdateCheckStatus.NetworkError, "无法连接 GitHub 完成更新检查，请检查网络后重试。"); }
         catch (Exception ex) when (ex is InvalidDataException or IOException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException)
         { return new(UpdateCheckStatus.Incomplete, "更新检查未完成：" + ex.Message); }
+        finally { if (entered) checkGate.Release(); }
+    }
+
+    private UpdateCheckResult RateLimitedResult(DateTimeOffset now) => new(UpdateCheckStatus.RateLimited,
+        $"GitHub 暂时限制请求，请在约 {Math.Max(1, Math.Ceiling((rateLimitUntil - now).TotalSeconds))} 秒后重试；等待期间不会重复发送检查请求。");
+
+    private async Task<UpdateCheckResult> CheckLatestManifestAsync(CancellationToken ct)
+    {
+        string? version = null;
+        try
+        {
+            using var response = await SendAsync(LatestManifest, true, ct, uri =>
+            {
+                if (uri == LatestManifest && version == null) return;
+                if (uri.Host == "github.com")
+                {
+                    var prefix = "/yxsimony-dot/CCB-USB-User/releases/download/v";
+                    var suffix = "/release-manifest.json";
+                    Require(uri.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal)
+                        && uri.AbsolutePath.EndsWith(suffix, StringComparison.Ordinal) && uri.Query.Length == 0, "版本清单重定向不匹配。");
+                    var tagVersion = uri.AbsolutePath[prefix.Length..^suffix.Length];
+                    Require(ParseVersion(tagVersion) != null && (version == null || version == tagVersion), "清单重定向版本不匹配。");
+                    version = tagVersion;
+                }
+                else Require(version != null, "清单下载未提供可信的发布版本地址。");
+            }).ConfigureAwait(false);
+            Require(version != null, "清单下载未提供可信的发布版本地址。");
+            using var document = await ReadJsonAsync(response, ManifestLimit, ct).ConfigureAwait(false);
+            var release = ValidateManifest(document.RootElement, version!, null,
+                $"版本说明：{Repository}/releases/tag/v{version}");
+            try
+            {
+                using var sums = await SendAsync(new Uri($"{Repository}/releases/download/v{version}/SHA256SUMS"), true, ct).ConfigureAwait(false);
+                var bytes = await ReadBytesAsync(sums, ManifestLimit, ct).ConfigureAwait(false);
+                var text = Encoding.UTF8.GetString(bytes).TrimStart('\ufeff').Trim();
+                Require(text.Length >= 66 && text[..64].Equals(release.Sha256, StringComparison.OrdinalIgnoreCase)
+                    && text[64..] == $"  {release.InstallerFileName}", "SHA256SUMS 与版本清单不一致。");
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            { throw new InvalidDataException("发布文件缺失：SHA256SUMS。", ex); }
+            if (ParseVersion(version!)! <= currentVersion) return new(UpdateCheckStatus.UpToDate, "当前已是最新正式版本。");
+            selected.TryAdd(release, 0);
+            return new(UpdateCheckStatus.UpdateAvailable, $"发现新版本 {release.Version}。", release);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound && version != null)
+        { return new(UpdateCheckStatus.InvalidRelease, "发布版本清单已不存在，请稍后重试。"); }
+        catch (Exception ex) when (ex is InvalidDataException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException)
+        { return new(UpdateCheckStatus.InvalidRelease, "新版不兼容或发布文件异常：" + ex.Message); }
+    }
+
+    private async Task<UpdateCheckResult> CheckLegacyReleasesAsync(CancellationToken ct)
+    {
+        var candidates = new List<(Version Version, JsonElement Release)>();
+        var next = new Uri(ApiRoot + "/releases?per_page=100&page=1");
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var page = 0; next != null; page++)
+        {
+            if (page >= maxPages || !seen.Add(next.AbsoluteUri))
+                return new(UpdateCheckStatus.Incomplete, "更新检查未完成：发布分页超过限制，请稍后重试。");
+            using var response = await SendAsync(next, false, ct).ConfigureAwait(false);
+            using var document = await ReadJsonAsync(response, ListLimit, ct).ConfigureAwait(false);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) throw new InvalidDataException("发布列表格式异常。");
+            foreach (var release in document.RootElement.EnumerateArray())
+            {
+                if (release.GetProperty("draft").GetBoolean() || release.GetProperty("prerelease").GetBoolean()) continue;
+                var tag = release.GetProperty("tag_name").GetString() ?? "";
+                var version = tag.StartsWith('v') ? ParseVersion(tag[1..]) : null;
+                if (version != null) candidates.Add((version, release.Clone()));
+            }
+            next = NextPage(response);
+        }
+        if (candidates.Count == 0) return new(UpdateCheckStatus.NoReleases, "暂无已发布的正式版本。");
+        var warnings = new List<string>();
+        foreach (var candidate in candidates.Where(c => c.Version > currentVersion).OrderByDescending(c => c.Version))
+        {
+            try
+            {
+                var release = await ValidateReleaseAsync(candidate.Release, candidate.Version.ToString(3), ct).ConfigureAwait(false);
+                selected.TryAdd(release, 0);
+                return new(UpdateCheckStatus.UpdateAvailable,
+                    $"发现新版本 {release.Version}。" + (warnings.Count > 0 ? " 更高版本不可用：" + string.Join("；", warnings) : ""), release);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException)
+            {
+                warnings.Add($"{candidate.Version.ToString(3)}：{ex.Message}");
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                warnings.Add($"{candidate.Version.ToString(3)}：发布文件或 tag 已不存在。");
+            }
+        }
+        return warnings.Count > 0
+            ? new(UpdateCheckStatus.InvalidRelease, "新版不兼容或发布文件异常：" + string.Join("；", warnings))
+            : new(UpdateCheckStatus.UpToDate, "当前已是最新正式版本。");
     }
 
     private async Task<UpdateRelease> ValidateReleaseAsync(JsonElement release, string version, CancellationToken ct)
@@ -106,7 +194,16 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         GetAsset(assets, "SHA256SUMS", version);
         using var response = await SendAsync(manifestAsset.Url, true, ct).ConfigureAwait(false);
         using var document = await ReadJsonAsync(response, ManifestLimit, ct).ConfigureAwait(false);
-        var manifest = document.RootElement;
+        var installer = GetAsset(assets, $"UsbWebLauncher-{version}-win-x64-setup.exe", version);
+        var notes = release.TryGetProperty("body", out var body) && body.ValueKind == JsonValueKind.String ? body.GetString()! : "";
+        notes = Regex.Replace(notes, @"<!--\s*usb-web-launcher-release:.*?-->", "", RegexOptions.Singleline).Trim();
+        var validated = ValidateManifest(document.RootElement, version, installer.Size, notes);
+        Require(string.Equals(await ResolveTagAsync(version, ct).ConfigureAwait(false), validated.SourceCommit, StringComparison.OrdinalIgnoreCase), "tag 与源提交不匹配。");
+        return validated;
+    }
+
+    private UpdateRelease ValidateManifest(JsonElement manifest, string version, long? expectedSize, string notes)
+    {
         Require(manifest.GetProperty("schemaVersion").GetInt32() == 1, "不支持的清单版本。");
         Require(Text(manifest, "productId") == "usb-web-launcher", "产品身份不匹配。");
         Require(Text(manifest, "version") == version && Text(manifest, "channel") == "stable", "版本或通道不匹配。");
@@ -118,18 +215,14 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         Require(Regex.IsMatch(commit, "\\A[0-9a-fA-F]{40}\\z"), "源提交无效。");
         var installerName = $"UsbWebLauncher-{version}-win-x64-setup.exe";
         Require(Text(manifest, "installerFileName") == installerName, "安装文件名不匹配。");
-        var installer = GetAsset(assets, installerName, version);
         var size = manifest.GetProperty("size").GetInt64();
-        Require(size > 0 && size <= InstallerLimit && size == installer.Size, "安装文件大小不匹配或超过限制。");
+        Require(size > 0 && size <= InstallerLimit && (expectedSize == null || size == expectedSize), "安装文件大小不匹配或超过限制。");
         var hash = Text(manifest, "sha256");
         Require(Regex.IsMatch(hash, "\\A[0-9a-fA-F]{64}\\z"), "SHA-256 格式无效。");
         var signature = Text(manifest, "signatureStatus");
         Require(signature is "signed" or "unsigned", "签名状态无效。");
-        Require(string.Equals(await ResolveTagAsync(version, ct).ConfigureAwait(false), commit, StringComparison.OrdinalIgnoreCase), "tag 与源提交不匹配。");
-        var notes = release.TryGetProperty("body", out var body) && body.ValueKind == JsonValueKind.String ? body.GetString()! : "";
-        notes = Regex.Replace(notes, @"<!--\s*usb-web-launcher-release:.*?-->", "", RegexOptions.Singleline).Trim();
-        return new(version, notes,
-            installerName, size, hash, installer.Url, commit, signature);
+        return new(version, notes, installerName, size, hash,
+            new Uri($"{Repository}/releases/download/v{version}/{installerName}"), commit, signature);
     }
 
     private async Task<string> ResolveTagAsync(string version, CancellationToken ct)
@@ -233,16 +326,24 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         return (new Uri(expected), size);
     }
 
-    private async Task<HttpResponseMessage> SendAsync(Uri uri, bool asset, CancellationToken ct)
+    private async Task<HttpResponseMessage> SendAsync(Uri uri, bool asset, CancellationToken ct, Action<Uri>? observeUri = null)
     {
+        var initialUri = uri;
         for (var hop = 0; hop <= 5; hop++)
         {
             ValidateUri(uri, asset);
+            if (asset && initialUri != LatestManifest && uri.Host == "github.com")
+                Require(uri == initialUri, "发布文件重定向来源或版本不匹配。");
+            observeUri?.Invoke(uri);
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             request.Headers.UserAgent.ParseAdd("UsbWebLauncher-Updater/1.0");
             if (!asset) { request.Headers.Accept.ParseAdd("application/vnd.github+json"); request.Headers.Add("X-GitHub-Api-Version", "2022-11-28"); }
             var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-            if (response.RequestMessage?.RequestUri is Uri effective) ValidateUri(effective, asset);
+            if (response.RequestMessage?.RequestUri is Uri effective && effective != uri)
+            {
+                response.Dispose();
+                throw new InvalidDataException("更新连接必须关闭自动重定向，以校验每个下载地址。");
+            }
             if (response.StatusCode is HttpStatusCode.MovedPermanently or HttpStatusCode.Redirect or HttpStatusCode.SeeOther or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect)
             {
                 var location = response.Headers.Location;
@@ -251,7 +352,16 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
                 uri = new Uri(uri, location!);
                 continue;
             }
-            if ((int)response.StatusCode is 403 or 429) { response.Dispose(); throw new RateLimitException(); }
+            if ((int)response.StatusCode is 403 or 429)
+            {
+                try
+                {
+                    var limit = await GetRateLimitAsync(response, ct).ConfigureAwait(false);
+                    if (limit != null) throw limit;
+                    response.EnsureSuccessStatusCode();
+                }
+                finally { response.Dispose(); }
+            }
             try { response.EnsureSuccessStatusCode(); return response; }
             catch { response.Dispose(); throw; }
         }
@@ -266,7 +376,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             Require(uri.Host == "api.github.com" && uri.AbsolutePath.StartsWith("/repos/yxsimony-dot/CCB-USB-User/", StringComparison.Ordinal), "API 来源不匹配。");
             return;
         }
-        Require((uri.Host == "github.com" && uri.AbsolutePath.StartsWith("/yxsimony-dot/CCB-USB-User/releases/download/", StringComparison.Ordinal))
+        Require((uri.Host == "github.com" && (uri.AbsolutePath.StartsWith("/yxsimony-dot/CCB-USB-User/releases/download/", StringComparison.Ordinal) || uri == LatestManifest))
             || uri.Host is "release-assets.githubusercontent.com" or "objects.githubusercontent.com" or "github-releases.githubusercontent.com", "拒绝不可信的下载重定向来源。");
     }
 
@@ -288,6 +398,13 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
 
     private static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response, int limit, CancellationToken ct)
     {
+        var bytes = await ReadBytesAsync(response, limit, ct).ConfigureAwait(false);
+        var offset = bytes.Length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
+        return JsonDocument.Parse(bytes.AsMemory(offset));
+    }
+
+    private static async Task<byte[]> ReadBytesAsync(HttpResponseMessage response, int limit, CancellationToken ct)
+    {
         Require(response.Content.Headers.ContentLength is not long size || size <= limit, "响应超过大小限制。");
         await using var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var output = new MemoryStream();
@@ -298,14 +415,49 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             Require(output.Length + count <= limit, "响应超过大小限制。");
             output.Write(buffer, 0, count);
         }
-        var bytes = output.ToArray();
-        var offset = bytes.Length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
-        return JsonDocument.Parse(bytes.AsMemory(offset));
+        return output.ToArray();
     }
 
     private static Version? ParseVersion(string value) => Regex.IsMatch(value, "\\A(0|[1-9][0-9]{0,4})\\.(0|[1-9][0-9]{0,4})\\.(0|[1-9][0-9]{0,4})\\z")
         && Version.TryParse(value, out var version) && version.Major <= 65535 && version.Minor <= 65535 && version.Build <= 65535 ? version : null;
     private static string Text(JsonElement value, string property) => value.GetProperty(property).GetString() ?? "";
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidDataException(message); }
-    private sealed class RateLimitException : HttpRequestException { }
+    private async Task<RateLimitException?> GetRateLimitAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        var now = utcNow();
+        var retry = response.Headers.RetryAfter;
+        var isLimit = (int)response.StatusCode == 429 || retry != null
+            || (response.Headers.TryGetValues("X-RateLimit-Remaining", out var remaining) && remaining.Any(value => value.Trim() == "0"));
+        if (!isLimit)
+        {
+            try
+            {
+                using var document = await ReadJsonAsync(response, ManifestLimit, ct).ConfigureAwait(false);
+                if (document.RootElement.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String)
+                {
+                    var text = message.GetString() ?? "";
+                    isLimit = text.Contains("API rate limit exceeded", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("secondary rate limit", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception ex) when (ex is InvalidDataException or JsonException or InvalidOperationException) { }
+        }
+        if (!isLimit) return null;
+        var delta = retry?.Delta ?? TimeSpan.FromMinutes(1);
+        var retryAt = retry?.Date ?? now.Add(delta > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : delta);
+        if (response.Headers.TryGetValues("X-RateLimit-Reset", out var resets)
+            && long.TryParse(resets.FirstOrDefault(), out var seconds) && seconds >= 0 && seconds <= 253402300799)
+        {
+            var reset = DateTimeOffset.FromUnixTimeSeconds(seconds);
+            if (reset > retryAt) retryAt = reset;
+        }
+        if (retryAt <= now) retryAt = now.AddMinutes(1);
+        if (retryAt > now.AddDays(1)) retryAt = now.AddDays(1);
+        return new RateLimitException(retryAt);
+    }
+
+    private sealed class RateLimitException(DateTimeOffset retryAt) : HttpRequestException("GitHub 暂时限制下载请求，请稍后重试。")
+    {
+        public DateTimeOffset RetryAt { get; } = retryAt;
+    }
 }
