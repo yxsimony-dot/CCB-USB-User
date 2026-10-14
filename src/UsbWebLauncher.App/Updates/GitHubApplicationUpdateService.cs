@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +18,8 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
     private const int ListLimit = 2 * 1024 * 1024;
     private const int ManifestLimit = 64 * 1024;
     private const long InstallerLimit = 1024L * 1024 * 1024;
+    private const int DownloadMaxAttempts = 4;
+    private const int DownloadBufferSize = 81920;
     private readonly HttpClient client;
     private readonly Version currentVersion;
     private readonly Version osVersion;
@@ -24,7 +27,9 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
     private readonly int maxPages;
     private readonly TimeSpan timeout;
     private readonly Func<DateTimeOffset> utcNow;
+    private readonly Func<TimeSpan, CancellationToken, Task> delayAsync;
     private readonly SemaphoreSlim checkGate = new(1, 1);
+    private readonly SemaphoreSlim downloadGate = new(1, 1);
     private UpdateCheckResult? cachedCheck;
     private DateTimeOffset cacheExpires;
     private DateTimeOffset rateLimitUntil;
@@ -34,7 +39,8 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
 
     // Injected clients must disable automatic redirects; CreateDefault enforces this for production.
     public GitHubApplicationUpdateService(HttpClient client, string currentVersion, string cacheRoot,
-        Version? osVersion = null, int maxPages = 10, TimeSpan? timeout = null, Func<DateTimeOffset>? utcNow = null)
+        Version? osVersion = null, int maxPages = 10, TimeSpan? timeout = null, Func<DateTimeOffset>? utcNow = null,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
     {
         this.client = client;
         this.currentVersion = ParseVersion(currentVersion) ?? throw new ArgumentException("Invalid current version.", nameof(currentVersion));
@@ -43,6 +49,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         this.maxPages = maxPages > 0 ? maxPages : throw new ArgumentOutOfRangeException(nameof(maxPages));
         this.timeout = timeout ?? TimeSpan.FromSeconds(30);
         this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        this.delayAsync = delayAsync ?? Task.Delay;
     }
 
     public static GitHubApplicationUpdateService CreateDefault(string currentVersion) => new(
@@ -247,38 +254,73 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         cancellationToken.ThrowIfCancellationRequested();
         Require(selected.ContainsKey(release), "请重新检查更新后再下载。");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        deadline.CancelAfter(TimeSpan.FromMinutes(10));
+        deadline.CancelAfter(TimeSpan.FromMinutes(30));
         var ct = deadline.Token;
-        var directory = Path.Combine(cacheRoot, release.Version, Guid.NewGuid().ToString("N"));
-        EnsureSafePath(directory);
-        Directory.CreateDirectory(directory);
-        EnsureSafePath(directory);
-        var finalPath = Path.Combine(directory, release.InstallerFileName);
-        var partialPath = finalPath + ".partial";
+        var entered = false;
         try
         {
-            using var response = await SendAsync(release.DownloadUrl, true, ct).ConfigureAwait(false);
-            if (response.Content.Headers.ContentLength is long declared)
-                Require(declared == release.Size, "安装文件大小与清单不一致。");
-            await using (var output = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
-            await using (var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
-            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            await downloadGate.WaitAsync(ct).ConfigureAwait(false);
+            entered = true;
+            var directory = Path.Combine(cacheRoot, release.Version);
+            EnsureSafePath(directory);
+            Directory.CreateDirectory(directory);
+            EnsureSafePath(directory);
+            var finalPath = Path.Combine(directory, release.InstallerFileName);
+            var partialPath = finalPath + ".partial";
+            EnsureSafePath(finalPath);
+            EnsureSafePath(partialPath);
+
+            if (File.Exists(finalPath))
             {
-                var buffer = new byte[81920];
-                long received = 0;
-                int count;
-                while ((count = await input.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+                if (await HasExpectedHashAsync(finalPath, release, ct).ConfigureAwait(false))
                 {
-                    received += count;
-                    Require(received <= release.Size && received <= InstallerLimit, "下载超出预期大小。");
-                    hash.AppendData(buffer, 0, count);
-                    await output.WriteAsync(buffer.AsMemory(0, count), ct).ConfigureAwait(false);
-                    progress?.Report(new(received, release.Size));
+                    downloads[finalPath] = release;
+                    progress?.Report(new(release.Size, release.Size));
+                    return new(release, finalPath);
                 }
-                Require(received == release.Size, "下载不完整。");
-                Require(Convert.ToHexString(hash.GetHashAndReset()).Equals(release.Sha256, StringComparison.OrdinalIgnoreCase), "安装文件 SHA-256 校验失败。");
-                await output.FlushAsync(ct).ConfigureAwait(false);
+                File.Delete(finalPath);
             }
+
+            if (File.Exists(partialPath) && new FileInfo(partialPath).Length > release.Size)
+                File.Delete(partialPath);
+
+            Exception? lastTransientError = null;
+            for (var attempt = 1; attempt <= DownloadMaxAttempts; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var received = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
+                progress?.Report(new(received, release.Size));
+                if (received == release.Size) break;
+                try
+                {
+                    await DownloadRangeAsync(release, partialPath, received, progress, ct).ConfigureAwait(false);
+                    lastTransientError = null;
+                    break;
+                }
+                catch (Exception ex) when (IsTransientDownloadFailure(ex, ct))
+                {
+                    lastTransientError = ex;
+                    if (attempt == DownloadMaxAttempts) break;
+                    await delayAsync(TimeSpan.FromSeconds(1 << (attempt - 1)), ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    if (File.Exists(partialPath)) File.Delete(partialPath);
+                    throw;
+                }
+            }
+
+            var completed = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
+            if (lastTransientError != null)
+                throw new IOException($"下载连接多次中断，已自动重试 {DownloadMaxAttempts} 次；已保留 {completed} / {release.Size} 字节，下次可继续下载。", lastTransientError);
+
+            Require(completed == release.Size, "下载不完整。");
+            if (!await HasExpectedHashAsync(partialPath, release, ct).ConfigureAwait(false))
+            {
+                File.Delete(partialPath);
+                throw new InvalidDataException("安装文件 SHA-256 校验失败。");
+            }
+
             ct.ThrowIfCancellationRequested();
             EnsureSafePath(partialPath);
             File.Move(partialPath, finalPath);
@@ -287,9 +329,62 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         }
         finally
         {
-            // Only remove this attempt's partial file; no recursive cleanup of user/cache data.
-            if (File.Exists(partialPath)) File.Delete(partialPath);
+            if (entered) downloadGate.Release();
         }
+    }
+
+    private async Task DownloadRangeAsync(UpdateRelease release, string partialPath, long received,
+        IProgress<UpdateDownloadProgress>? progress, CancellationToken ct)
+    {
+        using var response = await SendAsync(release.DownloadUrl, true, ct, rangeStart: received > 0 ? received : null).ConfigureAwait(false);
+        var append = received > 0 && response.StatusCode == HttpStatusCode.PartialContent;
+        if (received > 0 && !append)
+        {
+            Require(response.StatusCode == HttpStatusCode.OK, "下载服务器拒绝断点续传。");
+            received = 0;
+        }
+
+        if (append)
+        {
+            var range = response.Content.Headers.ContentRange;
+            Require(range?.Unit == "bytes" && range.From == received && range.Length == release.Size,
+                "下载断点与发布文件不匹配。");
+            if (response.Content.Headers.ContentLength is long declared)
+                Require(declared > 0 && declared <= release.Size - received, "安装文件大小与清单不一致。");
+        }
+        else if (response.Content.Headers.ContentLength is long declared)
+        {
+            Require(declared == release.Size, "安装文件大小与清单不一致。");
+        }
+
+        var mode = append ? FileMode.Open : FileMode.Create;
+        await using var output = new FileStream(partialPath, mode, FileAccess.Write, FileShare.None, DownloadBufferSize, true);
+        if (append) output.Seek(received, SeekOrigin.Begin);
+        await using var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        var buffer = new byte[DownloadBufferSize];
+        int count;
+        while ((count = await input.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+        {
+            received += count;
+            Require(received <= release.Size && received <= InstallerLimit, "下载超出预期大小。");
+            await output.WriteAsync(buffer.AsMemory(0, count), ct).ConfigureAwait(false);
+            progress?.Report(new(received, release.Size));
+        }
+        await output.FlushAsync(ct).ConfigureAwait(false);
+        if (received < release.Size)
+            throw new IOException($"下载连接提前结束，当前已接收 {received} / {release.Size} 字节。");
+    }
+
+    private static bool IsTransientDownloadFailure(Exception exception, CancellationToken ct) =>
+        !ct.IsCancellationRequested && exception is HttpRequestException or IOException;
+
+    private static async Task<bool> HasExpectedHashAsync(string path, UpdateRelease release, CancellationToken ct)
+    {
+        var info = new FileInfo(path);
+        if (info.Length != release.Size) return false;
+        await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, DownloadBufferSize, true);
+        var hash = await SHA256.HashDataAsync(input, ct).ConfigureAwait(false);
+        return Convert.ToHexString(hash).Equals(release.Sha256, StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task VerifyDownloadedAsync(DownloadedUpdate downloaded, CancellationToken cancellationToken)
@@ -298,7 +393,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         Require(downloads.TryGetValue(downloaded.FilePath, out var issued) && issued == downloaded.Release && selected.ContainsKey(downloaded.Release), "安装缓存身份无效，请重新下载。");
         EnsureSafePath(downloaded.FilePath);
         Require(Path.GetFileName(downloaded.FilePath) == downloaded.Release.InstallerFileName, "安装缓存文件名无效。");
-        await using var input = new FileStream(downloaded.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+        await using var input = new FileStream(downloaded.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, DownloadBufferSize, true);
         Require(input.Length == downloaded.Release.Size, "安装缓存大小已改变，请重新下载。");
         var hash = await SHA256.HashDataAsync(input, cancellationToken).ConfigureAwait(false);
         Require(Convert.ToHexString(hash).Equals(downloaded.Release.Sha256, StringComparison.OrdinalIgnoreCase), "安装缓存已改变，请重新下载。");
@@ -326,7 +421,8 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         return (new Uri(expected), size);
     }
 
-    private async Task<HttpResponseMessage> SendAsync(Uri uri, bool asset, CancellationToken ct, Action<Uri>? observeUri = null)
+    private async Task<HttpResponseMessage> SendAsync(Uri uri, bool asset, CancellationToken ct,
+        Action<Uri>? observeUri = null, long? rangeStart = null)
     {
         var initialUri = uri;
         for (var hop = 0; hop <= 5; hop++)
@@ -337,6 +433,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             observeUri?.Invoke(uri);
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             request.Headers.UserAgent.ParseAdd("UsbWebLauncher-Updater/1.0");
+            if (rangeStart is long start) request.Headers.Range = new RangeHeaderValue(start, null);
             if (!asset) { request.Headers.Accept.ParseAdd("application/vnd.github+json"); request.Headers.Add("X-GitHub-Api-Version", "2022-11-28"); }
             var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (response.RequestMessage?.RequestUri is Uri effective && effective != uri)

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -297,6 +298,48 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task InterruptedDownloadRetriesFromServerRange()
+    {
+        var service = Service([Release("1.1.10")]);
+        var release = (await service.CheckAsync(default)).Release!;
+        const int split = 12;
+        var firstRequest = true;
+        long? resumedFrom = null;
+        intercept = request =>
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith(".exe")) return null;
+            var range = request.Headers.Range?.Ranges.SingleOrDefault()?.From;
+            if (firstRequest)
+            {
+                firstRequest = false;
+                Assert.Null(range);
+                var response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(new ThrowAfterBytesStream(installer, split))
+                };
+                response.Content.Headers.ContentLength = installer.Length;
+                return response;
+            }
+
+            resumedFrom = range;
+            Assert.Equal(split, range);
+            var offset = checked((int)range!.Value);
+            var partial = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent(installer[offset..])
+            };
+            partial.Content.Headers.ContentRange = new ContentRangeHeaderValue(offset, installer.Length - 1, installer.Length);
+            return partial;
+        };
+
+        var downloaded = await service.DownloadAsync(release, null, default);
+
+        Assert.Equal(split, resumedFrom);
+        Assert.Equal(installer, await File.ReadAllBytesAsync(downloaded.FilePath));
+        Assert.Empty(Directory.EnumerateFiles(cache, "*.partial", SearchOption.AllDirectories));
+    }
+
+    [Fact]
     public async Task CancellationDuringStreamCleansPartialFile()
     {
         var service = Service([Release("1.1.10")]);
@@ -412,10 +455,9 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
     }
 
     [Theory]
-    [InlineData(-1)]
     [InlineData(1)]
     [InlineData(0)]
-    public async Task CorruptTruncatedOrOversizedDownloadCleansOnlyOwnPartialFile(int lengthChange)
+    public async Task CorruptOrOversizedDownloadCleansOnlyOwnPartialFile(int lengthChange)
     {
         var service = Service([Release("1.1.10")]);
         var release = (await service.CheckAsync(default)).Release!;
@@ -433,6 +475,38 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => service.DownloadAsync(release, null, default));
         Assert.Equal("keep", await File.ReadAllTextAsync(keep));
         Assert.Empty(Directory.EnumerateFiles(cache, "*.partial", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task RepeatedTruncationPreservesPartialAndNextClickContinues()
+    {
+        var service = Service([Release("1.1.10")]);
+        var release = (await service.CheckAsync(default)).Release!;
+        long? nextClickRange = null;
+        intercept = request =>
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith(".exe")) return null;
+            var response = Bytes(installer[..^1]);
+            response.Content.Headers.ContentLength = installer.Length;
+            return response;
+        };
+
+        var error = await Assert.ThrowsAsync<IOException>(() => service.DownloadAsync(release, null, default));
+        Assert.Contains("已保留", error.Message);
+        var partialPath = Assert.Single(Directory.EnumerateFiles(cache, "*.partial", SearchOption.AllDirectories));
+        Assert.Equal(installer.Length - 1, new FileInfo(partialPath).Length);
+
+        intercept = request =>
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith(".exe")) return null;
+            nextClickRange = request.Headers.Range?.Ranges.SingleOrDefault()?.From;
+            return Bytes(installer);
+        };
+        var downloaded = await service.DownloadAsync(release, null, default);
+
+        Assert.Equal(installer.Length - 1, nextClickRange);
+        Assert.Equal(installer, await File.ReadAllBytesAsync(downloaded.FilePath));
+        Assert.False(File.Exists(partialPath));
     }
 
     [Fact]
@@ -479,7 +553,8 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
             }
             return Bytes(installer);
         });
-        return new GitHubApplicationUpdateService(new HttpClient(handler), "1.1.0", cache, new Version(10, 0, 22621), maxPages, utcNow: utcNow);
+        return new GitHubApplicationUpdateService(new HttpClient(handler), "1.1.0", cache, new Version(10, 0, 22621), maxPages,
+            utcNow: utcNow, delayAsync: (_, cancellationToken) => Task.Delay(TimeSpan.Zero, cancellationToken));
     }
 
     private Dictionary<string, object?> Manifest(string version)
@@ -526,6 +601,21 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         { cts.Cancel(); return base.ReadAsync(buffer, cancellationToken); }
+    }
+    private sealed class ThrowAfterBytesStream(byte[] bytes, int byteCount) : MemoryStream(bytes)
+    {
+        private bool failed;
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!failed && Position >= byteCount)
+            {
+                failed = true;
+                throw new IOException("Synthetic connection interruption.");
+            }
+            var remaining = byteCount - checked((int)Position);
+            return base.ReadAsync(buffer[..Math.Min(buffer.Length, Math.Max(0, remaining))], cancellationToken);
+        }
     }
     public void Dispose() { if (Directory.Exists(cache)) Directory.Delete(cache, true); }
 }
