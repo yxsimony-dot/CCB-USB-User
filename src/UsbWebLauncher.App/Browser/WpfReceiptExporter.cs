@@ -110,13 +110,15 @@ internal sealed class WpfReceiptExporter(WebView2 browser) : IAsyncDisposable
             string? Read(string name) => parsed.RootElement.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
                 ? value.GetString() : null;
             var status = Read("status") ?? "failed";
+            JsonElement? diagnostics = parsed.RootElement.TryGetProperty("diagnostics", out var rawDiagnostics) &&
+                rawDiagnostics.ValueKind == JsonValueKind.Object ? rawDiagnostics.Clone() : null;
             StatementExportIdentity? identity = null;
             if (status == "identified")
             {
                 try { identity = StatementExportIdentity.CreateReceipt(Read("companyName") ?? string.Empty, Read("accountLast4") ?? string.Empty, range.Month); }
-                catch (ArgumentException) { return new("failed", "results", "naming-identity"); }
+                catch (ArgumentException) { return new("failed", "results", "naming-identity", null, diagnostics); }
             }
-            var reply = new StatementPageReply(status, Read("stage"), Read("code"), identity);
+            var reply = new StatementPageReply(status, Read("stage"), Read("code"), identity, diagnostics);
             if (operation != "inspect" && operation != "dispose")
                 CertificateLoginDiagnostics.Write("receipt-export-step", new
                 {
@@ -128,10 +130,43 @@ internal sealed class WpfReceiptExporter(WebView2 browser) : IAsyncDisposable
                         or "receipt-menu" or "query-rejected" or "query-controls" or "query-type" or "field-readback"
                         or "date-range" or "result-identity" or "not-first-page" or "print-controls" or "selection-failed"
                         or "login-required" or "stale" or "run-conflict" or "document-limit" or "multiple-forms"
-                        or "not-opened" or "not-queried" or "not-identified" or "page-changed" ? reply.Code : "none"
+                        or "not-opened" or "not-queried" or "not-identified" or "page-changed" ? reply.Code : "none",
+                    diagnostics = ReadDiagnostics(reply.Diagnostics)
                 });
             return reply;
         }
+
+        private static object? ReadDiagnostics(JsonElement? raw)
+        {
+            if (raw is not { ValueKind: JsonValueKind.Object } value) return null;
+            return new
+            {
+                documentCount = ReadCount(value, "documentCount"),
+                homeCount = ReadCount(value, "homeCount"),
+                tabCount = ReadCount(value, "tabCount"),
+                frameCount = ReadCount(value, "frameCount"),
+                homeActive = ReadBoolean(value, "homeActive"),
+                frameVisible = ReadBoolean(value, "frameVisible"),
+                frameReady = ReadBoolean(value, "frameReady"),
+                childFound = ReadBoolean(value, "childFound"),
+                childReadyState = ReadReadyState(value, "childReadyState"),
+                accountScopeCount = ReadCount(value, "accountScopeCount"),
+                identityFound = ReadBoolean(value, "identityFound")
+            };
+        }
+
+        private static int? ReadCount(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.Number &&
+            item.TryGetInt32(out var count) && count is >= 0 and <= 64 ? count : null;
+
+        private static bool? ReadBoolean(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? item.GetBoolean() : null;
+
+        private static string? ReadReadyState(JsonElement value, string name) =>
+            value.TryGetProperty(name, out var item) && item.ValueKind == JsonValueKind.String &&
+            item.GetString() is "loading" or "interactive" or "complete" or "other" or "missing"
+                ? item.GetString() : null;
 
         private static string LoadScript()
         {

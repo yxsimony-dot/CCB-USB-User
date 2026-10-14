@@ -1,6 +1,13 @@
+using System.Text.Json;
+
 namespace UsbWebLauncher.App.Browser;
 
-public sealed record StatementPageReply(string Status, string? Stage = null, string? Code = null, StatementExportIdentity? Identity = null);
+public sealed record StatementPageReply(
+    string Status,
+    string? Stage = null,
+    string? Code = null,
+    StatementExportIdentity? Identity = null,
+    JsonElement? Diagnostics = null);
 
 public interface IStatementExportPage
 {

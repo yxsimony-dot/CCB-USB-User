@@ -76,6 +76,40 @@ public sealed class ReceiptExportCoordinatorTests
         Assert.Equal(4, calls.Count(c => c == "identify")); Assert.Equal(2, calls.Count(c => c == "download"));
     }
 
+    [Fact]
+    public async Task ContinuesPollingWhenHomeIdentityIsStillBeingInserted()
+    {
+        var calls = new List<string>();
+        var replies = new Queue<StatementPageReply>([
+            new("waiting", "home", "account-identity"),
+            new("home-ready", "home")
+        ]);
+        var page = new Page(calls)
+        {
+            Override = op => op == "ensure-home" && replies.Count != 0 ? replies.Dequeue() : null
+        };
+        var coordinator = new ReceiptExportCoordinator(page, (_, _) => new Download(calls),
+            (_, _) => Task.CompletedTask);
+
+        Assert.Equal("receipt.pdf", await coordinator.ExportAsync(Range, _ => { }, CancellationToken.None));
+        Assert.Equal(2, calls.Count(operation => operation == "ensure-home"));
+    }
+
+    [Fact]
+    public async Task WaitingTimeoutUsesFriendlyReceiptMessage()
+    {
+        var calls = new List<string>();
+        var page = new Page(calls) { Override = op => op == "ensure-home" ? new("waiting", "home", "account-identity") : null };
+        var coordinator = new ReceiptExportCoordinator(page, (_, _) => throw new Exception("must not arm"),
+            (_, _) => Task.FromCanceled(new CancellationToken(true)));
+
+        var error = await Assert.ThrowsAsync<StatementExportException>(() =>
+            coordinator.ExportAsync(Range, _ => { }, CancellationToken.None));
+
+        Assert.Equal("等待电子回单页面超时，请查看银行页面后重试。", error.Message);
+        Assert.Equal("dispose", calls.Last());
+    }
+
     private sealed class Page(List<string> calls) : IStatementExportPage
     {
         public List<string> RunIds { get; } = [];

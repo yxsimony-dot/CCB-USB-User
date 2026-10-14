@@ -93,6 +93,7 @@
                                 <Button.ContextMenu>
                                     <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
                                         <MenuItem Header="检查更新" Click="OnCheckUpdatesClicked" />
+                                        <MenuItem Header="导出诊断日志" Click="OnExportDiagnosticsClicked" />
                                         <Separator />
                                         <MenuItem Header="检查完整环境 / 官方安装入口" Click="OnDependencyPreparationClicked"
                                                   IsEnabled="{Binding CanInstallNativePromptBroker}" />

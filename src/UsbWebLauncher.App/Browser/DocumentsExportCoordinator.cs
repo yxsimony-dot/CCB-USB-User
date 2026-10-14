@@ -38,7 +38,8 @@ public sealed record DocumentsExportResult(DocumentExportResult Statement, Docum
     public string Message => Statement.Status != DocumentExportStatus.Completed ? Statement.Message :
         "流水已保存：" + Statement.FilePath + Environment.NewLine +
         (Receipt?.Status == DocumentExportStatus.Completed ? "第一页回单已保存：" + Receipt.FilePath :
-            Receipt?.Status == DocumentExportStatus.Failed ? "回单导出失败：" + Receipt.Message :
+            Receipt?.Status == DocumentExportStatus.Failed ? "回单导出失败：" + Receipt.Message + Environment.NewLine +
+                "可通过“环境维护 → 导出诊断日志”保存日志后提供分析。" :
             Receipt?.Status == DocumentExportStatus.Cancelled ? "回单" + Receipt.Message :
             Receipt?.Message ?? "回单尚未导出。");
 }

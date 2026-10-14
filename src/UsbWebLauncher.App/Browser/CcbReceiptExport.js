@@ -1,7 +1,11 @@
 (request) => {
     'use strict';
     // Observed bank controls only. Full account/option values remain in page-local state.
-    const result = (status, stage = 'unsupported', code) => code ? { status, stage, code } : { status, stage };
+    const result = (status, stage = 'unsupported', code, diagnostics) => {
+        const output = code ? { status, stage, code } : { status, stage };
+        if (diagnostics) output.diagnostics = diagnostics;
+        return output;
+    };
     const key = '__usbWebLauncherReceiptExportV1', root = window.document;
     // The account's bank layout chooses the numeric version (for example 08 or 09).
     const isBusinessPath = pathname => /^\/NCCB\/NECV6B2BMainPlat_\d+_(?:LH|FW)$/.test(pathname);
@@ -91,28 +95,49 @@
             if (state.opened) return result('failed', 'home', 'stale');
             const homes = docs.flatMap(item => list(item.doc, '#menu1Content a[id="0000"]')
                 .filter(node => enabled(node) && text(node) === '首页' && handler(node, 'onclick', 'taskBar.createWin')).map(node => ({ ...item, node })));
-            if (homes.length !== 1) return result(homes.length > 1 ? 'ambiguous' : 'unsupported', 'home', 'home-not-found');
+            const homeDiagnostics = (home, tab, frame, child, scopes, identityFound) => ({
+                documentCount: docs.length,
+                homeCount: homes.length,
+                tabCount: docs.reduce((count, item) => count + list(item.doc, '[id="task_0000"]').length, 0),
+                frameCount: docs.reduce((count, item) => count + list(item.doc, 'iframe[id="win_0000"]').length, 0),
+                homeActive: !!home && !!tab && enabled(tab) && tab.classList.contains('taskOn_div'),
+                frameVisible: !!frame && visible(frame),
+                frameReady: !!frame && frame.getAttribute('isReady') === 'true',
+                childFound: !!child,
+                childReadyState: child ? ({
+                    loading: 'loading',
+                    interactive: 'interactive',
+                    complete: 'complete'
+                }[child.doc.readyState] || 'other') : 'missing',
+                accountScopeCount: scopes?.length || 0,
+                identityFound: !!identityFound
+            });
+            if (homes.length !== 1) {
+                const diagnostics = homeDiagnostics(null, null, null, null, [], false);
+                return result(homes.length > 1 ? 'ambiguous' : 'waiting', 'home', 'home-not-found', diagnostics);
+            }
             const home = homes[0], tab = one(home.doc, '[id="task_0000"]'), frame = one(home.doc, 'iframe[id="win_0000"]');
             if (!home.current() || (state.homeDocument && state.homeDocument !== home.doc)) return result('failed', 'home', 'stale');
             const active = enabled(tab) && tab.classList.contains('taskOn_div');
+            const child = frame && frame.contentDocument ? docs.find(item => item.doc === frame.contentDocument) : null;
+            const scopes = child ? list(child.doc, '.accInfoDiv .accDetailDiv .accInfo').filter(visible) : [];
+            const first = scopes[0], id = first && identity(first);
+            const diagnostics = homeDiagnostics(home, tab, frame, child, scopes, !!id);
             if (active && visible(frame) && frame.getAttribute('isReady') === 'true') {
-                const child = docs.find(item => item.doc === frame.contentDocument);
-                if (child && child.current() && child.doc.readyState === 'complete') {
+                if (child && child.current() && child.doc.readyState === 'complete' && id) {
                     // Reuses the exact homepage account schema already verified for company display.
-                    const scopes = list(child.doc, '.accInfoDiv .accDetailDiv .accInfo').filter(visible);
-                    const first = scopes[0], id = first && identity(first);
-                    if (!id) return result('failed', 'home', 'account-identity');
                     state.homeReady = true; state.homeDocument = home.doc; state.homeScope = first;
                     state.account = id.account; state.company = id.company;
-                    return result('home-ready', 'home');
+                    return result('home-ready', 'home', undefined, diagnostics);
                 }
+                return result('waiting', 'home', 'account-identity', diagnostics);
             }
             if (!active && !state.homeClicked) {
                 state.homeClicked = true; state.homeDocument = home.doc;
                 if (!fresh() || !home.current()) return result('failed', 'home', 'stale');
                 home.node.click();
             }
-            return result('waiting', 'home');
+            return result('waiting', 'home', undefined, diagnostics);
         }
         if (!state.homeReady || !originalIdentity()) return result('failed', 'home', 'account-identity');
         if (request.operation === 'open') {

@@ -6,6 +6,7 @@ using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.App.Configuration;
 using Microsoft.Win32;
 using UsbWebLauncher.App.Updates;
+using UsbWebLauncher.App.Browser;
 
 namespace UsbWebLauncher.App;
 
@@ -69,6 +70,31 @@ public partial class MainWindow : Window
         {
             MessageBox.Show(this, "无法保存下载目录。请确认所选文件夹可写、磁盘空间充足后重试。原设置未更改。",
                 "下载目录", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void OnExportDiagnosticsClicked(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SaveFileDialog
+        {
+            Title = "导出诊断日志",
+            Filter = "诊断日志压缩包 (*.zip)|*.zip",
+            DefaultExt = ".zip",
+            AddExtension = true,
+            FileName = $"UsbWebLauncher-diagnostics-{DateTime.Now:yyyyMMdd-HHmmss}.zip",
+            OverwritePrompt = true
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            DiagnosticBundleExporter.Export(dialog.FileName);
+            MessageBox.Show(this, "诊断日志已保存，可将该 ZIP 文件提供给开发人员分析。",
+                "导出诊断日志", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch
+        {
+            MessageBox.Show(this, "诊断日志导出失败，请确认目标文件夹可写后重试。",
+                "导出诊断日志", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 

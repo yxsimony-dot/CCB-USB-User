@@ -12,6 +12,8 @@ internal static class CertificateLoginDiagnostics
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "UsbWebLauncher", "logs", "certificate-page-login.jsonl");
 
+    internal static string LogDirectory => Path.GetDirectoryName(PathName)!;
+
     public static void BeginRun()
     {
         lock (Sync)

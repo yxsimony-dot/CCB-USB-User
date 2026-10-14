@@ -226,6 +226,44 @@ test('returns home before receipt navigation and fills exact month and observed 
     assert.equal(p.doc.querySelector('[name="Mrg_Dwld_Ind"]:checked').value, 'yes');
     assert.equal(p.run('query').status, 'queried'); assert.equal(p.clicks.query, 1);
 });
+test('waits for the delayed home menu and succeeds after it is inserted', t => {
+    const p = fixture(t);
+    p.main.querySelector('[id="0000"]').remove();
+    const first = p.run('ensure-home');
+    assert.equal(first.status, 'waiting');
+    assert.equal(first.code, 'home-not-found');
+    assert.equal(first.diagnostics.homeCount, 0);
+    p.main.querySelector('#menu1Content').insertAdjacentHTML(
+        'afterbegin',
+        '<a id="0000" onclick="taskBar.createWin()">首页</a>'
+    );
+    assert.equal(p.run('ensure-home').status, 'home-ready');
+});
+test('waits for the delayed account card and succeeds after identity is inserted', t => {
+    const p = fixture(t);
+    p.home.querySelector('.accInfo').remove();
+    const first = p.run('ensure-home');
+    assert.equal(first.status, 'waiting');
+    assert.equal(first.code, 'account-identity');
+    assert.equal(first.diagnostics.identityFound, false);
+    p.home.querySelector('.accInfoDiv').innerHTML =
+        `<div class="accDetailDiv"><div class="accInfo"><span id="ACCNM_ZHGS" class="deptName">${company}</span><span id="ACCNO_ZHGS" class="accNo">${account}</span></div></div>`;
+    assert.equal(p.run('ensure-home').status, 'home-ready');
+});
+test('keeps multiple home candidates ambiguous and diagnostics redacted', t => {
+    const p = fixture(t);
+    p.main.querySelector('#menu1Content').insertAdjacentHTML(
+        'afterbegin',
+        '<a id="0000" onclick="taskBar.createWin()">首页</a>'
+    );
+    const reply = p.run('ensure-home');
+    assert.equal(reply.status, 'ambiguous');
+    assert.equal(reply.code, 'home-not-found');
+    assert.equal(reply.diagnostics.homeCount, 2);
+    const serialized = JSON.stringify(reply);
+    assert.doesNotMatch(serialized, new RegExp(company));
+    assert.doesNotMatch(serialized, new RegExp(account));
+});
 test('matches full account and company despite option order; returns only filename identity', t => {
     const p = fixture(t); p.queried(); p.results();
     assert.deepEqual(p.run('identify'), { status: 'identified', stage: 'results', companyName: company, accountLast4: '0007' });
