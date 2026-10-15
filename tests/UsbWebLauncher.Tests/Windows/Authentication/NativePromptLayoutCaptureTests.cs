@@ -40,6 +40,9 @@ public sealed class NativePromptLayoutCaptureTests
             {
                 Assert.NotNull(snapshot);
                 Assert.True(snapshot.UsesDialogEnterSubmit);
+                Assert.Equal(
+                    NativePromptDialogEnterLayout.TitledPasswordEdit,
+                    snapshot.DialogEnterLayout);
                 Assert.Equal(IntPtr.Zero, snapshot.SubmitControlHandle);
                 Assert.Equal(0, snapshot.SubmitControlId);
                 AssertCapturedLayoutMatch(policy, snapshot, title, expected: true);
@@ -77,6 +80,45 @@ public sealed class NativePromptLayoutCaptureTests
             else Assert.Null(snapshot);
         }
         finally { DestroyWindow(dialog); }
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(1024, false)]
+    public void Capture_CaptionlessCcbKeyboardRequiresCompleteFingerprint(
+        int omittedControlId,
+        bool expected)
+    {
+        var dialog = CreateWindowExW(0x08000000, "#32770", "", 0x10000000,
+            -32000, -32000, 375, 163, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        Assert.NotEqual(IntPtr.Zero, dialog);
+        try
+        {
+            CreateCaptionlessCcbKeyboard(dialog, omittedControlId);
+            var policy = NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy() with
+            { ProcessFileName = Path.GetFileName(Environment.ProcessPath) };
+            var snapshot = new WindowsNativePromptApi().CaptureWindowSnapshot(
+                dialog, policy, Environment.ProcessId);
+            if (!expected)
+            {
+                Assert.Null(snapshot);
+                return;
+            }
+
+            Assert.NotNull(snapshot);
+            Assert.True(snapshot.UsesDialogEnterSubmit);
+            Assert.Equal(
+                NativePromptDialogEnterLayout.CaptionlessCcbKeyboard,
+                snapshot.DialogEnterLayout);
+            Assert.Equal(10005, snapshot.InputControlId);
+            Assert.Equal(IntPtr.Zero, snapshot.SubmitControlHandle);
+            AssertCapturedLayoutMatch(policy, snapshot, string.Empty, expected: true);
+            Assert.False(new WindowsNativePromptApi().IsSubmitControlReady(snapshot));
+        }
+        finally
+        {
+            DestroyWindow(dialog);
+        }
     }
 
     [Theory]
@@ -162,6 +204,35 @@ public sealed class NativePromptLayoutCaptureTests
             snapshot with { IntegrityRid = NativePromptWindowMatcher.MediumIntegrityRid }, Environment.ProcessId));
         Assert.False(NativePromptWindowMatcher.IsMatch(policy,
             snapshot with { IntegrityRid = NativePromptWindowMatcher.HighIntegrityRid }, Environment.ProcessId));
+    }
+
+    private static void CreateCaptionlessCcbKeyboard(IntPtr dialog, int omittedControlId)
+    {
+        Assert.NotEqual(IntPtr.Zero, CreateWindowExW(
+            0, "Edit", "", 0x50000020, 0, 0, 80, 20,
+            dialog, new IntPtr(10005), IntPtr.Zero, IntPtr.Zero));
+        for (var controlId = 1001; controlId <= 1047; controlId++)
+        {
+            if (controlId == omittedControlId) continue;
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(
+                0, "Button", (controlId - 1000).ToString(
+                    "00",
+                    System.Globalization.CultureInfo.InvariantCulture), 0x40000000,
+                0, 25, 30, 20, dialog, new IntPtr(controlId), IntPtr.Zero, IntPtr.Zero));
+        }
+
+        foreach (var (controlId, text) in new[]
+        {
+            (1069, "Caps Lock"),
+            (1070, "←"),
+            (1071, "OK")
+        })
+        {
+            if (controlId == omittedControlId) continue;
+            Assert.NotEqual(IntPtr.Zero, CreateWindowExW(
+                0, "Button", text, 0x40000000,
+                0, 50, 80, 20, dialog, new IntPtr(controlId), IntPtr.Zero, IntPtr.Zero));
+        }
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]

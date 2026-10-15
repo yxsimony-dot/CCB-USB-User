@@ -1,5 +1,12 @@
 namespace UsbWebLauncher.Windows.Authentication.NativePrompt;
 
+internal enum NativePromptDialogEnterLayout
+{
+    None,
+    TitledPasswordEdit,
+    CaptionlessCcbKeyboard
+}
+
 internal sealed record NativePromptWindowSnapshot(
     IntPtr WindowHandle,
     bool IsTopLevel,
@@ -30,7 +37,8 @@ internal sealed record NativePromptWindowSnapshot(
     int SubmitControlId = 0,
     int ParentProcessId = 0,
     bool HasVerifiedAlternativeControls = false,
-    bool UsesDialogEnterSubmit = false)
+    bool UsesDialogEnterSubmit = false,
+    NativePromptDialogEnterLayout DialogEnterLayout = NativePromptDialogEnterLayout.None)
 {
     public IntPtr ForegroundWindowHandle =>
         IsTopLevel || RootWindowHandle == IntPtr.Zero ? WindowHandle : RootWindowHandle;

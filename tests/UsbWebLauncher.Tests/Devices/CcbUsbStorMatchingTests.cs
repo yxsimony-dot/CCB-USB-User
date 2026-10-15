@@ -35,6 +35,7 @@ public sealed class CcbUsbStorMatchingTests
     [InlineData("SAMPLE-02", "1780", "0401", "0001", "Tendyron Token", "TENDYRON U-DISK USB Device", "CCB")]
     [InlineData("SAMPLE-03", "1677", "0054", "0100", "uKeyCI800-K54", "HDZB-CCB USB AutoRunDisk USB Device", "HDZB_USBKEY_KEY")]
     [InlineData("SAMPLE-04", "1677", "0054", "0103", "uKeyCI800-K156", "HDZB-CCB USB AutoRunDisk USB Device", "HDZB_USBKEY_KEY")]
+    [InlineData("SAMPLE-05", "163C", "0620", "0001", "USB Key", "Watch Autorun CDROM USB Device", "\u5EFA\u884C\u7F51\u94F6\u76FE")]
     [InlineData("NEW-PORT", "ABCD", "9876", "9999", "Future model", "new cCb virtual CD", "OTHER")]
     public void MapAndMatch_AcceptsBankEvidenceAcrossModelsAndRevisions(
         string instance, string vendor, string product, string revision, string model, string cdName, string label)
@@ -57,6 +58,10 @@ public sealed class CcbUsbStorMatchingTests
     [Theory]
     [InlineData("USBSTOR", "x-CCB-y", null, true)]
     [InlineData("usbstor", null, "x-ccb-y", true)]
+    [InlineData("USBSTOR", null, "\u5EFA\u884C\u7F51\u94F6\u76FE", true)]
+    [InlineData("USBSTOR", null, "2026-\u5EFA\u884C\u7F51\u94F6\u76FE", true)]
+    [InlineData("USBSTOR", null, "\u5EFA\u884C", false)]
+    [InlineData("USBSTOR", null, "\u7F51\u94F6\u76FE", false)]
     [InlineData("USBSTOR", "Other", "Other", false)]
     [InlineData(null, "CCB", "CCB", false)]
     [InlineData("", "CCB", "CCB", false)]

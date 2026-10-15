@@ -7,8 +7,8 @@ public sealed class CcbDetectorDeviceCatalogTests
 {
     public static IEnumerable<object?[]> DetectorPairs()
     {
-        // Independent transcription of E路护航 Dev2KeyType, not production data.
-        var pairs = new[] { "163C:0406", "163C:0407", "163C:0402", "163C:5471", "163C:548C",
+        // Independent transcription plus captured CCB models, not production data.
+        var pairs = new[] { "163C:0406", "163C:0407", "163C:0402", "163C:5471", "163C:548C", "163C:0620",
             "8829:CCB0", "8829:CCB1", "8829:CCB2", "8829:CCB3", "1780:FE33", "1780:0410", "1780:0401",
             "1677:0028", "1677:0050", "1677:0054", "1677:0057", "096E:0707", "1EA8:C03E", "14D6:3766", "14D6:3769" };
         foreach (var pair in pairs)

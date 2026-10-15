@@ -5,6 +5,7 @@ namespace UsbWebLauncher.Core.Devices;
 public static class UsbDeviceMatcher
 {
     private static readonly StringComparer TextComparer = StringComparer.OrdinalIgnoreCase;
+    private static readonly string[] CcbStorageMarkers = ["CCB", "\u5EFA\u884C\u7F51\u94F6\u76FE"];
 
     public static bool IsCcbUsbStorMatch(UsbDeviceDescriptor device)
     {
@@ -14,8 +15,8 @@ public static class UsbDeviceMatcher
         return device.InstanceId.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase) &&
                (CcbDetectorDeviceCatalog.IsMatch(device) ||
                 (TextComparer.Equals(device.Service, "USBSTOR") &&
-                 (device.CdRomNames.Any(name => name.Contains("CCB", StringComparison.OrdinalIgnoreCase)) ||
-                  device.VolumeLabels.Any(label => label.Contains("CCB", StringComparison.OrdinalIgnoreCase)))));
+                 (ContainsCcbStorageMarker(device.CdRomNames) ||
+                  ContainsCcbStorageMarker(device.VolumeLabels))));
     }
 
     public static bool IsMatch(UsbDeviceDescriptor device, LauncherProfile profile)
@@ -62,4 +63,8 @@ public static class UsbDeviceMatcher
     {
         return string.IsNullOrWhiteSpace(expected) || values.Contains(expected, TextComparer);
     }
+
+    private static bool ContainsCcbStorageMarker(IEnumerable<string> values) =>
+        values.Any(value => CcbStorageMarkers.Any(marker =>
+            value.Contains(marker, StringComparison.OrdinalIgnoreCase)));
 }

@@ -128,4 +128,149 @@ public sealed class NativePromptAlternativeLayoutTests
             AlternativeCandidate() with { InputControlId = 1010, SubmitControlId = 1, HasVerifiedAlternativeControls = verifiedAlternative },
             NativePromptWindowMatcherTests.TrustedClientProcessId));
     }
+
+    [Fact]
+    public void CaptionlessCcbKeyboard_CompleteFingerprintSelectsPasswordInput()
+    {
+        var controls = CaptionlessCcbKeyboardControls();
+
+        Assert.True(NativePromptWindowMatcher.TryFindCaptionlessCcbKeyboardInput(
+            controls, 500, string.Empty, out var input));
+        Assert.NotNull(input);
+        Assert.Equal(10005, input.ControlId);
+        Assert.True(input.IsPassword);
+    }
+
+    [Theory]
+    [InlineData("nonempty-title")]
+    [InlineData("missing-button")]
+    [InlineData("wrong-button-text")]
+    [InlineData("visible-button")]
+    [InlineData("disabled-button")]
+    [InlineData("wrong-process")]
+    [InlineData("non-password-input")]
+    [InlineData("hidden-input")]
+    [InlineData("disabled-input")]
+    [InlineData("wrong-input-id")]
+    [InlineData("extra-edit")]
+    [InlineData("extra-button")]
+    [InlineData("duplicate-id")]
+    public void CaptionlessCcbKeyboard_AlteredFingerprintIsRejected(string difference)
+    {
+        var title = string.Empty;
+        var controls = CaptionlessCcbKeyboardControls().ToList();
+        switch (difference)
+        {
+            case "nonempty-title":
+                title = "验证网银盾密码";
+                break;
+            case "missing-button":
+                controls.RemoveAll(control => control.ControlId == 1024);
+                break;
+            case "wrong-button-text":
+                MutateControl(controls, 1024, control => control with { WindowText = "XX" });
+                break;
+            case "visible-button":
+                MutateControl(controls, 1024, control => control with { IsVisible = true });
+                break;
+            case "disabled-button":
+                MutateControl(controls, 1024, control => control with { IsEnabled = false });
+                break;
+            case "wrong-process":
+                MutateControl(controls, 1024, control => control with { ProcessId = 501 });
+                break;
+            case "non-password-input":
+                MutateControl(controls, 10005, control => control with { IsPassword = false });
+                break;
+            case "hidden-input":
+                MutateControl(controls, 10005, control => control with { IsVisible = false });
+                break;
+            case "disabled-input":
+                MutateControl(controls, 10005, control => control with { IsEnabled = false });
+                break;
+            case "wrong-input-id":
+                MutateControl(controls, 10005, control => control with { ControlId = 10006 });
+                break;
+            case "extra-edit":
+                controls.Add(new NativePromptControlSnapshot(
+                    new IntPtr(20000), true, true, 500, "Edit", 20000, IsPassword: true));
+                break;
+            case "extra-button":
+                controls.Add(new NativePromptControlSnapshot(
+                    new IntPtr(20001), true, true, 500, "Button", 20001, "Extra"));
+                break;
+            case "duplicate-id":
+                MutateControl(controls, 1025, control => control with { ControlId = 1024 });
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(difference));
+        }
+
+        Assert.False(NativePromptWindowMatcher.TryFindCaptionlessCcbKeyboardInput(
+            controls, 500, title, out _));
+    }
+
+    [Fact]
+    public void CaptionlessCcbKeyboardSnapshot_IsAcceptedOnlyWithExplicitLayout()
+    {
+        var candidate = NativePromptWindowMatcherTests.TrustedClientTopLevelCandidate() with
+        {
+            WindowTitle = string.Empty,
+            InputControlId = 10005,
+            SubmitControlHandle = IntPtr.Zero,
+            SubmitWindowClass = string.Empty,
+            SubmitControlId = 0,
+            HasVerifiedAlternativeControls = true,
+            UsesDialogEnterSubmit = true,
+            DialogEnterLayout = NativePromptDialogEnterLayout.CaptionlessCcbKeyboard
+        };
+
+        Assert.True(NativePromptWindowMatcher.IsMatch(
+            NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy(),
+            candidate,
+            NativePromptWindowMatcherTests.TrustedClientProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            NativePromptWindowMatcherTests.TrustedClientTopLevelPolicy(),
+            candidate with { DialogEnterLayout = NativePromptDialogEnterLayout.None },
+            NativePromptWindowMatcherTests.TrustedClientProcessId));
+    }
+
+    private static IReadOnlyList<NativePromptControlSnapshot> CaptionlessCcbKeyboardControls()
+    {
+        var controls = new List<NativePromptControlSnapshot>
+        {
+            new(new IntPtr(10005), true, true, 500, "Edit", 10005, IsPassword: true)
+        };
+        for (var controlId = 1001; controlId <= 1047; controlId++)
+        {
+            controls.Add(new NativePromptControlSnapshot(
+                new IntPtr(controlId),
+                IsVisible: false,
+                IsEnabled: true,
+                ProcessId: 500,
+                WindowClass: "Button",
+                ControlId: controlId,
+                WindowText: (controlId - 1000).ToString(
+                    "00",
+                    System.Globalization.CultureInfo.InvariantCulture)));
+        }
+
+        controls.Add(new NativePromptControlSnapshot(
+            new IntPtr(1069), false, true, 500, "Button", 1069, "Caps Lock"));
+        controls.Add(new NativePromptControlSnapshot(
+            new IntPtr(1070), false, true, 500, "Button", 1070, "←"));
+        controls.Add(new NativePromptControlSnapshot(
+            new IntPtr(1071), false, true, 500, "Button", 1071, "OK"));
+        return controls;
+    }
+
+    private static void MutateControl(
+        IList<NativePromptControlSnapshot> controls,
+        int controlId,
+        Func<NativePromptControlSnapshot, NativePromptControlSnapshot> mutation)
+    {
+        var index = controls.ToList().FindIndex(control => control.ControlId == controlId);
+        Assert.True(index >= 0);
+        controls[index] = mutation(controls[index]);
+    }
 }

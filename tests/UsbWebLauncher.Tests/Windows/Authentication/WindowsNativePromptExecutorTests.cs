@@ -1274,7 +1274,8 @@ public sealed class WindowsNativePromptExecutorTests
         var standard = NativePromptWindowMatcherTests.TrustedClientTopLevelCandidate();
         var target = standard with { WindowTitle = "网银盾验证密码", SubmitControlHandle = IntPtr.Zero,
             SubmitControlId = 0, SubmitWindowClass = "", HasVerifiedAlternativeControls = true,
-            UsesDialogEnterSubmit = true };
+            UsesDialogEnterSubmit = true,
+            DialogEnterLayout = NativePromptDialogEnterLayout.TitledPasswordEdit };
         var native = new RecordingNativePromptApi { Snapshots = [target], FreshSnapshot = target,
             FallbackForegroundHandle = target.WindowHandle };
         var diagnostics = new RecordingInputDiagnostics

@@ -388,6 +388,19 @@ public sealed class NativePromptWindowMatcherTests
     }
 
     [Fact]
+    public void HasSameIdentity_DifferentDialogEnterLayout_ReturnsFalse()
+    {
+        var candidate = TrustedClientTopLevelCandidate();
+
+        Assert.False(NativePromptWindowMatcher.HasSameIdentity(
+            candidate,
+            candidate with
+            {
+                DialogEnterLayout = NativePromptDialogEnterLayout.CaptionlessCcbKeyboard
+            }));
+    }
+
+    [Fact]
     public void HasSameIdentity_TrustedClientTopLevelApprovedTitleTransition_ReturnsTrue()
     {
         var policy = TrustedClientTopLevelPolicy();

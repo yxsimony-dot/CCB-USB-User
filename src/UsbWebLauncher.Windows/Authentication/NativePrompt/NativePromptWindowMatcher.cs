@@ -16,6 +16,7 @@ internal sealed record NativePromptControlSnapshot(
 internal static class NativePromptWindowMatcher
 {
     internal const int HighIntegrityRid = 0x00003000;
+    internal const int CaptionlessCcbKeyboardInputControlId = 10005;
     private const string CapsLockTitleSuffix = " - 大写锁定打开！";
 
     internal static bool TryFindTrustedClientTopLevelControls(
@@ -101,6 +102,83 @@ internal static class NativePromptWindowMatcher
             return false;
         input = edits[0];
         return true;
+    }
+
+    internal static bool TryFindCaptionlessCcbKeyboardInput(
+        IReadOnlyList<NativePromptControlSnapshot> candidates,
+        int processId,
+        string title,
+        out NativePromptControlSnapshot? input)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        input = null;
+        if (title.Length != 0 || processId <= 0)
+        {
+            return false;
+        }
+
+        var relevant = candidates.Where(control =>
+            control.WindowClass is "Edit" or "Button").ToArray();
+        if (relevant.Length != 51 ||
+            relevant.Any(control =>
+                control.WindowHandle == IntPtr.Zero ||
+                control.ProcessId != processId) ||
+            relevant.Select(control => control.WindowHandle).Distinct().Count() != relevant.Length ||
+            relevant.Select(control => control.ControlId).Distinct().Count() != relevant.Length)
+        {
+            return false;
+        }
+
+        var edits = relevant.Where(control => control.WindowClass == "Edit").ToArray();
+        if (edits.Length != 1 ||
+            edits[0].ControlId != CaptionlessCcbKeyboardInputControlId ||
+            !edits[0].IsVisible ||
+            !edits[0].IsEnabled ||
+            !edits[0].IsPassword)
+        {
+            return false;
+        }
+
+        var buttons = relevant.Where(control => control.WindowClass == "Button").ToArray();
+        if (buttons.Length != 50)
+        {
+            return false;
+        }
+
+        for (var controlId = 1001; controlId <= 1047; controlId++)
+        {
+            if (!HasCaptionlessCcbKeyboardButton(
+                    buttons,
+                    controlId,
+                    (controlId - 1000).ToString(
+                        "00",
+                        System.Globalization.CultureInfo.InvariantCulture)))
+            {
+                return false;
+            }
+        }
+
+        if (!HasCaptionlessCcbKeyboardButton(buttons, 1069, "Caps Lock") ||
+            !HasCaptionlessCcbKeyboardButton(buttons, 1070, "←") ||
+            !HasCaptionlessCcbKeyboardButton(buttons, 1071, "OK"))
+        {
+            return false;
+        }
+
+        input = edits[0];
+        return true;
+    }
+
+    private static bool HasCaptionlessCcbKeyboardButton(
+        IReadOnlyList<NativePromptControlSnapshot> buttons,
+        int controlId,
+        string text)
+    {
+        var matches = buttons.Where(button => button.ControlId == controlId).ToArray();
+        return matches.Length == 1 &&
+            !matches[0].IsVisible &&
+            matches[0].IsEnabled &&
+            string.Equals(matches[0].WindowText, text, StringComparison.Ordinal);
     }
 
     private static string NormalizeButtonText(string text) =>
@@ -257,6 +335,7 @@ internal static class NativePromptWindowMatcher
         first.SubmitControlId == second.SubmitControlId &&
         first.HasVerifiedAlternativeControls == second.HasVerifiedAlternativeControls &&
         first.UsesDialogEnterSubmit == second.UsesDialogEnterSubmit &&
+        first.DialogEnterLayout == second.DialogEnterLayout &&
         first.IsAuthenticodeValid == second.IsAuthenticodeValid &&
         titlesMatch &&
         string.Equals(first.WindowClass, second.WindowClass, StringComparison.Ordinal) &&
@@ -366,7 +445,8 @@ internal static class NativePromptWindowMatcher
             string.Equals(candidate.ProcessSha256, policy.ProcessSha256, StringComparison.Ordinal)) &&
         HasRequiredValue(policy.WindowTitle) &&
         (HasApprovedTrustedClientTopLevelTitle(policy.WindowTitle!, candidate.WindowTitle) ||
-         (candidate.WindowTitle.Length == 0 && HasAlternativeControlPair(candidate)));
+         (candidate.WindowTitle.Length == 0 &&
+          (HasAlternativeControlPair(candidate) || HasCaptionlessCcbKeyboardControls(candidate))));
 
     private static bool HasAlternativeControlPair(NativePromptWindowSnapshot candidate) =>
         !candidate.UsesDialogEnterSubmit && candidate.HasVerifiedAlternativeControls &&
@@ -375,10 +455,17 @@ internal static class NativePromptWindowMatcher
 
     private static bool HasDialogEnterControls(NativePromptWindowSnapshot candidate) =>
         candidate.UsesDialogEnterSubmit && candidate.HasVerifiedAlternativeControls &&
-        IsApprovedTrustedClientTopLevelTitle(candidate.WindowTitle) &&
         candidate.InputWindowClass == "Edit" && candidate.InputControlId > 0 &&
         candidate.SubmitControlHandle == IntPtr.Zero && candidate.SubmitControlId == 0 &&
-        candidate.SubmitWindowClass.Length == 0;
+        candidate.SubmitWindowClass.Length == 0 &&
+        (candidate.DialogEnterLayout == NativePromptDialogEnterLayout.TitledPasswordEdit &&
+         IsApprovedTrustedClientTopLevelTitle(candidate.WindowTitle) ||
+         HasCaptionlessCcbKeyboardControls(candidate));
+
+    private static bool HasCaptionlessCcbKeyboardControls(NativePromptWindowSnapshot candidate) =>
+        candidate.DialogEnterLayout == NativePromptDialogEnterLayout.CaptionlessCcbKeyboard &&
+        candidate.WindowTitle.Length == 0 &&
+        candidate.InputControlId == CaptionlessCcbKeyboardInputControlId;
 
     private static bool IsTrustedClientOrDirectChild(
         NativePromptWindowSnapshot candidate,

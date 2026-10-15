@@ -512,10 +512,23 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
             !TryGetWindowClass(snapshot.WindowHandle, out var dialogClass) || dialogClass != "#32770" ||
             !TryGetWindowTextAllowEmpty(snapshot.WindowHandle, out var title)) return false;
         GetWindowThreadProcessId(snapshot.WindowHandle, out var processId);
-        if (processId != (uint)snapshot.ProcessId ||
-            !NativePromptWindowMatcher.TryFindDialogEnterInput(
-                CaptureDescendantControls(snapshot.WindowHandle, includeButtonText: false),
-                snapshot.ProcessId, title, out var input)) return false;
+        if (processId != (uint)snapshot.ProcessId) return false;
+        var controls = CaptureDescendantControls(
+            snapshot.WindowHandle,
+            includeButtonText:
+                snapshot.DialogEnterLayout == NativePromptDialogEnterLayout.CaptionlessCcbKeyboard);
+        NativePromptControlSnapshot? input = null;
+        var layoutMatches = snapshot.DialogEnterLayout switch
+        {
+            NativePromptDialogEnterLayout.TitledPasswordEdit =>
+                NativePromptWindowMatcher.TryFindDialogEnterInput(
+                    controls, snapshot.ProcessId, title, out input),
+            NativePromptDialogEnterLayout.CaptionlessCcbKeyboard =>
+                NativePromptWindowMatcher.TryFindCaptionlessCcbKeyboardInput(
+                    controls, snapshot.ProcessId, title, out input),
+            _ => false
+        };
+        if (!layoutMatches) return false;
         return input!.WindowHandle == snapshot.InputControlHandle &&
             input.ControlId == snapshot.InputControlId && input.WindowClass == snapshot.InputWindowClass;
     }
@@ -766,14 +779,32 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
             var processId = checked((int)nativeProcessId);
             var controls = CaptureDescendantControls(windowHandle, includeButtonText: true);
             var usesDialogEnter = false;
+            var dialogEnterLayout = NativePromptDialogEnterLayout.None;
             if (!NativePromptWindowMatcher.TryFindTrustedClientTopLevelControls(
                     controls,
                     processId, policy, out var input, out var submit, out var verifiedAlternative,
                     requireCaptionlessEvidence: windowTitle.Length == 0))
             {
-                if (policy.InputWindowClass != "Edit" || policy.SubmitWindowClass != "Button" ||
-                    !NativePromptWindowMatcher.TryFindDialogEnterInput(controls, processId, windowTitle, out input))
+                if (policy.InputWindowClass != "Edit" || policy.SubmitWindowClass != "Button")
+                {
                     return null;
+                }
+
+                if (NativePromptWindowMatcher.TryFindDialogEnterInput(
+                        controls, processId, windowTitle, out input))
+                {
+                    dialogEnterLayout = NativePromptDialogEnterLayout.TitledPasswordEdit;
+                }
+                else if (NativePromptWindowMatcher.TryFindCaptionlessCcbKeyboardInput(
+                             controls, processId, windowTitle, out input))
+                {
+                    dialogEnterLayout = NativePromptDialogEnterLayout.CaptionlessCcbKeyboard;
+                }
+                else
+                {
+                    return null;
+                }
+
                 usesDialogEnter = true;
                 verifiedAlternative = true;
             }
@@ -835,7 +866,8 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
                 SubmitControlId: submit?.ControlId ?? 0,
                 ParentProcessId: parentProcessId,
                 HasVerifiedAlternativeControls: verifiedAlternative,
-                UsesDialogEnterSubmit: usesDialogEnter);
+                UsesDialogEnterSubmit: usesDialogEnter,
+                DialogEnterLayout: dialogEnterLayout);
         }
         catch
         {

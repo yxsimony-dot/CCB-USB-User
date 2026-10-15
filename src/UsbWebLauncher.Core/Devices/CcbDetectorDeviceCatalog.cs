@@ -2,13 +2,14 @@ using System.Globalization;
 
 namespace UsbWebLauncher.Core.Devices;
 
-// VID/PID pairs recognized by E路护航's present-device Dev2KeyType classifier.
+// VID/PID pairs recognized by E路护航's present-device classifier or captured
+// from CCB USB Keys whose vendor plug-in supplies the final inserted state.
 // These identify compatible device families, not a credential or a unique Key.
 internal static class CcbDetectorDeviceCatalog
 {
     private static readonly HashSet<uint> Pairs =
     [
-        0x163C0406, 0x163C0407, 0x163C0402, 0x163C5471, 0x163C548C,
+        0x163C0406, 0x163C0407, 0x163C0402, 0x163C5471, 0x163C548C, 0x163C0620,
         0x8829CCB0, 0x8829CCB1, 0x8829CCB2, 0x8829CCB3,
         0x1780FE33, 0x17800410, 0x17800401,
         0x16770028, 0x16770050, 0x16770054, 0x16770057,
