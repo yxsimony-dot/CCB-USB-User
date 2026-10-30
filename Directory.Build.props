@@ -2,6 +2,8 @@
   <PropertyGroup>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+    <PublishTrimmed>false</PublishTrimmed>
     <Deterministic>true</Deterministic>
     <VersionSourceText>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)build/version.json'))</VersionSourceText>
     <Version Condition="'$(ReleaseVersion)' == ''">$([System.Text.RegularExpressions.Regex]::Match('$(VersionSourceText)', '&quot;version&quot;\s*:\s*&quot;([0-9]+\.[0-9]+\.[0-9]+)&quot;').Groups[1].Value)</Version>

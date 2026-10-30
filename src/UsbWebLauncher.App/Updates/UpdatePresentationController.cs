@@ -2,18 +2,22 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using UsbWebLauncher.App.Presentation;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.App.Updates;
 
 // Called on the UI dispatcher; the service owns network and file I/O.
-public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisposable
+public sealed class UpdatePresentationController : INotifyPropertyChanged, IAsyncDisposable
 {
     private readonly IApplicationUpdateService _service;
     private readonly LauncherViewModel _business;
     private readonly Action<string> _launchInstaller;
     private readonly Action _closeApplication;
+    private readonly object _sync = new();
+    private readonly HashSet<Task> _operations = [];
     private CancellationTokenSource? _pendingSource;
     private Task? _checkTask;
+    private Task? _disposeTask;
     private UpdateRelease? _release;
     private DownloadedUpdate? _downloaded;
     private long _revision;
@@ -74,7 +78,7 @@ public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisp
     {
         if (_checkTask is { IsCompleted: false }) return _checkTask;
         if (!CanCheck) return Task.CompletedTask;
-        _checkTask = CheckCoreAsync();
+        _checkTask = RunTrackedAsync(CheckCoreAsync);
         return _checkTask;
     }
 
@@ -95,7 +99,13 @@ public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisp
         finally { End(operation); }
     }
 
-    public async Task DownloadAsync()
+    public Task DownloadAsync()
+    {
+        if (!CanDownload || _release is null) return Task.CompletedTask;
+        return RunTrackedAsync(DownloadCoreAsync);
+    }
+
+    private async Task DownloadCoreAsync()
     {
         if (!CanDownload || _release is null) return;
         var release = _release;
@@ -125,7 +135,13 @@ public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisp
         finally { End(operation); }
     }
 
-    public async Task InstallAsync()
+    public Task InstallAsync()
+    {
+        if (_disposed || IsBusy || _handedOff || _downloaded is null) return Task.CompletedTask;
+        return RunTrackedAsync(InstallCoreAsync);
+    }
+
+    private async Task InstallCoreAsync()
     {
         if (_disposed || IsBusy || _handedOff || _downloaded is null) return;
         if (!_business.TryBeginUpdateInstall())
@@ -173,20 +189,106 @@ public sealed class UpdatePresentationController : INotifyPropertyChanged, IDisp
         _revision++;
         var source = _pendingSource;
         _pendingSource = null;
-        if (source is not null) _ = source.CancelAsync();
+        if (source is not null)
+        {
+            BackgroundTaskObserver.Observe(
+                source.CancelAsync(),
+                "update-presentation-cancel");
+        }
         _checkTask = null;
         IsBusy = false;
         StatusText = "更新操作已取消，可重试。";
         Publish();
     }
 
-    public void Dispose()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        CancelPending();
-        _disposed = true;
-        _revision++;
-        _business.PropertyChanged -= OnBusinessChanged;
+        lock (_sync)
+        {
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
+
+            _disposed = true;
+            _revision++;
+            _business.PropertyChanged -= OnBusinessChanged;
+            PropertyChanged = null;
+            var source = _pendingSource;
+            _pendingSource = null;
+            var operations = _operations.ToArray();
+            _disposeTask = DisposeCoreAsync(source, operations);
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync(
+        CancellationTokenSource? source,
+        IReadOnlyList<Task> operations)
+    {
+        await Task.Yield();
+        await CleanupStageRunner.RunAsync(
+        [
+            new("update-presentation-cancel", () =>
+                CancelSourceAsync(source)),
+            new("update-presentation-settle", () =>
+                new ValueTask(Task.WhenAll(operations))),
+            new("update-presentation-service", () =>
+                _service.DisposeAsync())
+        ]).ConfigureAwait(false);
+    }
+
+    private static async ValueTask CancelSourceAsync(
+        CancellationTokenSource? source)
+    {
+        if (source is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await source.CancelAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The operation settled and released its source before cleanup ran.
+        }
+    }
+
+    private Task RunTrackedAsync(Func<Task> operation)
+    {
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return Task.CompletedTask;
+            }
+
+            _operations.Add(completion.Task);
+        }
+
+        return RunTrackedCoreAsync(operation, completion);
+    }
+
+    private async Task RunTrackedCoreAsync(
+        Func<Task> operation,
+        TaskCompletionSource completion)
+    {
+        try
+        {
+            await operation().ConfigureAwait(false);
+        }
+        finally
+        {
+            completion.TrySetResult();
+            lock (_sync)
+            {
+                _operations.Remove(completion.Task);
+            }
+        }
     }
 
     private (long Revision, CancellationTokenSource Source) Begin(string message)

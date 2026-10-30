@@ -44,12 +44,13 @@ public interface INativePromptBrokerCommands
     Task UninstallNativePromptBrokerAsync(CancellationToken cancellationToken = default);
 }
 
-public sealed class LocalPinCommands : ILocalPinCommands, INativePromptBrokerCommands
+public sealed class LocalPinCommands : ILocalPinCommands, INativePromptBrokerCommands, IDisposable
 {
     private readonly Func<ILocalPinDialog> _dialogFactory;
     private readonly IClientCertificatePinSetupService _setupService;
     private readonly INativePromptBrokerPrerequisites _prerequisites;
     private string? _operationStatus;
+    private int _disposed;
 
     public LocalPinCommands(
         ILocalPinDialog dialog,
@@ -67,7 +68,7 @@ public sealed class LocalPinCommands : ILocalPinCommands, INativePromptBrokerCom
         _dialogFactory = dialogFactory ?? throw new ArgumentNullException(nameof(dialogFactory));
         _setupService = setupService ?? throw new ArgumentNullException(nameof(setupService));
         _prerequisites = prerequisites ?? NullNativePromptBrokerPrerequisites.Instance;
-        _prerequisites.StateChanged += (_, _) => StateChanged?.Invoke(this, EventArgs.Empty);
+        _prerequisites.StateChanged += OnPrerequisiteStateChanged;
     }
 
     public event EventHandler? StateChanged;
@@ -151,6 +152,25 @@ public sealed class LocalPinCommands : ILocalPinCommands, INativePromptBrokerCom
 
         _operationStatus = status;
         StateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnPrerequisiteStateChanged(object? sender, EventArgs eventArgs)
+    {
+        if (Volatile.Read(ref _disposed) == 0)
+        {
+            StateChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _prerequisites.StateChanged -= OnPrerequisiteStateChanged;
+        StateChanged = null;
     }
 }
 

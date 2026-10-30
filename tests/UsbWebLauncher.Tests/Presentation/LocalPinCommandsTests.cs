@@ -5,6 +5,48 @@ namespace UsbWebLauncher.Tests.Presentation;
 
 public sealed class LocalPinCommandsTests
 {
+    [Fact]
+    public void Dispose_DetachesPrerequisiteSubscriptionAndClearsOutwardSubscribers()
+    {
+        var prerequisites = new RecordingBrokerPrerequisites([]);
+        var commands = new LocalPinCommands(
+            new RecordingPinDialog(null),
+            new RecordingPinSetupService(),
+            prerequisites);
+        var notifications = 0;
+        commands.StateChanged += (_, _) => notifications++;
+
+        Assert.Equal(1, prerequisites.SubscriptionCount);
+        prerequisites.PublishStateChanged();
+        Assert.Equal(1, notifications);
+
+        commands.Dispose();
+        commands.Dispose();
+        prerequisites.PublishStateChanged();
+
+        Assert.Equal(0, prerequisites.SubscriptionCount);
+        Assert.Equal(1, notifications);
+    }
+
+    [Fact]
+    public void SessionReplacement_ReleasesPreviousPrerequisiteSubscription()
+    {
+        var prerequisites = new RecordingBrokerPrerequisites([]);
+        var first = new LocalPinCommands(
+            new RecordingPinDialog(null),
+            new RecordingPinSetupService(),
+            prerequisites);
+        Assert.Equal(1, prerequisites.SubscriptionCount);
+
+        first.Dispose();
+        using var replacement = new LocalPinCommands(
+            new RecordingPinDialog(null),
+            new RecordingPinSetupService(),
+            prerequisites);
+
+        Assert.Equal(1, prerequisites.SubscriptionCount);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -98,7 +140,8 @@ public sealed class LocalPinCommandsTests
     [Fact]
     public async Task ValidateAndSaveAsync_PassesDisposablePinDirectlyToSetupService()
     {
-        using var pin = ClientCertificatePin.CopyOf("local-test-pin".AsSpan());
+        using var pin = ClientCertificatePin.CopyOf(
+            Guid.NewGuid().ToString("N").AsSpan());
         var dialog = new RecordingPinDialog(pin);
         var setup = new RecordingPinSetupService();
         var commands = new LocalPinCommands(dialog, setup);
@@ -107,6 +150,7 @@ public sealed class LocalPinCommandsTests
 
         Assert.Same(pin, setup.ReceivedPin);
         Assert.Equal(1, setup.SaveFixedCount);
+        Assert.All(pin.AsMemory().ToArray(), character => Assert.Equal('\0', character));
     }
 
     [Fact]
@@ -172,6 +216,7 @@ public sealed class LocalPinCommandsTests
         Assert.Equal(["Health", "ShowPinDialog", "SaveFixed"], events);
         Assert.Equal(1, setup.SaveFixedCount);
         Assert.Equal(0, setup.ValidateCount);
+        Assert.All(pin.AsMemory().ToArray(), character => Assert.Equal('\0', character));
         Assert.Contains("启动业务", commands.CurrentState.StatusText);
     }
 
@@ -204,6 +249,45 @@ public sealed class LocalPinCommandsTests
         Assert.Equal(1, setup.SaveFixedCount);
         Assert.Equal(0, setup.ValidateCount);
         Assert.DoesNotContain("PIN 已保存", commands.CurrentState.StatusText);
+        Assert.All(pin.AsMemory().ToArray(), character => Assert.Equal('\0', character));
+    }
+
+    [Fact]
+    public async Task ValidateAndSaveAsync_WhenCredentialSaveThrows_ClearsThePin()
+    {
+        var secret = Guid.NewGuid().ToString("N");
+        using var pin = ClientCertificatePin.CopyOf(secret.AsSpan());
+        var commands = new LocalPinCommands(
+            new RecordingPinDialog(pin),
+            new RecordingPinSetupService
+            {
+                SaveFixedException = new IOException("synthetic save failure")
+            });
+
+        await Assert.ThrowsAsync<IOException>(
+            () => commands.ValidateAndSaveAsync());
+
+        Assert.DoesNotContain(secret, commands.CurrentState.StatusText);
+        Assert.All(pin.AsMemory().ToArray(), character => Assert.Equal('\0', character));
+    }
+
+    [Fact]
+    public async Task ValidateAndSaveAsync_WhenCancelledDuringSave_ClearsThePin()
+    {
+        var secret = Guid.NewGuid().ToString("N");
+        using var pin = ClientCertificatePin.CopyOf(secret.AsSpan());
+        var commands = new LocalPinCommands(
+            new RecordingPinDialog(pin),
+            new RecordingPinSetupService
+            {
+                SaveFixedException = new OperationCanceledException()
+            });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => commands.ValidateAndSaveAsync());
+
+        Assert.DoesNotContain(secret, commands.CurrentState.StatusText);
+        Assert.All(pin.AsMemory().ToArray(), character => Assert.Equal('\0', character));
     }
 
     private sealed class RecordingPinDialog(
@@ -227,6 +311,7 @@ public sealed class LocalPinCommandsTests
         public int ValidateCount { get; private set; }
         public int SaveFixedCount { get; private set; }
         public bool SaveFixedResult { get; init; } = true;
+        public Exception? SaveFixedException { get; init; }
         public int DeleteCount { get; private set; }
         public ClientCertificatePin? ReceivedPin { get; private set; }
 
@@ -247,6 +332,11 @@ public sealed class LocalPinCommandsTests
             SaveFixedCount++;
             events?.Add("SaveFixed");
             ReceivedPin = pin;
+            if (SaveFixedException is not null)
+            {
+                return Task.FromException<bool>(SaveFixedException);
+            }
+
             return Task.FromResult(SaveFixedResult);
         }
 
@@ -266,11 +356,28 @@ public sealed class LocalPinCommandsTests
             IsInstalled: false,
             "需要安装本机认证组件。");
 
-        public event EventHandler? StateChanged;
+        private EventHandler? _stateChanged;
+
+        public event EventHandler? StateChanged
+        {
+            add
+            {
+                _stateChanged += value;
+                SubscriptionCount++;
+            }
+            remove
+            {
+                _stateChanged -= value;
+                SubscriptionCount--;
+            }
+        }
 
         public bool InstallResult { get; set; } = true;
         public bool HealthResult { get; set; } = true;
+        public int SubscriptionCount { get; private set; }
         public NativePromptBrokerPrerequisiteState CurrentState => _state;
+
+        public void PublishStateChanged() => _stateChanged?.Invoke(this, EventArgs.Empty);
 
         public Task<bool> InstallAsync(CancellationToken cancellationToken = default)
         {
@@ -278,7 +385,7 @@ public sealed class LocalPinCommandsTests
             if (InstallResult)
             {
                 _state = _state with { IsInstalled = true };
-                StateChanged?.Invoke(this, EventArgs.Empty);
+                PublishStateChanged();
             }
 
             return Task.FromResult(InstallResult);
@@ -288,14 +395,14 @@ public sealed class LocalPinCommandsTests
         {
             events.Add("Health");
             _state = _state with { IsHealthy = HealthResult, IsInstalled = HealthResult };
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            PublishStateChanged();
             return Task.FromResult(HealthResult);
         }
 
         public Task<bool> UninstallAsync(CancellationToken cancellationToken = default)
         {
             _state = _state with { IsHealthy = false, IsInstalled = false };
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            PublishStateChanged();
             return Task.FromResult(true);
         }
     }

@@ -1038,8 +1038,8 @@
         "type": "Project",
         "dependencies": {
           "Microsoft.Web.WebView2": "[1.0.4191.47, )",
-          "UsbWebLauncher.Core": "[1.0.0, )",
-          "UsbWebLauncher.Windows": "[1.0.0, )"
+          "UsbWebLauncher.Core": "[1.1.0, )",
+          "UsbWebLauncher.Windows": "[1.1.0, )"
         }
       },
       "usbweblauncher.core": {
@@ -1049,7 +1049,7 @@
         "type": "Project",
         "dependencies": {
           "System.Management": "[8.0.0, )",
-          "UsbWebLauncher.Core": "[1.0.0, )"
+          "UsbWebLauncher.Core": "[1.1.0, )"
         }
       }
     },

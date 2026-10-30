@@ -3,6 +3,64 @@ namespace UsbWebLauncher.Tests.Composition;
 public sealed class ApplicationShutdownSequenceTests
 {
     [Fact]
+    public async Task RunAsync_WhenCapturedOwnerFails_AttemptsLaterOwnerBeforeClosing()
+    {
+        var calls = new List<string>();
+        var sequence = CreateSequence(
+            () => UsbWebLauncher.Core.Lifecycle.CleanupStageRunner.RunAsync(
+            [
+                new("failing-owner", () =>
+                {
+                    calls.Add("failing-owner");
+                    throw new IOException("cleanup failure");
+                }),
+                new("later-owner", () =>
+                {
+                    calls.Add("later-owner");
+                    return ValueTask.CompletedTask;
+                })
+            ]),
+            () => calls.Add("close"),
+            code => calls.Add($"shutdown:{code}"));
+
+        await RunAsync(sequence);
+
+        Assert.Equal(
+            ["failing-owner", "later-owner", "close", "shutdown:0"],
+            calls);
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenFirstCapturedOwnerTimesOut_LaterOwnerWasStillStarted()
+    {
+        var never = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var laterStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = new List<string>();
+        var sequence = new UsbWebLauncher.App.ApplicationShutdownSequence(
+            () =>
+            {
+                var first = never.Task;
+                var later = Task.Run(() => laterStarted.SetResult());
+                return UsbWebLauncher.Core.Lifecycle.CleanupStageRunner.RunAsync(
+                [
+                    new("blocked-owner", () => new ValueTask(first)),
+                    new("later-owner", () => new ValueTask(later))
+                ]);
+            },
+            () => calls.Add("close"),
+            code => calls.Add($"shutdown:{code}"),
+            TimeSpan.FromMilliseconds(50));
+
+        await Task.WhenAll(
+            sequence.RunAsync(),
+            laterStarted.Task.WaitAsync(TimeSpan.FromSeconds(1)));
+
+        Assert.Equal(["close", "shutdown:0"], calls);
+    }
+
+    [Fact]
     public async Task RunAsync_WhenCleanupNeverCompletes_StillClosesWithinExitBudget()
     {
         var calls = new List<string>();
@@ -82,6 +140,38 @@ public sealed class ApplicationShutdownSequenceTests
         await RunAsync(sequence);
 
         Assert.Equal(["cleanup", "close", "shutdown:0"], calls);
+    }
+
+    [Fact]
+    public async Task RunAsync_AwaitsUpdatePresentationStageBeforeClosing()
+    {
+        var updateDisposal = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = new List<string>();
+        var sequence = CreateSequence(
+            () => UsbWebLauncher.Core.Lifecycle.CleanupStageRunner.RunAsync(
+            [
+                new("update-presentation", async () =>
+                {
+                    calls.Add("update-dispose-start");
+                    await updateDisposal.Task;
+                    calls.Add("update-dispose-complete");
+                })
+            ]),
+            () => calls.Add("close"),
+            code => calls.Add($"shutdown:{code}"));
+
+        var shutdown = sequence.RunAsync();
+        await Task.Yield();
+
+        Assert.Equal(["update-dispose-start"], calls);
+
+        updateDisposal.SetResult();
+        await shutdown;
+
+        Assert.Equal(
+            ["update-dispose-start", "update-dispose-complete", "close", "shutdown:0"],
+            calls);
     }
 
     [Fact]

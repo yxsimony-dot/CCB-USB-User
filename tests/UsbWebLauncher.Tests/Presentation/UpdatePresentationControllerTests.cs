@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Reflection;
 using UsbWebLauncher.App.Updates;
 using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.App;
@@ -10,12 +12,15 @@ public sealed class UpdatePresentationControllerTests
     public async Task UpdateWindowCanBindReadOnlyProgressAndRender()
     {
         var completion = new TaskCompletionSource();
+        var disposal = new TaskCompletionSource<Task>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             UpdateWindow? window = null;
+            UpdatePresentationController? ui = null;
             try
             {
-                using var ui = Controller(new ControlledService());
+                ui = Controller(new ControlledService());
                 window = new UpdateWindow(ui) { ShowInTaskbar = false, Left = -10000, Top = -10000,
                     WindowStartupLocation = System.Windows.WindowStartupLocation.Manual };
                 window.Show();
@@ -24,11 +29,18 @@ public sealed class UpdatePresentationControllerTests
                 completion.SetResult();
             }
             catch (Exception ex) { completion.SetException(ex); }
-            finally { window?.Close(); }
+            finally
+            {
+                window?.Close();
+                disposal.TrySetResult(
+                    ui?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+            }
         });
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await (await disposal.Task.WaitAsync(TimeSpan.FromSeconds(10)))
+            .WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     private static readonly UpdateRelease Release = new("1.1.10", "<script>plain text</script>", "setup.exe", 4,
@@ -40,7 +52,7 @@ public sealed class UpdatePresentationControllerTests
     {
         var service = new ControlledService();
         var vm = UpdateHandoffGateTests.Ready();
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => throw new Exception("unexpected launch"), () => { });
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => throw new Exception("unexpected launch"), () => { });
         var first = ui.CheckOnStartupAsync();
         var second = ui.CheckAsync();
         service.Check.SetResult(new(UpdateCheckStatus.UpdateAvailable, "发现新版", Release));
@@ -58,7 +70,7 @@ public sealed class UpdatePresentationControllerTests
     public async Task ClosedWindowIgnoresLateCheckAndDownloadProgress()
     {
         var service = new ControlledService();
-        using var ui = Controller(service);
+        await using var ui = Controller(service);
         var pending = ui.CheckAsync();
         ui.CancelPending();
         var status = ui.StatusText;
@@ -82,7 +94,7 @@ public sealed class UpdatePresentationControllerTests
         var service = new ControlledService();
         var vm = UpdateHandoffGateTests.Ready();
         var launched = false;
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
         await ReadyDownload(ui, service);
         vm.UpdateSessionState(state);
         await ui.InstallAsync();
@@ -97,7 +109,7 @@ public sealed class UpdatePresentationControllerTests
         var service = new ControlledService { Verification = new() };
         var vm = UpdateHandoffGateTests.Ready();
         var closes = 0;
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => throw new IOException("launch failed"), () => closes++);
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => throw new IOException("launch failed"), () => closes++);
         await ReadyDownload(ui, service);
         var install = ui.InstallAsync();
         Assert.False(vm.CanStartBusiness);
@@ -118,13 +130,13 @@ public sealed class UpdatePresentationControllerTests
         var service = new ControlledService { Verification = new() };
         var vm = UpdateHandoffGateTests.Ready();
         var launched = false;
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
         await ReadyDownload(ui, service);
         var pending = ui.InstallAsync();
         vm.UpdateSessionState(BusinessSessionState.Closing);
-        ui.Dispose();
+        var dispose = ui.DisposeAsync().AsTask();
         service.Verification.SetResult();
-        await pending;
+        await Task.WhenAll(pending, dispose);
         Assert.False(launched);
     }
 
@@ -133,7 +145,7 @@ public sealed class UpdatePresentationControllerTests
     {
         var service = new ControlledService { Verification = new() };
         var launched = false;
-        using var ui = new UpdatePresentationController(service, UpdateHandoffGateTests.Ready(), "1.1.0", _ => launched = true, () => { });
+        await using var ui = new UpdatePresentationController(service, UpdateHandoffGateTests.Ready(), "1.1.0", _ => launched = true, () => { });
         await ReadyDownload(ui, service);
         service.Verification.SetException(new InvalidDataException("changed cache"));
         await ui.InstallAsync();
@@ -148,7 +160,7 @@ public sealed class UpdatePresentationControllerTests
         var service = new ControlledService { Verification = new() };
         var vm = UpdateHandoffGateTests.Ready();
         var launched = false;
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => launched = true, () => { });
         await ReadyDownload(ui, service);
         var pending = ui.InstallAsync();
         vm.UpdateBusinessState(false, false, false, false);
@@ -164,13 +176,41 @@ public sealed class UpdatePresentationControllerTests
         var service = new ControlledService();
         var vm = UpdateHandoffGateTests.Ready();
         var events = new List<string>();
-        using var ui = new UpdatePresentationController(service, vm, "1.1.0", path => events.Add(path), () => events.Add("close"));
+        await using var ui = new UpdatePresentationController(service, vm, "1.1.0", path => events.Add(path), () => events.Add("close"));
         await ReadyDownload(ui, service);
         await ui.InstallAsync();
         Assert.Equal(new[] { "verified-setup.exe", "close" }, events);
         Assert.False(vm.CanStartBusiness);
         Assert.Contains("安装器已启动", ui.StatusText);
         Assert.DoesNotContain("升级完成", ui.StatusText);
+    }
+
+    [Fact]
+    public async Task DisposeWaitsForPendingWorkSuppressesLatePublicationAndDisposesServiceOnce()
+    {
+        var service = new ControlledService();
+        var vm = UpdateHandoffGateTests.Ready();
+        var ui = new UpdatePresentationController(service, vm, "1.1.0", _ => { }, () => { });
+        var publications = 0;
+        ui.PropertyChanged += (_, _) => publications++;
+        Assert.True(HasBusinessSubscription(vm, ui));
+
+        var pending = ui.CheckAsync();
+        var beforeDispose = publications;
+        var firstDispose = ui.DisposeAsync().AsTask();
+        var secondDispose = ui.DisposeAsync().AsTask();
+
+        Assert.Same(firstDispose, secondDispose);
+        Assert.False(firstDispose.IsCompleted);
+        Assert.False(HasBusinessSubscription(vm, ui));
+
+        service.Check.SetResult(new(UpdateCheckStatus.UpdateAvailable, "late", Release));
+        await Task.WhenAll(pending, firstDispose);
+        vm.UpdateSessionState(BusinessSessionState.Active);
+
+        Assert.Equal(beforeDispose, publications);
+        Assert.Empty(ui.AvailableVersion);
+        Assert.Equal(1, service.DisposeCount);
     }
 
     private static UpdatePresentationController Controller(ControlledService service) =>
@@ -189,6 +229,7 @@ public sealed class UpdatePresentationControllerTests
         public TaskCompletionSource? Verification { get; init; }
         public int CheckCount { get; private set; }
         public int DownloadCount { get; private set; }
+        public int DisposeCount { get; private set; }
         public IProgress<UpdateDownloadProgress>? Progress { get; private set; }
         public Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken) { CheckCount++; return Check.Task; }
         public Task<DownloadedUpdate> DownloadAsync(UpdateRelease release, IProgress<UpdateDownloadProgress>? progress, CancellationToken cancellationToken)
@@ -198,5 +239,22 @@ public sealed class UpdatePresentationControllerTests
             return Task.FromResult(new DownloadedUpdate(release, "verified-setup.exe"));
         }
         public Task VerifyDownloadedAsync(DownloadedUpdate downloaded, CancellationToken cancellationToken) => Verification?.Task ?? Task.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private static bool HasBusinessSubscription(
+        LauncherViewModel business,
+        UpdatePresentationController controller)
+    {
+        var field = typeof(LauncherViewModel).GetField(
+            nameof(INotifyPropertyChanged.PropertyChanged),
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var handlers = (PropertyChangedEventHandler?)field?.GetValue(business);
+        return handlers?.GetInvocationList().Any(handler =>
+            ReferenceEquals(handler.Target, controller)) == true;
     }
 }

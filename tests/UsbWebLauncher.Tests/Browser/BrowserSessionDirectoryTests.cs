@@ -61,9 +61,29 @@ public sealed class BrowserSessionDirectoryTests : IDisposable
         {
             Assert.False(session.RetireAndTryCleanup());
             Assert.True(Directory.Exists(session.Path));
+            Assert.True(File.Exists(System.IO.Path.Combine(
+                session.Path,
+                BrowserSessionDirectory.RetiredFileName)));
         }
         Assert.Equal(1, BrowserSessionDirectory.CleanupRetired(_root));
         Assert.False(Directory.Exists(session.Path));
+    }
+
+    [Fact]
+    public void ActiveSessionIsNotEligibleForLaterCleanupUntilRetired()
+    {
+        var session = new BrowserSessionDirectory(_root);
+        var path = session.EnsureCreated();
+        File.WriteAllText(System.IO.Path.Combine(path, "active"), "in use");
+
+        Assert.Equal(0, BrowserSessionDirectory.CleanupRetired(_root));
+        Assert.True(Directory.Exists(path));
+        Assert.False(File.Exists(System.IO.Path.Combine(
+            path,
+            BrowserSessionDirectory.RetiredFileName)));
+
+        Assert.True(session.RetireAndTryCleanup());
+        Assert.False(Directory.Exists(path));
     }
 
     [Fact]

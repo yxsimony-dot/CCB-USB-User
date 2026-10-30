@@ -28,7 +28,7 @@
         "type": "Project",
         "dependencies": {
           "System.Management": "[8.0.0, )",
-          "UsbWebLauncher.Core": "[1.0.0, )"
+          "UsbWebLauncher.Core": "[1.1.0, )"
         }
       }
     },

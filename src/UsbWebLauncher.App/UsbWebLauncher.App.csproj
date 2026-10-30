@@ -8,8 +8,6 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Browser\CcbCertificateLogin.js" />
-    <EmbeddedResource Include="Browser\CcbPopupDiagnostics.js" />
-    <EmbeddedResource Include="Browser\CcbStatementDiagnostics.js" />
     <EmbeddedResource Include="Browser\CcbStatementExport.js" />
     <EmbeddedResource Include="Browser\CcbReceiptExport.js" />
     <EmbeddedResource Include="Browser\CcbCurrentCompany.js" />
@@ -33,6 +31,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 
 </Project>

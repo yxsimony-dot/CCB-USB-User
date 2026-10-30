@@ -2,6 +2,7 @@ using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.App.Browser;
 using UsbWebLauncher.Core.Authentication;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.App.Composition;
 
@@ -25,6 +26,8 @@ public sealed class ManualLauncherActions : ILocalPinCommands, INativePromptBrok
     private volatile bool _started;
     private volatile bool _awaitingStart = true;
     private volatile bool _busy;
+    private readonly object _disposeSync = new();
+    private Task? _disposeTask;
     private int _disposed;
 
     public ManualLauncherActions(LauncherCoordinator launcher, ILocalPinCommands preparation,
@@ -239,23 +242,74 @@ public sealed class ManualLauncherActions : ILocalPinCommands, INativePromptBrok
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _lifetime.Cancel();
-        lock (_pageLoginSync) CancelPageLogin();
-        await _operation.WaitAsync();
-        _operation.Release();
-        _broker.StateChanged -= OnStateChanged;
-        if (_authentication is not null) _authentication.StateChanged -= OnStateChanged;
-        if (_pageLogin is not null)
+        lock (_disposeSync)
         {
-            _launcher.StateChanged -= OnLauncherStateChanged;
-            _pageLogin.StateChanged -= OnPageLoginStateChanged;
-            await _pageLogin.DisposeAsync();
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
         }
-        _lifetime.Dispose();
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        Volatile.Write(ref _disposed, 1);
+        await CleanupStageRunner.RunAsync(
+        [
+            new("manual-actions-detach", () =>
+            {
+                _broker.StateChanged -= OnStateChanged;
+                if (_authentication is not null)
+                {
+                    _authentication.StateChanged -= OnStateChanged;
+                }
+
+                if (_pageLogin is not null)
+                {
+                    _launcher.StateChanged -= OnLauncherStateChanged;
+                    _pageLogin.StateChanged -= OnPageLoginStateChanged;
+                }
+
+                StateChanged = null;
+                return ValueTask.CompletedTask;
+            }),
+            new("manual-actions-cancel", async () =>
+            {
+                await _lifetime.CancelAsync().ConfigureAwait(false);
+                lock (_pageLoginSync)
+                {
+                    CancelPageLogin();
+                }
+            }),
+            new("manual-actions-settle-operation", async () =>
+            {
+                await _operation.WaitAsync().ConfigureAwait(false);
+                _operation.Release();
+            }),
+            new("manual-actions-page-login", () =>
+                _pageLogin?.DisposeAsync() ?? ValueTask.CompletedTask),
+            new("manual-actions-local-pin", DisposePreparationAsync),
+            new("manual-actions-lifetime", () =>
+            {
+                _lifetime.Dispose();
+                return ValueTask.CompletedTask;
+            })
+        ]).ConfigureAwait(false);
         // Late UI commands are rejected by _disposed; do not dispose a semaphore
         // that a command already entering RunAsync may still be awaiting.
+    }
+
+    private ValueTask DisposePreparationAsync()
+    {
+        if (_preparation is IAsyncDisposable asyncDisposable)
+        {
+            return asyncDisposable.DisposeAsync();
+        }
+
+        if (_preparation is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
     }
 }

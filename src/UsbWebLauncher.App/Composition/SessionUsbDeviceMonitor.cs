@@ -1,4 +1,5 @@
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.App.Browser;
 
 namespace UsbWebLauncher.App.Composition;
 
@@ -8,7 +9,8 @@ namespace UsbWebLauncher.App.Composition;
 internal sealed class SessionUsbDeviceMonitor(
     IUsbDeviceMonitor inner,
     Func<UsbDeviceDescriptor, bool> matches,
-    Action onDeviceRemoved) : IUsbDeviceMonitor
+    Action onDeviceRemoved,
+    Action<string, Exception>? reportFault = null) : IUsbDeviceMonitor
 {
     private readonly object sync = new();
     private readonly HashSet<string> originalIds = new(StringComparer.OrdinalIgnoreCase);
@@ -18,8 +20,28 @@ internal sealed class SessionUsbDeviceMonitor(
     private bool ended;
     private bool disposed;
     private Task? disposal;
+    private UsbDevicesChangedEventHandler? devicesChanged;
+    private readonly Action<string, Exception> reportFault =
+        reportFault ?? ReportDefaultFault;
 
-    public event UsbDevicesChangedEventHandler? DevicesChanged;
+    public event UsbDevicesChangedEventHandler? DevicesChanged
+    {
+        add
+        {
+            lock (sync)
+            {
+                ThrowIfEnded();
+                devicesChanged += value;
+            }
+        }
+        remove
+        {
+            lock (sync)
+            {
+                devicesChanged -= value;
+            }
+        }
+    }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -66,11 +88,15 @@ internal sealed class SessionUsbDeviceMonitor(
     private async Task OnDevicesChangedAsync(object? sender, UsbDevicesChangedEventArgs args)
     {
         bool removed;
+        UsbDevicesChangedEventHandler[] subscribers;
         lock (sync)
         {
             if (ended || disposed || !ReferenceEquals(sender, inner)) return;
             // A failed enumeration supplies no physical absence evidence.
             removed = args.Error is null && ObserveSnapshot(args.Devices);
+            subscribers = devicesChanged?.GetInvocationList()
+                .Cast<UsbDevicesChangedEventHandler>()
+                .ToArray() ?? [];
         }
         if (removed)
         {
@@ -80,15 +106,21 @@ internal sealed class SessionUsbDeviceMonitor(
             return;
         }
 
-        foreach (var handler in DevicesChanged?.GetInvocationList().Cast<UsbDevicesChangedEventHandler>() ?? [])
+        for (var index = 0; index < subscribers.Length; index++)
         {
-            Task delivery;
             lock (sync)
             {
                 if (ended || disposed) return;
-                delivery = handler(this, args);
             }
-            await delivery.ConfigureAwait(false);
+
+            try
+            {
+                await subscribers[index](this, args).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                ReportFault($"session-usb-subscriber-{index}", exception);
+            }
         }
     }
 
@@ -125,7 +157,7 @@ internal sealed class SessionUsbDeviceMonitor(
             disposed = true;
             ended = true;
             if (subscribed) inner.DevicesChanged -= OnDevicesChangedAsync;
-            DevicesChanged = null;
+            devicesChanged = null;
             completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
             disposal = completion.Task;
         }
@@ -142,4 +174,21 @@ internal sealed class SessionUsbDeviceMonitor(
         }
         catch (Exception error) { completion.TrySetException(error); }
     }
+
+    private void ReportFault(string operation, Exception exception)
+    {
+        try
+        {
+            reportFault(operation, exception);
+        }
+        catch
+        {
+            // Diagnostics cannot alter session revocation or subscriber delivery.
+        }
+    }
+
+    private static void ReportDefaultFault(string operation, Exception exception) =>
+        CertificateLoginDiagnostics.Write(
+            "background-task-error",
+            new { operation, exceptionType = exception.GetType().Name });
 }

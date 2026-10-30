@@ -108,6 +108,12 @@ public partial class MainWindow : Window
         return browser;
     }
 
+    internal void PrepareBrowserForLifecycleObservation()
+    {
+        BrowserContainer.Visibility = Visibility.Visible;
+        BrowserContainer.UpdateLayout();
+    }
+
     public void DetachBrowserControl() => BrowserContainer.Content = null;
 
     public void ActivateForBrowser()

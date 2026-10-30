@@ -145,7 +145,105 @@ public sealed class SessionUsbDeviceMonitorTests
         Assert.Equal(1, source.DisposeCount);
     }
 
-    private static IUsbDeviceMonitor Create(Source source, Action removed) =>
+    [Fact]
+    public async Task FailingSubscriberIsReportedAndLaterSubscriberReceivesSameSnapshot()
+    {
+        var source = new Source([Key("A")]);
+        var faults = new List<(string Operation, Exception Error)>();
+        await using var monitor = new SessionUsbDeviceMonitor(
+            source,
+            device => device.Service == "USBSTOR",
+            () => { },
+            (operation, error) => faults.Add((operation, error)));
+        var deliveries = new List<string>();
+        monitor.DevicesChanged += (_, args) =>
+        {
+            deliveries.Add($"first:{Assert.Single(args.Devices).InstanceId}");
+            return Task.FromException(new InvalidOperationException("first failed"));
+        };
+        monitor.DevicesChanged += (_, args) =>
+        {
+            deliveries.Add($"second:{Assert.Single(args.Devices).InstanceId}");
+            return Task.CompletedTask;
+        };
+        await monitor.StartAsync();
+        await monitor.GetConnectedDevicesAsync();
+
+        await source.Emit([Key("A")]);
+
+        Assert.Equal(new[] { "first:A", "second:A" }, deliveries);
+        var fault = Assert.Single(faults);
+        Assert.Equal("session-usb-subscriber-0", fault.Operation);
+        Assert.IsType<InvalidOperationException>(fault.Error);
+    }
+
+    [Fact]
+    public async Task SubscriberRemovalDuringDeliveryDoesNotChangeStableSnapshot()
+    {
+        var source = new Source([Key("A")]);
+        await using var monitor = Create(source, () => { });
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondDeliveries = 0;
+        monitor.DevicesChanged += First;
+        monitor.DevicesChanged += Second;
+        await monitor.StartAsync();
+        await monitor.GetConnectedDevicesAsync();
+
+        var publication = source.Emit([Key("A")]);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        monitor.DevicesChanged -= Second;
+        releaseFirst.TrySetResult();
+        await publication;
+
+        Assert.Equal(1, secondDeliveries);
+
+        async Task First(object? sender, UsbDevicesChangedEventArgs args)
+        {
+            firstStarted.TrySetResult();
+            await releaseFirst.Task;
+        }
+
+        Task Second(object? sender, UsbDevicesChangedEventArgs args)
+        {
+            secondDeliveries++;
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task DisposalDuringDeliveryPreventsAnyLaterSubscriberCallback()
+    {
+        var source = new Source([Key("A")]);
+        var monitor = Create(source, () => { });
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondDeliveries = 0;
+        monitor.DevicesChanged += async (_, _) =>
+        {
+            firstStarted.TrySetResult();
+            await releaseFirst.Task;
+        };
+        monitor.DevicesChanged += (_, _) =>
+        {
+            secondDeliveries++;
+            return Task.CompletedTask;
+        };
+        await monitor.StartAsync();
+        await monitor.GetConnectedDevicesAsync();
+
+        var publication = source.Emit([Key("A")]);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await monitor.DisposeAsync();
+        releaseFirst.TrySetResult();
+        await publication;
+
+        Assert.Equal(0, secondDeliveries);
+        Assert.Equal(0, source.Subscribers);
+        Assert.Equal(1, source.DisposeCount);
+    }
+
+    private static SessionUsbDeviceMonitor Create(Source source, Action removed) =>
         new SessionUsbDeviceMonitor(source, device => device.Service == "USBSTOR", removed);
 
     private static UsbDeviceDescriptor Key(string id) => new(id, [], null, [], [], [], "USBSTOR");

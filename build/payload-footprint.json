@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "layout": "conventional-self-contained",
+  "measurement": "Files declared by payload-manifest.json; payload-manifest.json itself is excluded.",
+  "supportedSatelliteLanguages": [
+    "zh-Hans"
+  ],
+  "baseline": {
+    "fileCount": 284,
+    "unpackedBytes": 274549498
+  },
+  "maximum": {
+    "fileCount": 284,
+    "unpackedBytes": 274549498
+  },
+  "rationale": "The accepted 2026-10-16 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, and the final lifecycle cleanup and observation bootstrap fixes while removing unreachable embedded diagnostics and unsupported satellite resources. The final lifecycle work increased the application binaries by 29,184 bytes after the initial reduced baseline; product metadata decreased by 5 bytes, for a measured payload increase of 29,179 bytes. Any further growth requires an explicit reviewed update.",
+  "reduction": {
+    "unfilteredAppFileCount": 481,
+    "acceptedAppFileCount": 277,
+    "removedFileCount": 204,
+    "unfilteredAppUnpackedBytes": 195759381,
+    "acceptedAppUnpackedBytes": 180562413,
+    "removedUnpackedBytes": 15226152,
+    "unfilteredSatelliteLanguages": [
+      "cs",
+      "de",
+      "es",
+      "fr",
+      "it",
+      "ja",
+      "ko",
+      "pl",
+      "pt-BR",
+      "ru",
+      "tr",
+      "zh-Hans",
+      "zh-Hant"
+    ]
+  },
+  "singleFileEvaluation": {
+    "status": "rejected",
+    "evaluatedOn": "2026-10-16",
+    "candidateFileCount": 23,
+    "candidateUnpackedBytes": 268216560,
+    "decision": "retain-conventional-self-contained",
+    "reason": "The candidate passed the non-hardware .NET suite, JavaScript suite, packaging scripts, signing-target presence check, update-handoff coverage, footprint bounds, and startup smoke test. Payload compatibility failed because single-file publishing bundled the required zh-Hans satellite resources and removed the external UsbWebLauncher.App.dll, UsbWebLauncher.Core.dll, and UsbWebLauncher.Windows.dll files required by the broker trusted-client hash policy. The installer gate therefore stopped at payload validation without weakening the contract."
+  }
+}

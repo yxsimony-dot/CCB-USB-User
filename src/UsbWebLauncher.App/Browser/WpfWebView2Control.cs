@@ -1,12 +1,14 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using UsbWebLauncher.App.Configuration;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.App.Browser;
 
 public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
 {
     private readonly WebView2 _control;
+    private readonly Func<string, Task<CoreWebView2Environment>> _createEnvironment;
     private readonly UiThreadResourceDisposer _disposer;
     private readonly CcbUKeyBrowserExtensionInstaller _extensionInstaller = new();
     private readonly WebView2NavigationSessionTracker _navigationSessions = new();
@@ -20,17 +22,59 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
     private readonly DownloadDirectorySettings? _downloadSettings;
     private readonly Action<string> _downloadError;
     private readonly BrowserSessionDirectory _sessionDirectory;
+    private readonly BrowserSessionDirectoryOwnership _sessionDirectoryOwnership;
     private readonly CancellationToken _sessionToken;
+    private readonly Action<string>? _initializationPhase;
+    private readonly TaskCompletionSource<uint> _browserProcessExited =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CoreWebView2Environment? _environment;
-    private bool _browserProcessExited;
-    private bool _environmentCreationStarted;
 
     public WpfWebView2Control(WebView2 control, DownloadDirectorySettings? downloadSettings = null,
         Action<string>? downloadError = null, BrowserSessionDirectory? sessionDirectory = null,
         CancellationToken sessionToken = default)
+        : this(
+            control,
+            downloadSettings,
+            downloadError,
+            sessionDirectory,
+            sessionToken,
+            CreateEnvironmentAsync,
+            initializationPhase: null)
+    {
+    }
+
+    internal WpfWebView2Control(
+        WebView2 control,
+        DownloadDirectorySettings? downloadSettings,
+        Action<string>? downloadError,
+        BrowserSessionDirectory? sessionDirectory,
+        CancellationToken sessionToken,
+        Action<string> initializationPhase)
+        : this(
+            control,
+            downloadSettings,
+            downloadError,
+            sessionDirectory,
+            sessionToken,
+            CreateEnvironmentAsync,
+            initializationPhase)
+    {
+    }
+
+    internal WpfWebView2Control(
+        WebView2 control,
+        DownloadDirectorySettings? downloadSettings,
+        Action<string>? downloadError,
+        BrowserSessionDirectory? sessionDirectory,
+        CancellationToken sessionToken,
+        Func<string, Task<CoreWebView2Environment>> createEnvironment,
+        Action<string>? initializationPhase = null)
     {
         _sessionToken = sessionToken;
+        _initializationPhase = initializationPhase;
         _sessionDirectory = sessionDirectory ?? new BrowserSessionDirectory();
+        _sessionDirectoryOwnership = new(_sessionDirectory, RetireSessionDirectory);
+        _createEnvironment = createEnvironment ?? throw new ArgumentNullException(nameof(createEnvironment));
         _downloadSettings = downloadSettings;
         _downloadError = downloadError ?? (_ => { });
         _control = control ?? throw new ArgumentNullException(nameof(control));
@@ -41,6 +85,14 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             action => _control.Dispatcher.InvokeAsync(action).Task,
             DisposeOnUiThread);
     }
+
+    internal BrowserSessionDirectoryOwnershipState SessionDirectoryState =>
+        _sessionDirectoryOwnership.State;
+
+    internal uint? BrowserProcessId =>
+        _control.CoreWebView2?.BrowserProcessId;
+
+    internal Task<uint> BrowserProcessExited => _browserProcessExited.Task;
 
     public event EventHandler<WebNavigationStartingEventArgs>? NavigationStarting;
 
@@ -72,25 +124,48 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         _lifetime.ThrowIfDisposed();
         if (_control.CoreWebView2 is null)
         {
-            var sessionPath = _sessionDirectory.EnsureCreated();
-            _ = Task.Run(() => BrowserSessionDirectory.CleanupRetired(
-                System.IO.Path.GetDirectoryName(sessionPath)!));
-            _environmentCreationStarted = true;
-            var environment = await CoreWebView2Environment.CreateAsync(
-                    browserExecutableFolder: null,
-                    userDataFolder: sessionPath,
-                    CcbUKeyWebView2Environment.CreateOptions());
+            var sessionPath = _sessionDirectoryOwnership.EnsureCreated();
+            ReportInitializationPhase("session-directory-created");
+            ObserveDirectoryCleanup(
+                Task.Run(() => BrowserSessionDirectory.CleanupRetired(
+                    System.IO.Path.GetDirectoryName(sessionPath)!)),
+                "browser-retired-directory-scan");
+            CoreWebView2Environment environment;
+            try
+            {
+                ReportInitializationPhase("environment-creation-started");
+                environment = await _createEnvironment(sessionPath) ??
+                    throw new InvalidOperationException("WebView2 environment creation returned no environment.");
+                ReportInitializationPhase("environment-creation-completed");
+            }
+            catch
+            {
+                ReportInitializationPhase("environment-creation-failed");
+                _sessionDirectoryOwnership.EnvironmentCreationFailed();
+                throw;
+            }
             // Keep ownership even when cancellation wins during environment creation:
             // cleanup may only happen after its browser process exit is observed.
             _environment = environment;
             environment.BrowserProcessExited += OnBrowserProcessExited;
+            _sessionDirectoryOwnership.EnvironmentCreated();
             cancellationToken.ThrowIfCancellationRequested();
             _lifetime.ThrowIfDisposed();
             if (!string.Equals(System.IO.Path.GetFullPath(environment.UserDataFolder).TrimEnd('\\', '/'),
                     System.IO.Path.GetFullPath(sessionPath).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("浏览器数据目录被外部配置覆盖，无法建立独立业务会话。");
-            await _control.EnsureCoreWebView2Async(environment)
-                .WaitAsync(cancellationToken);
+            try
+            {
+                ReportInitializationPhase("controller-initialization-started");
+                await _control.EnsureCoreWebView2Async(environment)
+                    .WaitAsync(cancellationToken);
+                ReportInitializationPhase("controller-initialization-completed");
+            }
+            catch
+            {
+                ReportInitializationPhase("controller-initialization-failed");
+                throw;
+            }
         }
 
         _lifetime.ThrowIfDisposed();
@@ -100,10 +175,20 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             _downloadDirectory ??= new WpfDownloadDirectory(coreWebView2, _downloadSettings, _downloadError);
         var package = CcbUKeyBrowserExtensionPackage.ResolveFromBaseDirectory(
             AppContext.BaseDirectory);
-        await _extensionInstaller.EnsureInstalledAsync(
-            new WebView2BrowserExtensionProfile(coreWebView2.Profile),
-            package,
-            cancellationToken);
+        try
+        {
+            ReportInitializationPhase("extension-installation-started");
+            await _extensionInstaller.EnsureInstalledAsync(
+                new WebView2BrowserExtensionProfile(coreWebView2.Profile),
+                package,
+                cancellationToken);
+            ReportInitializationPhase("extension-installation-completed");
+        }
+        catch
+        {
+            ReportInitializationPhase("extension-installation-failed");
+            throw;
+        }
         _lifetime.ThrowIfDisposed();
         try
         {
@@ -117,6 +202,7 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             CertificateLoginDiagnostics.Write("popup-handler-unavailable");
         }
         _lifetime.ThrowIfDisposed();
+        ReportInitializationPhase("initialization-completed");
     }
 
     public async Task RegisterClientCertificateRequestHandlerAsync(
@@ -254,25 +340,55 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
 
         _clientCertificateHandlerRegistered = false;
         _clientCertificateHandler = null;
+        Release("directory-disposal-request", _sessionDirectoryOwnership.DisposeRequested);
         Release("native-controller", _control.Dispose);
-        if (_browserProcessExited || !_environmentCreationStarted) ScheduleDirectoryCleanup();
         if (failures.Count != 0) throw new AggregateException("Browser session cleanup failed.", failures);
     }
 
     private void OnBrowserProcessExited(object? sender, CoreWebView2BrowserProcessExitedEventArgs eventArgs)
     {
-        _browserProcessExited = true;
-        if (_disposed) ScheduleDirectoryCleanup();
+        _browserProcessExited.TrySetResult(eventArgs.BrowserProcessId);
+        _sessionDirectoryOwnership.BrowserProcessExited();
     }
 
-    private void ScheduleDirectoryCleanup()
+    private void RetireSessionDirectory()
     {
         if (_environment is not null)
         {
             _environment.BrowserProcessExited -= OnBrowserProcessExited;
             _environment = null;
         }
-        _ = Task.Run(() => _sessionDirectory.RetireAndTryCleanup());
+        ObserveDirectoryCleanup(
+            Task.Run(() => _sessionDirectory.RetireAndTryCleanup()),
+            "browser-session-directory-retire");
+    }
+
+    private static Task<CoreWebView2Environment> CreateEnvironmentAsync(string sessionPath) =>
+        CoreWebView2Environment.CreateAsync(
+            browserExecutableFolder: null,
+            userDataFolder: sessionPath,
+            CcbUKeyWebView2Environment.CreateOptions());
+
+    private static void ObserveDirectoryCleanup(Task task, string operation) =>
+        BackgroundTaskObserver.Observe(
+            task,
+            operation,
+            fault => CertificateLoginDiagnostics.Write(
+                "background-task-error",
+                new { operation = fault.Operation, exceptionType = fault.ExceptionType }));
+
+    private void ReportInitializationPhase(string phase)
+    {
+        try
+        {
+            _initializationPhase?.Invoke(phase);
+        }
+        catch (Exception exception)
+        {
+            CertificateLoginDiagnostics.Write(
+                "lifecycle-observation-phase-error",
+                new { phase, exceptionType = exception.GetType().Name });
+        }
     }
 
     private void OnNavigationStarting(

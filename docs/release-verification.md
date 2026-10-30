@@ -255,3 +255,65 @@ $env:NUGET_PACKAGES='D:\NuGetPackages'
 - `UsbWebLauncher.App.dll` SHA-256：`F06CE0A253FC2B6B45DBB09666F6527689F77C4D210FB736401A7ED28C41C1BE`。
 - `UsbWebLauncher.Windows.dll` SHA-256：`266FF49044D6E6EBD9756F92B42B8DEC65EF0A8F6395308D7B51361216E6C6E0`。
 - 无设备启动及正常关闭冒烟通过，退出码为 0。
+## 2026-10-16 Runtime lifecycle observation
+
+The bounded lifecycle harness is `tests/Smoke/ObservePublishedAppLifecycle.ps1`.
+Each application run performs three WebView2 start, stop, retry, and close cycles.
+The default harness invocation repeats the application run three times, for nine
+cycles in separate processes.
+
+The committed acceptance tolerances are:
+
+- WebView2 initialization: 45 seconds per cycle.
+- Browser-process exit: 15 seconds per cycle.
+- Retired session-directory cleanup: 5 seconds per cycle.
+- Stopped private-bytes growth from the first to final cycle: at most 96 MiB.
+- Stopped managed-heap growth from the first to final cycle: at most 16 MiB.
+- Stopped handle-count growth from the first to final cycle: at most 128.
+- Each started cycle has one live business-session owner and one active browser
+  session directory; each stopped cycle has zero of both.
+- The recorded WebView2 browser process must exit, and retired browser session
+  directories must not accumulate.
+
+The 2026-10-16 repeated observation passed all three application runs and all
+nine cycles. The maximum per-run stopped deltas were 1,155,072 private bytes,
+86,776 managed-heap bytes, and 7 handles. Every browser process exited and every
+run ended with zero live session owners and zero active or retired session
+directories. Evidence is written to
+`artifacts/test-results/lifecycle-observation-visible-repeated.json`.
+
+### Hardware-only acceptance boundary
+
+Automated release verification excludes tests categorized as `Hardware`. It does
+not prove physical USB Key detection, CSP/container access, real client
+certificate selection, native PIN-prompt binding and submission, target TLS
+authentication, bank navigation/export behavior, or unplug/replug recovery.
+Those checks still require an explicit real-machine acceptance run with the
+supported USB Key and production dependencies. Test output and diagnostics must
+not record the real PIN or credential contents.
+
+## 2026-10-16 Final non-hardware release gates
+
+The final source state passed every automated gate required by OpenSpec task
+7.6:
+
+- Release .NET tests excluding `Category=Hardware`: 1,743 passed, 0 failed.
+- Browser JavaScript tests: 260 passed, 0 failed.
+- Packaging tests passed for transaction behavior on Windows PowerShell 5.1
+  and PowerShell 7, install-directory validation, build contract, versioning,
+  build entry, payload integrity, and release publication (14 Node tests).
+- A fresh conventional self-contained `win-x64` payload passed
+  `Assert-CleanPayload` and `Write-PayloadManifest`.
+- Final payload footprint: 284 files and 274,549,498 unpacked bytes.
+- The broker policy remained unbound in the release payload.
+- `tests/Smoke/ClosePublishedApp.ps1` passed against the fresh payload.
+
+The verified payload is:
+
+`artifacts/publish/final-gate-conventional-20261016-1306f618c6d34e2083895f2bb53e25e8`
+
+Hardware-only acceptance remains outside these automated gates. A real-machine
+release acceptance run is still required for physical USB Key detection,
+CSP/container access, client-certificate selection, native PIN-prompt binding
+and submission, target TLS authentication, bank navigation/export behavior,
+and unplug/replug recovery.

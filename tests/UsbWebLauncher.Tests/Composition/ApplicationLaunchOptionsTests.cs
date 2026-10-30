@@ -22,6 +22,29 @@ public sealed class ApplicationLaunchOptionsTests
     }
 
     [Fact]
+    public void Parse_WithLifecycleObservationPath_UsesEmptyMonitorAndNormalizesPath()
+    {
+        var reportPath = Path.Combine(
+            Path.GetTempPath(),
+            "UsbWebLauncherLifecycleTests",
+            "report.json");
+
+        var options = ApplicationLaunchOptions.Parse(
+            [$"--lifecycle-observation-report={reportPath}"]);
+
+        Assert.True(options.UseEmptyDeviceMonitor);
+        Assert.True(options.IsLifecycleObservation);
+        Assert.Equal(Path.GetFullPath(reportPath), options.LifecycleObservationReportPath);
+    }
+
+    [Fact]
+    public void Parse_WithRelativeLifecycleObservationPath_RejectsAmbiguousOutput()
+    {
+        Assert.Throws<ArgumentException>(() => ApplicationLaunchOptions.Parse(
+            ["--lifecycle-observation-report=relative-report.json"]));
+    }
+
+    [Fact]
     public async Task EmptyDeviceMonitor_NeverReportsADevice()
     {
         await using var monitor = new EmptyUsbDeviceMonitor();

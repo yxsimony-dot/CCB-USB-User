@@ -6,11 +6,52 @@ using UsbWebLauncher.Core.Browser;
 using UsbWebLauncher.Core.Configuration;
 using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.Tests.Composition;
 
 public sealed class ManualLauncherActionsTests
 {
+    [Fact]
+    public async Task DisposeAsync_ReleasesOwnedPreparationExactlyOnce()
+    {
+        var preparation = new DisposablePreparation();
+        await using var launcher = Create(new Monitor(true), new Browser());
+        var actions = new ManualLauncherActions(launcher, preparation);
+
+        await actions.DisposeAsync();
+        await actions.DisposeAsync();
+
+        Assert.Equal(1, preparation.DisposeCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhenOwnedPreparationFails_StillDetachesOtherHandlers()
+    {
+        var preparation = new DisposablePreparation { ThrowOnDispose = true };
+        var authentication = new AuthenticationControl();
+        await using var launcher = Create(new Monitor(true), new Browser());
+        var actions = new ManualLauncherActions(
+            launcher,
+            preparation,
+            authentication: authentication);
+        var notifications = 0;
+        actions.StateChanged += (_, _) => notifications++;
+
+        var exception = await Assert.ThrowsAsync<CleanupStageAggregateException>(
+            async () => await actions.DisposeAsync());
+        authentication.PublishStateChanged();
+        preparation.PublishStateChanged();
+
+        Assert.Contains(
+            exception.Failures,
+            failure => failure.Stage == "manual-actions-local-pin");
+        Assert.Equal(1, preparation.DisposeCount);
+        Assert.Equal(0, authentication.SubscriptionCount);
+        Assert.Equal(0, preparation.SubscriptionCount);
+        Assert.Equal(0, notifications);
+    }
+
     [Fact]
     public async Task PageLogin_OnePresentationSubscriberCannotBlockRemainingStatusSubscribers()
     {
@@ -467,6 +508,84 @@ public sealed class ManualLauncherActionsTests
         public Task DeleteAsync(CancellationToken cancellationToken = default) { Deletes++; return Task.CompletedTask; }
         public Task InstallNativePromptBrokerAsync(CancellationToken cancellationToken = default) { Installs++; return Task.CompletedTask; }
         public Task UninstallNativePromptBrokerAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
+    private sealed class DisposablePreparation :
+        ILocalPinCommands,
+        INativePromptBrokerCommands,
+        IDisposable
+    {
+        private EventHandler? _stateChanged;
+
+        public event EventHandler? StateChanged
+        {
+            add
+            {
+                _stateChanged += value;
+                SubscriptionCount++;
+            }
+            remove
+            {
+                _stateChanged -= value;
+                SubscriptionCount--;
+            }
+        }
+
+        public int DisposeCount { get; private set; }
+        public int SubscriptionCount { get; private set; }
+        public bool ThrowOnDispose { get; init; }
+        public NativePromptBrokerPrerequisiteState CurrentState =>
+            NativePromptBrokerPrerequisiteState.NotRequired;
+
+        public Task ValidateAndSaveAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task ResetAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task DeleteAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task InstallNativePromptBrokerAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task UninstallNativePromptBrokerAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public void PublishStateChanged() => _stateChanged?.Invoke(this, EventArgs.Empty);
+
+        public void Dispose()
+        {
+            DisposeCount++;
+            if (ThrowOnDispose)
+            {
+                throw new InvalidOperationException("synthetic preparation disposal failure");
+            }
+        }
+    }
+
+    private sealed class AuthenticationControl : IManualAuthenticationControl
+    {
+        private EventHandler? _stateChanged;
+
+        public event EventHandler? StateChanged
+        {
+            add
+            {
+                _stateChanged += value;
+                SubscriptionCount++;
+            }
+            remove
+            {
+                _stateChanged -= value;
+                SubscriptionCount--;
+            }
+        }
+
+        public int SubscriptionCount { get; private set; }
+        public bool RequiresExplicitStart => false;
+
+        public Task AllowBusinessAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task PauseAsync(CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public void PublishStateChanged() => _stateChanged?.Invoke(this, EventArgs.Empty);
     }
     private sealed class Prerequisites : INativePromptBrokerPrerequisites
     {

@@ -1,3 +1,4 @@
+using System.IO;
 using UsbWebLauncher.Core.Devices;
 
 namespace UsbWebLauncher.App.Composition;
@@ -6,9 +7,14 @@ internal sealed record ApplicationLaunchOptions(bool UseEmptyDeviceMonitor)
 {
     public InstallerCommand InstallerCommand { get; init; }
     public bool IsHeadless => InstallerCommand is not InstallerCommand.None;
+    public bool IsLifecycleObservation => LifecycleObservationReportPath is not null;
+    public string? LifecycleObservationReportPath { get; init; }
     public bool ShowDependencyPreparation { get; init; }
     internal const string SmokeTestNoDevicesArgument = "--smoke-test-no-devices";
     internal const string SmokeReadyWindowTitle = "USB Web Launcher [Smoke Ready]";
+    internal const string LifecycleObservationArgumentPrefix = "--lifecycle-observation-report=";
+    internal const string LifecycleObservationReadyWindowTitle =
+        "USB Web Launcher [Lifecycle Observation Ready]";
 
     public static ApplicationLaunchOptions Parse(IEnumerable<string>? arguments)
     {
@@ -29,10 +35,37 @@ internal sealed record ApplicationLaunchOptions(bool UseEmptyDeviceMonitor)
                 _ => InstallerCommand.Invalid
             }};
         }
-        return new(args.Any(argument => string.Equals(
+
+        var lifecycleArguments = args
+            .Where(argument => argument.StartsWith(
+                LifecycleObservationArgumentPrefix,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (lifecycleArguments.Length > 1)
+        {
+            throw new ArgumentException("Only one lifecycle observation report path may be supplied.");
+        }
+
+        string? lifecycleReportPath = null;
+        if (lifecycleArguments.Length == 1)
+        {
+            var path = lifecycleArguments[0][LifecycleObservationArgumentPrefix.Length..];
+            if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+            {
+                throw new ArgumentException(
+                    "The lifecycle observation report path must be absolute.");
+            }
+
+            lifecycleReportPath = Path.GetFullPath(path);
+        }
+
+        return new(lifecycleReportPath is not null || args.Any(argument => string.Equals(
             argument,
             SmokeTestNoDevicesArgument,
-            StringComparison.OrdinalIgnoreCase)));
+            StringComparison.OrdinalIgnoreCase)))
+        {
+            LifecycleObservationReportPath = lifecycleReportPath
+        };
     }
 }
 

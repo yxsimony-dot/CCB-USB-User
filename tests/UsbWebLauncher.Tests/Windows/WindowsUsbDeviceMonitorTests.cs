@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.Core.Lifecycle;
 using UsbWebLauncher.Windows.Devices;
 
 namespace UsbWebLauncher.Tests.Windows;
@@ -539,6 +541,101 @@ public sealed class WindowsUsbDeviceMonitorTests
     }
 
     [Fact]
+    public async Task DisposeAsync_StopFailureDoesNotSkipTrackedWorkOrOwnedResources()
+    {
+        var changeSource = new ThrowingStopChangeSource();
+        var monitor = new WindowsUsbDeviceMonitor(
+            new RecordingEnumerator([CreateDevice()]),
+            changeSource,
+            TimeSpan.FromMinutes(1));
+        await monitor.StartAsync();
+        changeSource.RaiseChanged();
+
+        var exception = await Assert.ThrowsAsync<CleanupStageAggregateException>(
+            () => monitor.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Contains(exception.Failures, failure =>
+            failure.Stage == "stop-change-source" &&
+            failure.ExceptionType == nameof(InvalidOperationException));
+        Assert.Equal(0, changeSource.ChangedSubscriberCount);
+        Assert.Equal(0, changeSource.FaultedSubscriberCount);
+        Assert.Equal(1, changeSource.DisposeCount);
+        Assert.True(monitor.DebounceDisposed);
+        Assert.True(monitor.LifetimeDisposed);
+        Assert.True(monitor.InitialReadGateDisposed);
+        Assert.Equal(0, monitor.TrackedRefreshCount);
+    }
+
+    [Fact]
+    public async Task EnumerationAndSubscriberFaultsAreObservedOnceAndLaterSubscribersRun()
+    {
+        var faults = new ConcurrentQueue<(string Operation, Exception Error)>();
+        var changeSource = new RecordingChangeSource();
+        var monitor = new WindowsUsbDeviceMonitor(
+            new ThrowingEnumerator(),
+            changeSource,
+            TimeSpan.Zero,
+            enableCcbMetadataRetry: false,
+            metadataRetryDelay: null,
+            maxMetadataRetries: 5,
+            (operation, error) => faults.Enqueue((operation, error)));
+        var deliveries = new ConcurrentQueue<string>();
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        monitor.DevicesChanged += (_, _) =>
+        {
+            deliveries.Enqueue("first");
+            return Task.FromException(new InvalidOperationException("subscriber failed"));
+        };
+        monitor.DevicesChanged += (_, args) =>
+        {
+            deliveries.Enqueue(args.Error is null ? "second-success" : "second-error");
+            delivered.TrySetResult();
+            return Task.CompletedTask;
+        };
+        await monitor.StartAsync();
+
+        changeSource.RaiseChanged();
+        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => monitor.TrackedRefreshCount == 0);
+        await monitor.DisposeAsync();
+
+        Assert.Equal(new[] { "first", "second-error" }, deliveries);
+        Assert.Single(faults.Where(fault => fault.Operation == "usb-enumeration"));
+        Assert.Single(faults.Where(fault => fault.Operation == "usb-subscriber-0"));
+        Assert.Equal(0, monitor.TrackedRefreshCount);
+        Assert.True(monitor.LifetimeDisposed);
+        Assert.True(monitor.InitialReadGateDisposed);
+    }
+
+    [Fact]
+    public async Task FaultedRefreshTaskIsObservedOnceRemovedAndDoesNotBlockDisposal()
+    {
+        var faults = new ConcurrentQueue<(string Operation, Exception Error)>();
+        var changeSource = new RecordingChangeSource();
+        var monitor = new WindowsUsbDeviceMonitor(
+            new FaultingSnapshotEnumerator(),
+            changeSource,
+            TimeSpan.Zero,
+            enableCcbMetadataRetry: true,
+            metadataRetryDelay: TimeSpan.Zero,
+            maxMetadataRetries: 0,
+            (operation, error) => faults.Enqueue((operation, error)));
+        await monitor.StartAsync();
+
+        changeSource.RaiseChanged();
+        await WaitUntilAsync(() =>
+            faults.Count(fault => fault.Operation == "usb-refresh") == 1 &&
+            monitor.TrackedRefreshCount == 0);
+        await monitor.DisposeAsync();
+
+        Assert.Single(faults.Where(fault => fault.Operation == "usb-refresh"));
+        Assert.Equal(0, monitor.TrackedRefreshCount);
+        Assert.True(monitor.DebounceDisposed);
+        Assert.True(monitor.LifetimeDisposed);
+        Assert.True(monitor.InitialReadGateDisposed);
+    }
+
+    [Fact]
     public async Task RefreshFailure_PublishesTheEnumerationError()
     {
         var changeSource = new RecordingChangeSource();
@@ -696,6 +793,16 @@ public sealed class WindowsUsbDeviceMonitorTests
         [],
         []);
 
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var timeout = DateTime.UtcNow.AddSeconds(2);
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= timeout) throw new TimeoutException("Condition was not reached.");
+            await Task.Delay(10);
+        }
+    }
+
     private sealed class RecordingEnumerator(
         IReadOnlyList<UsbDeviceDescriptor> devices) : IWindowsUsbDeviceEnumerator
     {
@@ -790,6 +897,56 @@ public sealed class WindowsUsbDeviceMonitorTests
         }
     }
 
+    private sealed class ThrowingStopChangeSource : IDeviceChangeSource
+    {
+        private EventHandler? _changed;
+        private EventHandler<DeviceChangeSourceFaultedEventArgs>? _faulted;
+
+        public event EventHandler? Changed
+        {
+            add
+            {
+                _changed += value;
+                ChangedSubscriberCount++;
+            }
+            remove
+            {
+                _changed -= value;
+                ChangedSubscriberCount--;
+            }
+        }
+
+        public event EventHandler<DeviceChangeSourceFaultedEventArgs>? Faulted
+        {
+            add
+            {
+                _faulted += value;
+                FaultedSubscriberCount++;
+            }
+            remove
+            {
+                _faulted -= value;
+                FaultedSubscriberCount--;
+            }
+        }
+
+        public int ChangedSubscriberCount { get; private set; }
+
+        public int FaultedSubscriberCount { get; private set; }
+
+        public int DisposeCount { get; private set; }
+
+        public void Start()
+        {
+        }
+
+        public void Stop() => throw new InvalidOperationException("stop failed");
+
+        public void RaiseChanged() => _changed?.Invoke(this, EventArgs.Empty);
+
+        public void Dispose() => DisposeCount++;
+    }
+
     private sealed class ControlledEnumerator : IWindowsUsbDeviceEnumerator
     {
         private int _callCount;
@@ -824,6 +981,33 @@ public sealed class WindowsUsbDeviceMonitorTests
             SecondStarted.TrySetResult();
             return await SecondResult.Task;
         }
+    }
+
+    private sealed class FaultingSnapshotEnumerator : IWindowsUsbDeviceEnumerator
+    {
+        private readonly IReadOnlyList<UsbDeviceDescriptor> _snapshot =
+            new FaultOnEnumerationList(CcbDevice());
+
+        public Task<IReadOnlyList<UsbDeviceDescriptor>> EnumerateAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(_snapshot);
+    }
+
+    private sealed class FaultOnEnumerationList(UsbDeviceDescriptor device)
+        : IReadOnlyList<UsbDeviceDescriptor>
+    {
+        public int Count => 1;
+
+        public UsbDeviceDescriptor this[int index] =>
+            index == 0 ? device : throw new ArgumentOutOfRangeException(nameof(index));
+
+        public IEnumerator<UsbDeviceDescriptor> GetEnumerator()
+        {
+            throw new InvalidOperationException("snapshot enumeration failed");
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+            GetEnumerator();
     }
 
     private sealed class ThrowingEnumerator : IWindowsUsbDeviceEnumerator

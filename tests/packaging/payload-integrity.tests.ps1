@@ -10,7 +10,28 @@ $dir = Join-Path ([IO.Path]::GetTempPath()) ('uwl-integrity-' + [guid]::NewGuid(
 New-Item $dir -ItemType Directory | Out-Null
 try {
     Set-Content "$dir/app.txt" 'original'
-    @{ files = @(@{path='app.txt';size=(Get-Item "$dir/app.txt").Length;sha256=(Get-FileHash "$dir/app.txt").Hash}) } | ConvertTo-Json -Depth 4 | Set-Content "$dir/payload-manifest.json"
+    $size = (Get-Item "$dir/app.txt").Length
+    @{
+        schemaVersion = 2
+        footprint = @{
+            fileCount = 1
+            unpackedBytes = $size
+            maximumFileCount = 1
+            maximumUnpackedBytes = $size
+        }
+        files = @(@{path='app.txt';size=$size;sha256=(Get-FileHash "$dir/app.txt").Hash})
+    } | ConvertTo-Json -Depth 4 | Set-Content "$dir/payload-manifest.json"
+    Assert-Payload $dir
+    $manifest = Get-Content "$dir/payload-manifest.json" -Raw | ConvertFrom-Json
+    $manifest.footprint.fileCount = 2
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content "$dir/payload-manifest.json"
+    Reject { Assert-Payload $dir }
+    $manifest.footprint.fileCount = 1
+    $manifest.footprint.maximumUnpackedBytes = $size - 1
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content "$dir/payload-manifest.json"
+    Reject { Assert-Payload $dir }
+    $manifest.footprint.maximumUnpackedBytes = $size
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content "$dir/payload-manifest.json"
     Assert-Payload $dir
     Set-Content "$dir/unlisted.txt" 'unexpected'
     Reject { Assert-Payload $dir }

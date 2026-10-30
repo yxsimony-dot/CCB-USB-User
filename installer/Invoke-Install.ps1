@@ -29,6 +29,18 @@ function Assert-Payload([string]$Directory) {
     $manifest = Get-Content (Join-Path $Directory 'payload-manifest.json') -Raw | ConvertFrom-Json
     $declared = @($manifest.files | ForEach-Object { $_.path.Replace('/','\') })
     if (@($declared | Select-Object -Unique).Count -ne $declared.Count) { throw 'Duplicate payload manifest paths' }
+    if ([long]$manifest.schemaVersion -ge 2) {
+        $declaredBytes = [long]0
+        foreach ($entry in $manifest.files) { $declaredBytes += [long]$entry.size }
+        if ([long]$manifest.footprint.fileCount -ne [long]$declared.Count -or
+            [long]$manifest.footprint.unpackedBytes -ne $declaredBytes) {
+            throw 'Payload footprint metadata does not match the declared files'
+        }
+        if ([long]$manifest.footprint.fileCount -gt [long]$manifest.footprint.maximumFileCount -or
+            [long]$manifest.footprint.unpackedBytes -gt [long]$manifest.footprint.maximumUnpackedBytes) {
+            throw 'Payload footprint exceeds its committed bounds'
+        }
+    }
     foreach ($item in Get-ChildItem -LiteralPath $Directory -Force -Recurse) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Payload contains a reparse point' }
         if (-not $item.PSIsContainer) {

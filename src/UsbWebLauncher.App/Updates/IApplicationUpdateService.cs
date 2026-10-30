@@ -1,10 +1,16 @@
 namespace UsbWebLauncher.App.Updates;
 
-public interface IApplicationUpdateService
+public interface IApplicationUpdateService : IAsyncDisposable
 {
     Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken);
     Task<DownloadedUpdate> DownloadAsync(UpdateRelease release, IProgress<UpdateDownloadProgress>? progress, CancellationToken cancellationToken);
     Task VerifyDownloadedAsync(DownloadedUpdate downloaded, CancellationToken cancellationToken);
+}
+
+public enum UpdateHttpClientOwnership
+{
+    Borrowed,
+    Owned
 }
 
 public enum UpdateCheckStatus { UpdateAvailable, UpToDate, NoReleases, InvalidRelease, Incomplete, NetworkError, RateLimited, Cancelled }

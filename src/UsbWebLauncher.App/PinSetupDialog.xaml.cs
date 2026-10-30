@@ -6,32 +6,73 @@ namespace UsbWebLauncher.App;
 
 public partial class PinSetupDialog : Window, ILocalPinDialog
 {
+    private readonly Func<bool?> _showDialog;
+
     public PinSetupDialog(Window owner)
+        : this(owner, null)
+    {
+    }
+
+    internal PinSetupDialog(Window? owner, Func<bool?>? showDialog)
     {
         InitializeComponent();
-        Owner = owner;
+        if (owner is not null)
+        {
+            Owner = owner;
+        }
+
+        _showDialog = showDialog ?? ShowDialog;
     }
 
     public Task<ClientCertificatePin?> ShowAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var accepted = ShowDialog() == true;
-        if (!accepted)
-        {
-            PinTextBox.Clear();
-            return Task.FromResult<ClientCertificatePin?>(null);
-        }
-
-        var pin = ClientCertificatePin.CopyOf(PinTextBox.Text.AsSpan());
+        using var registration = cancellationToken.Register(RequestCancellation);
         try
         {
-            return Task.FromResult<ClientCertificatePin?>(pin);
+            var accepted = _showDialog() == true;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!accepted)
+            {
+                return Task.FromResult<ClientCertificatePin?>(null);
+            }
+
+            using var securePassword = PinPasswordBox.SecurePassword;
+            return Task.FromResult<ClientCertificatePin?>(
+                SecurePasswordPinReader.CopyFrom(securePassword));
         }
         finally
         {
-            PinTextBox.Clear();
+            PinPasswordBox.Clear();
         }
     }
 
     private void OnConfirmClicked(object sender, RoutedEventArgs eventArgs) => DialogResult = true;
+
+    private void RequestCancellation()
+    {
+        try
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                CloseIfVisible();
+            }
+            else
+            {
+                _ = Dispatcher.BeginInvoke(CloseIfVisible);
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // The dispatcher or dialog has already reached its terminal state.
+        }
+    }
+
+    private void CloseIfVisible()
+    {
+        if (IsVisible)
+        {
+            Close();
+        }
+    }
 }

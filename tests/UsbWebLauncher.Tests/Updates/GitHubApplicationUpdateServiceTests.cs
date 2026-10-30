@@ -521,6 +521,108 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
         Assert.False(Directory.Exists(cache));
     }
 
+    [Fact]
+    public async Task DisposeHonorsOwnedAndBorrowedHttpClientModes()
+    {
+        var ownedHandler = new TrackingHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)));
+        var owned = new GitHubApplicationUpdateService(
+            new HttpClient(ownedHandler),
+            "1.1.0",
+            cache,
+            clientOwnership: UpdateHttpClientOwnership.Owned);
+
+        await owned.DisposeAsync();
+        await owned.DisposeAsync();
+
+        Assert.Equal(1, ownedHandler.DisposeCount);
+
+        var borrowedHandler = new TrackingHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)));
+        using var borrowedClient = new HttpClient(borrowedHandler);
+        var borrowed = new GitHubApplicationUpdateService(
+            borrowedClient,
+            "1.1.0",
+            cache,
+            clientOwnership: UpdateHttpClientOwnership.Borrowed);
+
+        await borrowed.DisposeAsync();
+
+        Assert.Equal(0, borrowedHandler.DisposeCount);
+    }
+
+    [Fact]
+    public async Task DisposeCancelsAndWaitsForPendingCheck()
+    {
+        var handler = new BlockingTrackingHandler();
+        using var client = new HttpClient(handler);
+        var service = new GitHubApplicationUpdateService(client, "1.1.0", cache);
+        var check = service.CheckAsync(default);
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var dispose = service.DisposeAsync().AsTask();
+        var result = await check.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(UpdateCheckStatus.Cancelled, result.Status);
+        Assert.True(handler.Cancelled.Task.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task DisposeCancelsAndWaitsForPendingDownloadAndCleansPartialFile()
+    {
+        var service = Service([Release("1.1.10")]);
+        var release = (await service.CheckAsync(default)).Release!;
+        var stream = new BlockingReadStream();
+        intercept = request => request.RequestUri!.AbsolutePath.EndsWith(".exe")
+            ? new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(stream)
+            }
+            : null;
+        var download = service.DownloadAsync(release, null, default);
+        await stream.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var dispose = service.DisposeAsync().AsTask();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => download.WaitAsync(TimeSpan.FromSeconds(5)));
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(stream.Cancelled.Task.IsCompletedSuccessfully);
+        Assert.Empty(Directory.EnumerateFiles(cache, "*.partial", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task ReplacingReleaseKeepsStateBoundedAndRejectsStaleReleaseAndDownload()
+    {
+        var now = DateTimeOffset.Parse("2026-10-11T00:00:00Z");
+        var service = Service([], directVersion: "1.1.10", utcNow: () => now);
+        var first = (await service.CheckAsync(default)).Release!;
+        var firstDownload = await service.DownloadAsync(first, null, default);
+
+        Assert.Equal(1, service.RetainedReleaseCount);
+        Assert.Equal(1, service.RetainedDownloadCount);
+
+        now = now.AddMinutes(2);
+        intercept = request => request.RequestUri!.AbsolutePath.Contains("/latest/")
+            ? Redirect(Repository + "/releases/download/v1.1.11/release-manifest.json")
+            : null;
+        var second = (await service.CheckAsync(default)).Release!;
+
+        Assert.Equal("1.1.11", second.Version);
+        Assert.Equal(1, service.RetainedReleaseCount);
+        Assert.Equal(0, service.RetainedDownloadCount);
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => service.DownloadAsync(first, null, default));
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => service.VerifyDownloadedAsync(firstDownload, default));
+
+        await service.DownloadAsync(second, null, default);
+
+        Assert.Equal(1, service.RetainedReleaseCount);
+        Assert.Equal(1, service.RetainedDownloadCount);
+    }
+
     private GitHubApplicationUpdateService Service(object[] first, object[]? second = null, int maxPages = 10, bool manifestBom = false, string? directVersion = null, Func<DateTimeOffset>? utcNow = null)
     {
         var handler = new Handler(request =>
@@ -591,6 +693,97 @@ public sealed class GitHubApplicationUpdateServiceTests : IDisposable
     {
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         { await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken); throw new InvalidOperationException(); }
+    }
+    private sealed class TrackingHandler(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> response)
+        : HttpMessageHandler
+    {
+        public int DisposeCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) =>
+            response(request, cancellationToken);
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                DisposeCount++;
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+    private sealed class BlockingTrackingHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource Started { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Cancelled { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    Cancelled.TrySetResult();
+                }
+            }
+
+            throw new InvalidOperationException();
+        }
+    }
+    private sealed class BlockingReadStream : MemoryStream
+    {
+        public TaskCompletionSource Started { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Cancelled { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public override bool CanSeek => false;
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            return await WaitForCancellationAsync(cancellationToken);
+        }
+
+        public override async Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken)
+        {
+            return await WaitForCancellationAsync(cancellationToken);
+        }
+
+        private async Task<int> WaitForCancellationAsync(
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    Cancelled.TrySetResult();
+                }
+            }
+
+            return 0;
+        }
     }
     private sealed class CaptureProgress : IProgress<UpdateDownloadProgress>
     {

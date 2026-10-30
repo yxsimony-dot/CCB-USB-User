@@ -6,9 +6,24 @@ namespace UsbWebLauncher.App.Presentation;
 
 internal static class SecurePasswordPinReader
 {
-    public static ClientCertificatePin CopyFrom(SecureString securePassword)
+    public static ClientCertificatePin CopyFrom(SecureString securePassword) =>
+        CopyFrom(
+            securePassword,
+            Marshal.SecureStringToGlobalAllocUnicode,
+            static (pointer, characters) =>
+                Marshal.Copy(pointer, characters, 0, characters.Length),
+            Marshal.ZeroFreeGlobalAllocUnicode);
+
+    internal static ClientCertificatePin CopyFrom(
+        SecureString securePassword,
+        Func<SecureString, IntPtr> allocate,
+        Action<IntPtr, char[]> copy,
+        Action<IntPtr> clearAndFree)
     {
         ArgumentNullException.ThrowIfNull(securePassword);
+        ArgumentNullException.ThrowIfNull(allocate);
+        ArgumentNullException.ThrowIfNull(copy);
+        ArgumentNullException.ThrowIfNull(clearAndFree);
         if (securePassword.Length == 0)
         {
             return ClientCertificatePin.CopyOf(ReadOnlySpan<char>.Empty);
@@ -18,8 +33,8 @@ internal static class SecurePasswordPinReader
         var pointer = IntPtr.Zero;
         try
         {
-            pointer = Marshal.SecureStringToGlobalAllocUnicode(securePassword);
-            Marshal.Copy(pointer, characters, 0, characters.Length);
+            pointer = allocate(securePassword);
+            copy(pointer, characters);
             return ClientCertificatePin.CopyOf(characters.AsSpan());
         }
         finally
@@ -27,7 +42,7 @@ internal static class SecurePasswordPinReader
             Array.Clear(characters, 0, characters.Length);
             if (pointer != IntPtr.Zero)
             {
-                Marshal.ZeroFreeGlobalAllocUnicode(pointer);
+                clearAndFree(pointer);
             }
         }
     }

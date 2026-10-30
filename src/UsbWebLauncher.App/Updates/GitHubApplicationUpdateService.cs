@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -7,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.App.Updates;
 
@@ -28,19 +28,29 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
     private readonly TimeSpan timeout;
     private readonly Func<DateTimeOffset> utcNow;
     private readonly Func<TimeSpan, CancellationToken, Task> delayAsync;
+    private readonly UpdateHttpClientOwnership clientOwnership;
+    private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim checkGate = new(1, 1);
     private readonly SemaphoreSlim downloadGate = new(1, 1);
+    private readonly SemaphoreSlim verifyGate = new(1, 1);
+    private readonly object stateSync = new();
+    private readonly object disposeSync = new();
     private UpdateCheckResult? cachedCheck;
     private DateTimeOffset cacheExpires;
     private DateTimeOffset rateLimitUntil;
     private static readonly Uri LatestManifest = new(Repository + "/releases/latest/download/release-manifest.json");
-    private readonly ConcurrentDictionary<UpdateRelease, byte> selected = new();
-    private readonly ConcurrentDictionary<string, UpdateRelease> downloads = new(StringComparer.OrdinalIgnoreCase);
+    private UpdateRelease? selectedRelease;
+    private DownloadedUpdate? currentDownload;
+    private TaskCompletionSource? operationsSettled;
+    private Task? disposeTask;
+    private int activeOperations;
+    private bool disposing;
 
     // Injected clients must disable automatic redirects; CreateDefault enforces this for production.
     public GitHubApplicationUpdateService(HttpClient client, string currentVersion, string cacheRoot,
         Version? osVersion = null, int maxPages = 10, TimeSpan? timeout = null, Func<DateTimeOffset>? utcNow = null,
-        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
+        UpdateHttpClientOwnership clientOwnership = UpdateHttpClientOwnership.Borrowed)
     {
         this.client = client;
         this.currentVersion = ParseVersion(currentVersion) ?? throw new ArgumentException("Invalid current version.", nameof(currentVersion));
@@ -50,15 +60,18 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         this.timeout = timeout ?? TimeSpan.FromSeconds(30);
         this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
         this.delayAsync = delayAsync ?? Task.Delay;
+        this.clientOwnership = clientOwnership;
     }
 
     public static GitHubApplicationUpdateService CreateDefault(string currentVersion) => new(
         new HttpClient(new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false }) { Timeout = Timeout.InfiniteTimeSpan },
-        currentVersion, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UsbWebLauncher", "updates"));
+        currentVersion, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UsbWebLauncher", "updates"),
+        clientOwnership: UpdateHttpClientOwnership.Owned);
 
     public async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var operation = EnterOperation();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
         deadline.CancelAfter(timeout);
         var ct = deadline.Token;
         var entered = false;
@@ -79,6 +92,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
                 result = await CheckLegacyReleasesAsync(ct).ConfigureAwait(false);
             }
             ct.ThrowIfCancellationRequested();
+            SetActionableRelease(result.Release);
             if (result.Status is UpdateCheckStatus.UpdateAvailable or UpdateCheckStatus.UpToDate or UpdateCheckStatus.NoReleases)
             {
                 cachedCheck = result;
@@ -91,7 +105,12 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             rateLimitUntil = ex.RetryAt;
             return RateLimitedResult(utcNow());
         }
-        catch (OperationCanceledException) { return new(cancellationToken.IsCancellationRequested ? UpdateCheckStatus.Cancelled : UpdateCheckStatus.Incomplete, cancellationToken.IsCancellationRequested ? "已取消更新检查。" : "更新检查超时，未完成检查，请重试。"); }
+        catch (OperationCanceledException)
+        {
+            var cancelled = cancellationToken.IsCancellationRequested || lifetime.IsCancellationRequested;
+            return new(cancelled ? UpdateCheckStatus.Cancelled : UpdateCheckStatus.Incomplete,
+                cancelled ? "已取消更新检查。" : "更新检查超时，未完成检查，请重试。");
+        }
         catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
         { return new(UpdateCheckStatus.NetworkError, "GitHub 拒绝访问更新文件，请检查网络、代理或访问权限后重试（HTTP 403）。"); }
         catch (HttpRequestException) { return new(UpdateCheckStatus.NetworkError, "无法连接 GitHub 完成更新检查，请检查网络后重试。"); }
@@ -138,7 +157,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             { throw new InvalidDataException("发布文件缺失：SHA256SUMS。", ex); }
             if (ParseVersion(version!)! <= currentVersion) return new(UpdateCheckStatus.UpToDate, "当前已是最新正式版本。");
-            selected.TryAdd(release, 0);
+            SetActionableRelease(release);
             return new(UpdateCheckStatus.UpdateAvailable, $"发现新版本 {release.Version}。", release);
         }
         catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound && version != null)
@@ -175,7 +194,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             try
             {
                 var release = await ValidateReleaseAsync(candidate.Release, candidate.Version.ToString(3), ct).ConfigureAwait(false);
-                selected.TryAdd(release, 0);
+                SetActionableRelease(release);
                 return new(UpdateCheckStatus.UpdateAvailable,
                     $"发现新版本 {release.Version}。" + (warnings.Count > 0 ? " 更高版本不可用：" + string.Join("；", warnings) : ""), release);
             }
@@ -251,9 +270,10 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
 
     public async Task<DownloadedUpdate> DownloadAsync(UpdateRelease release, IProgress<UpdateDownloadProgress>? progress, CancellationToken cancellationToken)
     {
+        using var operation = EnterOperation();
         cancellationToken.ThrowIfCancellationRequested();
-        Require(selected.ContainsKey(release), "请重新检查更新后再下载。");
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Require(IsCurrentRelease(release), "请重新检查更新后再下载。");
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
         deadline.CancelAfter(TimeSpan.FromMinutes(30));
         var ct = deadline.Token;
         var entered = false;
@@ -261,6 +281,8 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
         {
             await downloadGate.WaitAsync(ct).ConfigureAwait(false);
             entered = true;
+            ct.ThrowIfCancellationRequested();
+            Require(IsCurrentRelease(release), "请重新检查更新后再下载。");
             var directory = Path.Combine(cacheRoot, release.Version);
             EnsureSafePath(directory);
             Directory.CreateDirectory(directory);
@@ -274,7 +296,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             {
                 if (await HasExpectedHashAsync(finalPath, release, ct).ConfigureAwait(false))
                 {
-                    downloads[finalPath] = release;
+                    RegisterDownload(release, finalPath);
                     progress?.Report(new(release.Size, release.Size));
                     return new(release, finalPath);
                 }
@@ -324,7 +346,7 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
             ct.ThrowIfCancellationRequested();
             EnsureSafePath(partialPath);
             File.Move(partialPath, finalPath);
-            downloads[finalPath] = release;
+            RegisterDownload(release, finalPath);
             return new(release, finalPath);
         }
         finally
@@ -389,14 +411,178 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
 
     public async Task VerifyDownloadedAsync(DownloadedUpdate downloaded, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        Require(downloads.TryGetValue(downloaded.FilePath, out var issued) && issued == downloaded.Release && selected.ContainsKey(downloaded.Release), "安装缓存身份无效，请重新下载。");
-        EnsureSafePath(downloaded.FilePath);
-        Require(Path.GetFileName(downloaded.FilePath) == downloaded.Release.InstallerFileName, "安装缓存文件名无效。");
-        await using var input = new FileStream(downloaded.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, DownloadBufferSize, true);
-        Require(input.Length == downloaded.Release.Size, "安装缓存大小已改变，请重新下载。");
-        var hash = await SHA256.HashDataAsync(input, cancellationToken).ConfigureAwait(false);
-        Require(Convert.ToHexString(hash).Equals(downloaded.Release.Sha256, StringComparison.OrdinalIgnoreCase), "安装缓存已改变，请重新下载。");
+        using var operation = EnterOperation();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
+        var ct = linked.Token;
+        var entered = false;
+        try
+        {
+            await verifyGate.WaitAsync(ct).ConfigureAwait(false);
+            entered = true;
+            ct.ThrowIfCancellationRequested();
+            Require(IsCurrentDownload(downloaded), "安装缓存身份无效，请重新下载。");
+            EnsureSafePath(downloaded.FilePath);
+            Require(Path.GetFileName(downloaded.FilePath) == downloaded.Release.InstallerFileName, "安装缓存文件名无效。");
+            await using var input = new FileStream(downloaded.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, DownloadBufferSize, true);
+            Require(input.Length == downloaded.Release.Size, "安装缓存大小已改变，请重新下载。");
+            var hash = await SHA256.HashDataAsync(input, ct).ConfigureAwait(false);
+            Require(Convert.ToHexString(hash).Equals(downloaded.Release.Sha256, StringComparison.OrdinalIgnoreCase), "安装缓存已改变，请重新下载。");
+            Require(IsCurrentDownload(downloaded), "安装缓存身份无效，请重新下载。");
+        }
+        finally
+        {
+            if (entered) verifyGate.Release();
+        }
+    }
+
+    internal int RetainedReleaseCount
+    {
+        get
+        {
+            lock (stateSync)
+            {
+                return selectedRelease is null ? 0 : 1;
+            }
+        }
+    }
+
+    internal int RetainedDownloadCount
+    {
+        get
+        {
+            lock (stateSync)
+            {
+                return currentDownload is null ? 0 : 1;
+            }
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        lock (disposeSync)
+        {
+            disposeTask ??= DisposeCoreAsync(BeginDisposal());
+            return new ValueTask(disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync(Task settlement)
+    {
+        await Task.Yield();
+        await CleanupStageRunner.RunAsync(
+        [
+            new("update-service-cancel", () => new ValueTask(lifetime.CancelAsync())),
+            new("update-service-settle", () => new ValueTask(settlement)),
+            new("update-service-gates", () =>
+            {
+                checkGate.Dispose();
+                downloadGate.Dispose();
+                verifyGate.Dispose();
+                return ValueTask.CompletedTask;
+            }),
+            new("update-service-lifetime", () =>
+            {
+                lifetime.Dispose();
+                return ValueTask.CompletedTask;
+            }),
+            new("update-service-http-client", () =>
+            {
+                if (clientOwnership == UpdateHttpClientOwnership.Owned)
+                {
+                    client.Dispose();
+                }
+
+                return ValueTask.CompletedTask;
+            })
+        ]).ConfigureAwait(false);
+    }
+
+    private Task BeginDisposal()
+    {
+        lock (stateSync)
+        {
+            disposing = true;
+            selectedRelease = null;
+            currentDownload = null;
+            cachedCheck = null;
+            if (activeOperations == 0)
+            {
+                return Task.CompletedTask;
+            }
+
+            operationsSettled ??= new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            return operationsSettled.Task;
+        }
+    }
+
+    private OperationLease EnterOperation()
+    {
+        lock (stateSync)
+        {
+            ObjectDisposedException.ThrowIf(disposing, this);
+            activeOperations++;
+            return new OperationLease(this);
+        }
+    }
+
+    private void ExitOperation()
+    {
+        TaskCompletionSource? settled = null;
+        lock (stateSync)
+        {
+            activeOperations--;
+            if (disposing && activeOperations == 0)
+            {
+                settled = operationsSettled;
+            }
+        }
+
+        settled?.TrySetResult();
+    }
+
+    private void SetActionableRelease(UpdateRelease? release)
+    {
+        lock (stateSync)
+        {
+            if (selectedRelease != release)
+            {
+                currentDownload = null;
+            }
+
+            selectedRelease = release;
+        }
+    }
+
+    private bool IsCurrentRelease(UpdateRelease release)
+    {
+        lock (stateSync)
+        {
+            return !disposing && selectedRelease == release;
+        }
+    }
+
+    private void RegisterDownload(UpdateRelease release, string filePath)
+    {
+        lock (stateSync)
+        {
+            Require(!disposing && selectedRelease == release, "请重新检查更新后再下载。");
+            currentDownload = new DownloadedUpdate(release, filePath);
+        }
+    }
+
+    private bool IsCurrentDownload(DownloadedUpdate downloaded)
+    {
+        lock (stateSync)
+        {
+            return !disposing
+                && selectedRelease == downloaded.Release
+                && currentDownload?.Release == downloaded.Release
+                && string.Equals(
+                    currentDownload.FilePath,
+                    downloaded.FilePath,
+                    StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private void EnsureSafePath(string path)
@@ -556,5 +742,15 @@ public sealed class GitHubApplicationUpdateService : IApplicationUpdateService
     private sealed class RateLimitException(DateTimeOffset retryAt) : HttpRequestException("GitHub 暂时限制下载请求，请稍后重试。")
     {
         public DateTimeOffset RetryAt { get; } = retryAt;
+    }
+
+    private sealed class OperationLease(GitHubApplicationUpdateService owner) : IDisposable
+    {
+        private GitHubApplicationUpdateService? currentOwner = owner;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref currentOwner, null)?.ExitOperation();
+        }
     }
 }

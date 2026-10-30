@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.Core.Lifecycle;
 
 namespace UsbWebLauncher.Windows.Devices;
 
@@ -10,6 +12,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
     private readonly bool _enableCcbMetadataRetry;
     private readonly TimeSpan _metadataRetryDelay;
     private readonly int _maxMetadataRetries;
+    private readonly Action<string, Exception> _reportFault;
     private readonly SemaphoreSlim _initialReadGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly object _sync = new();
@@ -21,12 +24,17 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
     private bool _initialReadInProgress;
     private HashSet<string> _lastReportedCcbInstanceIds = new(StringComparer.OrdinalIgnoreCase);
     private Exception? _monitorFault;
+    private UsbDevicesChangedEventHandler? _devicesChanged;
+    private Task? _disposal;
 
     public WindowsUsbDeviceMonitor(bool enableCcbMetadataRetry = false)
         : this(
             new SetupApiUsbDeviceEnumerator(),
             new DeviceWatcherChangeSource(),
-            TimeSpan.FromMilliseconds(350), enableCcbMetadataRetry)
+            TimeSpan.FromMilliseconds(350), enableCcbMetadataRetry,
+            metadataRetryDelay: null,
+            maxMetadataRetries: 5,
+            reportFault: ReportDefaultFault)
     {
     }
 
@@ -37,9 +45,29 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         bool enableCcbMetadataRetry = false,
         TimeSpan? metadataRetryDelay = null,
         int maxMetadataRetries = 5)
+        : this(
+            enumerator,
+            changeSource,
+            debounceDelay,
+            enableCcbMetadataRetry,
+            metadataRetryDelay,
+            maxMetadataRetries,
+            ReportDefaultFault)
+    {
+    }
+
+    internal WindowsUsbDeviceMonitor(
+        IWindowsUsbDeviceEnumerator enumerator,
+        IDeviceChangeSource changeSource,
+        TimeSpan debounceDelay,
+        bool enableCcbMetadataRetry,
+        TimeSpan? metadataRetryDelay,
+        int maxMetadataRetries,
+        Action<string, Exception> reportFault)
     {
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _changeSource = changeSource ?? throw new ArgumentNullException(nameof(changeSource));
+        _reportFault = reportFault ?? throw new ArgumentNullException(nameof(reportFault));
         _debounceDelay = debounceDelay >= TimeSpan.Zero
             ? debounceDelay
             : throw new ArgumentOutOfRangeException(nameof(debounceDelay));
@@ -55,13 +83,51 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             : throw new ArgumentOutOfRangeException(nameof(maxMetadataRetries));
     }
 
-    public event UsbDevicesChangedEventHandler? DevicesChanged;
+    public event UsbDevicesChangedEventHandler? DevicesChanged
+    {
+        add
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                _devicesChanged += value;
+            }
+        }
+        remove
+        {
+            lock (_sync)
+            {
+                _devicesChanged -= value;
+            }
+        }
+    }
+
+    internal int TrackedRefreshCount
+    {
+        get
+        {
+            lock (_sync) return _refreshes.Count;
+        }
+    }
+
+    internal bool DebounceDisposed { get; private set; }
+
+    internal bool LifetimeDisposed { get; private set; }
+
+    internal bool InitialReadGateDisposed { get; private set; }
 
     public Task<IReadOnlyList<UsbDeviceDescriptor>> GetConnectedDevicesAsync(
-        CancellationToken cancellationToken = default) =>
-        _enableCcbMetadataRetry
+        CancellationToken cancellationToken = default)
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+        }
+
+        return _enableCcbMetadataRetry
             ? GetCurrentCcbSnapshotAsync(cancellationToken)
             : _enumerator.EnumerateAsync(cancellationToken);
+    }
 
     private async Task<IReadOnlyList<UsbDeviceDescriptor>> GetCurrentCcbSnapshotAsync(
         CancellationToken cancellationToken)
@@ -189,74 +255,146 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
 
-        if (_started)
-        {
-            return Task.CompletedTask;
-        }
+            if (_started)
+            {
+                return Task.CompletedTask;
+            }
 
-        _changeSource.Changed += OnDeviceChanged;
-        _changeSource.Faulted += OnChangeSourceFaulted;
-        try
-        {
-            _changeSource.Start();
-            _started = true;
-            _monitorFault = null;
-        }
-        catch
-        {
-            _changeSource.Changed -= OnDeviceChanged;
-            _changeSource.Faulted -= OnChangeSourceFaulted;
+            _changeSource.Changed += OnDeviceChanged;
+            _changeSource.Faulted += OnChangeSourceFaulted;
             try
             {
-                _changeSource.Stop();
+                _changeSource.Start();
+                _started = true;
+                _monitorFault = null;
             }
             catch
             {
-            }
+                _changeSource.Changed -= OnDeviceChanged;
+                _changeSource.Faulted -= OnChangeSourceFaulted;
+                try
+                {
+                    _changeSource.Stop();
+                }
+                catch
+                {
+                }
 
-            throw;
+                throw;
+            }
         }
 
         return Task.CompletedTask;
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
+        TaskCompletionSource completion;
         Task[] refreshes;
+        CancellationTokenSource? debounce;
+        bool shouldStop;
         lock (_sync)
         {
-            if (_disposed)
-            {
-                return;
-            }
-
+            if (_disposal is not null) return new ValueTask(_disposal);
             _disposed = true;
-            _lifetime.Cancel();
-            _debounce?.Cancel();
+            _devicesChanged = null;
             refreshes = _refreshes.ToArray();
+            debounce = _debounce;
+            shouldStop = _started;
+            _started = false;
+            completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _disposal = completion.Task;
         }
 
-        if (_started)
-        {
-            _changeSource.Changed -= OnDeviceChanged;
-            _changeSource.Faulted -= OnChangeSourceFaulted;
-            _changeSource.Stop();
-        }
+        _ = DisposeCoreAsync(completion, refreshes, debounce, shouldStop);
+        return new ValueTask(completion.Task);
+    }
 
+    private async Task DisposeCoreAsync(
+        TaskCompletionSource completion,
+        Task[] refreshes,
+        CancellationTokenSource? debounce,
+        bool shouldStop)
+    {
         try
         {
-            await Task.WhenAll(refreshes).ConfigureAwait(false);
+            await CleanupStageRunner.RunAsync(
+            [
+                new("detach-change-source", () =>
+                {
+                    _changeSource.Changed -= OnDeviceChanged;
+                    _changeSource.Faulted -= OnChangeSourceFaulted;
+                    return ValueTask.CompletedTask;
+                }),
+                new("cancel-monitor", () =>
+                {
+                    _lifetime.Cancel();
+                    debounce?.Cancel();
+                    return ValueTask.CompletedTask;
+                }),
+                new("stop-change-source", () =>
+                {
+                    if (shouldStop) _changeSource.Stop();
+                    return ValueTask.CompletedTask;
+                }),
+                new("settle-refreshes", () => new(SettleRefreshesAsync(refreshes))),
+                new("settle-initial-read", () => new(SettleInitialReadAsync())),
+                new("dispose-debounce", () =>
+                {
+                    debounce?.Dispose();
+                    DebounceDisposed = true;
+                    return ValueTask.CompletedTask;
+                }),
+                new("dispose-lifetime", () =>
+                {
+                    _lifetime.Dispose();
+                    LifetimeDisposed = true;
+                    return ValueTask.CompletedTask;
+                }),
+                new("dispose-initial-read-gate", () =>
+                {
+                    _initialReadGate.Dispose();
+                    InitialReadGateDisposed = true;
+                    return ValueTask.CompletedTask;
+                }),
+                new("dispose-change-source", () =>
+                {
+                    _changeSource.Dispose();
+                    return ValueTask.CompletedTask;
+                })
+            ]).ConfigureAwait(false);
+            completion.TrySetResult();
         }
-        catch (OperationCanceledException)
+        catch (Exception exception)
         {
+            completion.TrySetException(exception);
         }
+    }
 
-        _debounce?.Dispose();
-        _lifetime.Dispose();
-        _changeSource.Dispose();
+    private static async Task SettleRefreshesAsync(IEnumerable<Task> refreshes)
+    {
+        foreach (var refresh in refreshes)
+        {
+            try
+            {
+                await refresh.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The per-task observer owns fault reporting. Disposal only settles it.
+            }
+        }
+    }
+
+    private async Task SettleInitialReadAsync()
+    {
+        await _initialReadGate.WaitAsync().ConfigureAwait(false);
+        _initialReadGate.Release();
     }
 
     private void OnDeviceChanged(object? sender, EventArgs eventArgs)
@@ -293,6 +431,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             _debounce?.Cancel();
             _refreshGeneration++;
         }
+        ReportFault("usb-change-source", eventArgs.Exception);
 
         _changeSource.Changed -= OnDeviceChanged;
         _changeSource.Faulted -= OnChangeSourceFaulted;
@@ -300,15 +439,16 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         {
             _changeSource.Stop();
         }
-        catch
+        catch (Exception exception)
         {
+            ReportFault("usb-change-source-stop", exception);
         }
 
         lock (_sync)
         {
             if (!_disposed)
             {
-                Track(PublishAsync([], eventArgs.Exception));
+                Track(PublishAsync(SnapshotSubscribers(), [], eventArgs.Exception));
             }
         }
     }
@@ -332,22 +472,25 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         {
             devices = await EnumerateSnapshotAsync(cancellationToken, snapshot =>
             {
+                var shouldPublishAbsence = false;
                 lock (_sync)
                 {
-                    if (!IsCurrent(generation, cancellationToken) ||
-                        _lastReportedCcbInstanceIds.Count == 0 ||
-                        snapshot.Any(device => _lastReportedCcbInstanceIds.Contains(device.InstanceId)) ||
-                        snapshot.Any(UsbDeviceMatcher.IsCcbUsbStorMatch))
+                    if (IsCurrent(generation, cancellationToken) &&
+                        _lastReportedCcbInstanceIds.Count != 0 &&
+                        !snapshot.Any(device => _lastReportedCcbInstanceIds.Contains(device.InstanceId)) &&
+                        !snapshot.Any(UsbDeviceMatcher.IsCcbUsbStorMatch))
                     {
-                        return Task.CompletedTask;
+                        reportedAbsence = true;
+                        shouldPublishAbsence = true;
                     }
-
-                    // Only physical disappearance warrants an immediate absence. If
-                    // the same node remains, let bounded metadata retries finish so
-                    // a transient CD query cannot reset an authentication attempt.
-                    reportedAbsence = true;
-                    return PublishCurrentAsync(snapshot, null, generation, cancellationToken);
                 }
+
+                // Only physical disappearance warrants an immediate absence. If
+                // the same node remains, let bounded metadata retries finish so
+                // a transient CD query cannot reset an authentication attempt.
+                return shouldPublishAbsence
+                    ? PublishCurrentAsync(snapshot, null, generation, cancellationToken)
+                    : Task.CompletedTask;
             }).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -356,6 +499,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         }
         catch (Exception exception)
         {
+            ReportFault("usb-enumeration", exception);
             await PublishCurrentAsync([], exception, generation, cancellationToken).ConfigureAwait(false);
 
             return;
@@ -373,6 +517,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         long generation,
         CancellationToken cancellationToken)
     {
+        UsbDevicesChangedEventHandler[] subscribers;
         lock (_sync)
         {
             if (!IsCurrent(generation, cancellationToken))
@@ -385,8 +530,10 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
                 RememberMatchingInstanceIds(devices);
             }
 
-            return PublishAsync(devices, error);
+            subscribers = SnapshotSubscribers();
         }
+
+        return PublishAsync(subscribers, devices, error);
     }
 
     private void RememberMatchingInstanceIds(IReadOnlyList<UsbDeviceDescriptor> devices)
@@ -425,6 +572,10 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         catch (OperationCanceledException)
         {
         }
+        catch (Exception exception)
+        {
+            ReportFault("usb-refresh", exception);
+        }
         finally
         {
             lock (_sync)
@@ -434,19 +585,53 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         }
     }
 
+    private UsbDevicesChangedEventHandler[] SnapshotSubscribers() =>
+        _devicesChanged?.GetInvocationList()
+            .Cast<UsbDevicesChangedEventHandler>()
+            .ToArray() ?? [];
+
     private async Task PublishAsync(
+        IReadOnlyList<UsbDevicesChangedEventHandler> subscribers,
         IReadOnlyList<UsbDeviceDescriptor> devices,
         Exception? error)
     {
-        if (DevicesChanged is null)
+        await Task.Yield();
+        if (subscribers.Count == 0)
         {
             return;
         }
 
         var args = new UsbDevicesChangedEventArgs(devices, error);
-        foreach (UsbDevicesChangedEventHandler handler in DevicesChanged.GetInvocationList())
+        for (var index = 0; index < subscribers.Count; index++)
         {
-            await handler(this, args).ConfigureAwait(false);
+            lock (_sync)
+            {
+                if (_disposed) return;
+            }
+
+            try
+            {
+                await subscribers[index](this, args).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                ReportFault($"usb-subscriber-{index}", exception);
+            }
         }
     }
+
+    private void ReportFault(string operation, Exception exception)
+    {
+        try
+        {
+            _reportFault(operation, exception);
+        }
+        catch
+        {
+            // Diagnostics cannot alter monitor ownership or publication.
+        }
+    }
+
+    private static void ReportDefaultFault(string operation, Exception exception) =>
+        Trace.TraceError($"{operation}: {exception.GetType().Name}");
 }

@@ -5,6 +5,20 @@ namespace UsbWebLauncher.Tests.Composition;
 public sealed class BusinessSessionScopeTests
 {
     [Fact]
+    public void Dispose_TracksLiveOwnersAndIsIdempotent()
+    {
+        var baseline = BusinessSessionScope.LiveCount;
+        var scope = new BusinessSessionScope(CancellationToken.None);
+
+        Assert.Equal(baseline + 1, BusinessSessionScope.LiveCount);
+
+        scope.Dispose();
+        scope.Dispose();
+
+        Assert.Equal(baseline, BusinessSessionScope.LiveCount);
+    }
+
+    [Fact]
     public async Task RevokeAsync_WhenRepeated_SharesPendingCancellationCompletion()
     {
         using var scope = new BusinessSessionScope(CancellationToken.None);

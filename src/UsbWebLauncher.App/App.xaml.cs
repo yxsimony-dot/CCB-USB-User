@@ -9,6 +9,7 @@ using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.Core.Authentication;
 using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.Core.Lifecycle;
 using UsbWebLauncher.Windows.Devices;
 using UsbWebLauncher.App.Updates;
 
@@ -35,66 +36,97 @@ public partial class App : Application
     private bool _initializing;
     private bool _retryInProgress;
     private BusinessSessionScope? _session;
-    private Task? _cleanupTask;
+    private readonly ApplicationRuntimeCleanup _runtimeCleanup = new();
     private Task? _stopTask;
     private Task? _startTask;
     private UsbKeyPresenceObserver? _keyPresenceObserver;
     private long _keyPresenceRevision;
     private readonly ApplicationExitWatchdog _exitWatchdog = new();
     private UpdatePresentationController? _updates;
+    private LifecycleObservationReport? _lifecycleObservationReport;
+    private string? _lifecycleObservationReportPath;
+    private int _lifecycleObservationCycle;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-
-        _launchOptions = ApplicationLaunchOptions.Parse(e.Args);
-        if (_launchOptions.IsHeadless)
+        try
         {
-            Shutdown(await InstallerCommandRunner.Create().RunAsync(_launchOptions.InstallerCommand));
-            return;
+            _launchOptions = ApplicationLaunchOptions.Parse(e.Args);
+            if (_launchOptions.IsHeadless)
+            {
+                Shutdown(await InstallerCommandRunner.Create().RunAsync(_launchOptions.InstallerCommand));
+                return;
+            }
+            if (_launchOptions.ShowDependencyPreparation)
+            {
+                var preparation = new DependencyPreparationWindow();
+                MainWindow = preparation;
+                preparation.Closed += (_, _) => Shutdown();
+                preparation.Show();
+                return;
+            }
+
+            CertificateLoginDiagnostics.BeginRun();
+
+            _window = new MainWindow();
+            MainWindow = _window;
+            _window.Closing += OnMainWindowClosing;
+            _window.RetryRequested += OnRetryRequested;
+            _updates = new UpdatePresentationController(GitHubApplicationUpdateService.CreateDefault(ProductVersion.Display),
+                _window.ViewModel, ProductVersion.Display, UpdatePresentationController.LaunchInteractiveInstaller,
+                () => _window.Close());
+            _window.ConfigureUpdates(_updates);
+            _presenter = new LauncherUiPresenter(
+                _window.ViewModel,
+                new WpfUiDispatcher(Dispatcher),
+                _window.ActivateForBrowser);
+
+            _window.Show();
+            // Independent of initialization and USB Key observation; never download on startup.
+            if (!_launchOptions.IsLifecycleObservation)
+            {
+                ObserveBackground(
+                    _updates.CheckOnStartupAsync(),
+                    "startup-update-check");
+            }
+            await RunSerializedAsync(InitializeLauncherCoreAsync);
+
+            if (_launchOptions.LifecycleObservationReportPath is { } observationReportPath &&
+                !_shutdownStarted &&
+                _window is not null)
+            {
+                await RunLifecycleObservationAsync(observationReportPath);
+                if (!_shutdownStarted)
+                {
+                    _window.Title =
+                        ApplicationLaunchOptions.LifecycleObservationReadyWindowTitle;
+                }
+            }
+            else if (_launchOptions.UseEmptyDeviceMonitor &&
+                !_shutdownStarted &&
+                _coordinator is not null &&
+                _window is not null)
+            {
+                _window.Title = ApplicationLaunchOptions.SmokeReadyWindowTitle;
+            }
         }
-        if (_launchOptions.ShowDependencyPreparation)
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
-            var preparation = new DependencyPreparationWindow();
-            MainWindow = preparation;
-            preparation.Closed += (_, _) => Shutdown();
-            preparation.Show();
-            return;
         }
-
-        CertificateLoginDiagnostics.BeginRun();
-
-        _window = new MainWindow();
-        MainWindow = _window;
-        _window.Closing += OnMainWindowClosing;
-        _window.RetryRequested += OnRetryRequested;
-        _updates = new UpdatePresentationController(GitHubApplicationUpdateService.CreateDefault(ProductVersion.Display),
-            _window.ViewModel, ProductVersion.Display, UpdatePresentationController.LaunchInteractiveInstaller,
-            () => _window.Close());
-        _window.ConfigureUpdates(_updates);
-        _presenter = new LauncherUiPresenter(
-            _window.ViewModel,
-            new WpfUiDispatcher(Dispatcher),
-            _window.ActivateForBrowser);
-
-        _window.Show();
-        // Independent of initialization and USB Key observation; never download on startup.
-        _ = _updates.CheckOnStartupAsync();
-        await RunSerializedAsync(InitializeLauncherCoreAsync);
-
-        if (_launchOptions.UseEmptyDeviceMonitor &&
-            !_shutdownStarted &&
-            _coordinator is not null &&
-            _window is not null)
+        catch (Exception exception)
         {
-            _window.Title = ApplicationLaunchOptions.SmokeReadyWindowTitle;
+            CertificateLoginDiagnostics.Write(
+                "startup-handler-error",
+                new { exceptionType = exception.GetType().Name });
+            ShowStartupError(exception);
         }
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
         // Do not synchronously invoke third-party cancellation callbacks on exit.
-        _ = _lifetime.CancelAsync();
+        ObserveBackground(_lifetime.CancelAsync(), "application-exit-cancellation");
         base.OnExit(e);
         _exitWatchdog.Dispose();
     }
@@ -129,9 +161,15 @@ public partial class App : Application
         _window.ViewModel.UpdateBusinessState(false, false, true, true);
         try
         {
-            await DisposeRuntimeAsync();
+            try
+            {
+                await DisposeRuntimeAsync();
+            }
+            finally
+            {
+                _runtimeCleanup.Reset();
+            }
             if (_shutdownStarted) return;
-            _cleanupTask = null;
             var session = new BusinessSessionScope(_lifetime.Token);
             var sessionToken = session.Token;
             _session = session;
@@ -164,11 +202,28 @@ public partial class App : Application
                 _keyPresenceObserver = observer;
                 // Presence is only a hint. Never start the session coordinator or
                 // wait for hardware metadata on the UI/stop-initialization path.
-                _ = Task.Run(() => observer.StartAsync(_lifetime.Token));
+                ObserveBackground(
+                    Task.Run(() => observer.StartAsync(_lifetime.Token)),
+                    "presence-observer-start");
             }
 
-            _browserControl = new WpfWebView2Control(browser,
-                _window.DownloadSettings, _window.ShowDownloadDirectoryError, sessionToken: sessionToken);
+            var observationSessionDirectory = _launchOptions.LifecycleObservationReportPath is { } reportPath
+                ? new BrowserSessionDirectory(LifecycleObservation.GetBrowserSessionRoot(reportPath))
+                : null;
+            _browserControl = _launchOptions.IsLifecycleObservation
+                ? new WpfWebView2Control(
+                    browser,
+                    _window.DownloadSettings,
+                    _window.ShowDownloadDirectoryError,
+                    observationSessionDirectory,
+                    sessionToken,
+                    RecordLifecycleObservationPhase)
+                : new WpfWebView2Control(
+                    browser,
+                    _window.DownloadSettings,
+                    _window.ShowDownloadDirectoryError,
+                    observationSessionDirectory,
+                    sessionToken);
             _browserHost = new WebView2BrowserHost(_browserControl);
             var composer = new LauncherApplicationComposer(
                 new WindowsClientCertificateAuthenticationRuntimeFactory());
@@ -262,18 +317,159 @@ public partial class App : Application
         }
     }
 
+    private async Task RunLifecycleObservationAsync(string reportPath)
+    {
+        var tolerances = new LifecycleObservationTolerances();
+        var browserSessionRoot = LifecycleObservation.GetBrowserSessionRoot(reportPath);
+        var report = new LifecycleObservationReport
+        {
+            Tolerances = tolerances,
+            InitialSessionDirectories =
+                LifecycleObservation.CaptureSessionDirectories(browserSessionRoot)
+        };
+        _lifecycleObservationReport = report;
+        _lifecycleObservationReportPath = reportPath;
+        await LifecycleObservation.WriteReportAsync(reportPath, report);
+
+        try
+        {
+            for (var cycleNumber = 1; cycleNumber <= tolerances.CycleCount; cycleNumber++)
+            {
+                _lifecycleObservationCycle = cycleNumber;
+                var host = _browserHost ??
+                    throw new InvalidOperationException("The browser host was not initialized.");
+                var control = _browserControl ??
+                    throw new InvalidOperationException("The browser control was not initialized.");
+                var window = _window ??
+                    throw new InvalidOperationException("The main window was not initialized.");
+                var session = _session;
+                if (session?.IsCurrent != true)
+                    throw new InvalidOperationException("The business session owner was not current.");
+
+                window.PrepareBrowserForLifecycleObservation();
+                RecordLifecycleObservationPhase("browser-container-prepared");
+                await host.InitializeAsync(session.Token)
+                    .WaitAsync(
+                        TimeSpan.FromSeconds(tolerances.BrowserInitializationTimeoutSeconds),
+                        session.Token);
+                var browserProcessId = control.BrowserProcessId ??
+                    throw new InvalidOperationException("WebView2 did not expose its browser process.");
+                var browserProcessExit = control.BrowserProcessExited;
+                var cycle = new LifecycleObservationCycle
+                {
+                    Cycle = cycleNumber,
+                    BrowserProcessId = browserProcessId,
+                    Started = LifecycleObservation.CaptureSnapshot(browserSessionRoot)
+                };
+                report.Cycles.Add(cycle);
+                await LifecycleObservation.WriteReportAsync(reportPath, report);
+
+                try
+                {
+                    await DisposeRuntimeAsync().WaitAsync(
+                        TimeSpan.FromSeconds(tolerances.BrowserExitTimeoutSeconds),
+                        _lifetime.Token);
+                }
+                catch (Exception exception)
+                {
+                    report.Failures.Add(
+                        $"Cycle {cycleNumber} runtime cleanup failed: {exception.GetType().Name}.");
+                }
+
+                try
+                {
+                    cycle.ExitedBrowserProcessId = await browserProcessExit.WaitAsync(
+                        TimeSpan.FromSeconds(tolerances.BrowserExitTimeoutSeconds),
+                        _lifetime.Token);
+                    cycle.BrowserProcessExitedWithinTimeout = true;
+                }
+                catch (TimeoutException)
+                {
+                    cycle.BrowserProcessExitedWithinTimeout = false;
+                }
+
+                await LifecycleObservation.WaitForDirectoryCleanupAsync(
+                    browserSessionRoot,
+                    TimeSpan.FromSeconds(tolerances.DirectoryCleanupTimeoutSeconds),
+                    _lifetime.Token);
+                cycle.Stopped = LifecycleObservation.CaptureSnapshot(browserSessionRoot);
+                await LifecycleObservation.WriteReportAsync(reportPath, report);
+
+                if (cycleNumber < tolerances.CycleCount)
+                {
+                    await RunSerializedAsync(InitializeLauncherCoreAsync)
+                        .WaitAsync(
+                            TimeSpan.FromSeconds(tolerances.BrowserInitializationTimeoutSeconds),
+                            _lifetime.Token);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            var lastPhase = report.Phases.LastOrDefault()?.Name ?? "not-started";
+            report.Failures.Add(
+                $"Lifecycle observation failed at {lastPhase}: {exception.GetType().Name}.");
+        }
+        finally
+        {
+            try
+            {
+                await DisposeRuntimeAsync().WaitAsync(
+                    TimeSpan.FromSeconds(tolerances.BrowserExitTimeoutSeconds));
+            }
+            catch (Exception exception)
+            {
+                report.Failures.Add(
+                    $"Final runtime cleanup failed: {exception.GetType().Name}.");
+            }
+
+            try
+            {
+                await LifecycleObservation.WaitForDirectoryCleanupAsync(
+                    browserSessionRoot,
+                    TimeSpan.FromSeconds(tolerances.DirectoryCleanupTimeoutSeconds),
+                    CancellationToken.None);
+            }
+            catch (Exception exception)
+            {
+                report.Failures.Add(
+                    $"Final browser directory cleanup failed: {exception.GetType().Name}.");
+            }
+
+            report.Failures.AddRange(LifecycleObservation.Validate(report));
+            report.CompletedAtUtc = DateTimeOffset.UtcNow;
+            report.Status = report.Failures.Count == 0 ? "passed" : "failed";
+            await LifecycleObservation.WriteReportAsync(reportPath, report);
+        }
+    }
+
+    private void RecordLifecycleObservationPhase(string phase)
+    {
+        var report = _lifecycleObservationReport;
+        var reportPath = _lifecycleObservationReportPath;
+        if (report is null || reportPath is null) return;
+
+        report.Phases.Add(new LifecycleObservationPhase(
+            _lifecycleObservationCycle,
+            phase,
+            DateTimeOffset.UtcNow));
+        LifecycleObservation.WriteReport(reportPath, report);
+    }
+
     private void OnSessionDeviceRemoved(BusinessSessionScope session)
     {
         if (!session.IsCurrent) return;
         // Revoke on the notification thread before the old coordinator can see a
         // replacement Key. Never await cleanup here: it owns this device monitor.
-        _ = session.RevokeAsync();
+        ObserveBackground(session.RevokeAsync(), "session-device-removal-revocation");
         CertificateLoginDiagnostics.Write("session-key-removed", new { session.Id });
-        _ = Dispatcher.InvokeAsync(async () =>
-        {
-            if (_shutdownStarted || !ReferenceEquals(session, _session)) return;
-            await StopBusinessSessionAsync();
-        });
+        ObserveBackground(
+            Dispatcher.InvokeAsync(async () =>
+            {
+                if (_shutdownStarted || !ReferenceEquals(session, _session)) return;
+                await StopBusinessSessionAsync();
+            }).Task.Unwrap(),
+            "session-device-removal-stop");
     }
 
     private void OnCoordinatorStateChanged(
@@ -423,7 +619,12 @@ public partial class App : Application
         }
         catch
         {
-            _ = _session?.RevokeAsync();
+            if (_session is { } currentSession)
+            {
+                ObserveBackground(
+                    currentSession.RevokeAsync(),
+                    "session-stop-failure-revocation");
+            }
             if (!_shutdownStarted) _window.ViewModel.UpdateSessionState(BusinessSessionState.StopFailed);
             CertificateLoginDiagnostics.Write("session-stop-failed", new
             {
@@ -456,6 +657,13 @@ public partial class App : Application
             });
         }
         catch (OperationCanceledException) when (retrySession?.IsCurrent != true) { }
+        catch (Exception exception)
+        {
+            CertificateLoginDiagnostics.Write(
+                "retry-handler-error",
+                new { exceptionType = exception.GetType().Name });
+            ShowStartupError(exception);
+        }
         finally { _retryInProgress = false; }
     }
 
@@ -475,9 +683,15 @@ public partial class App : Application
         _shutdownStarted = true;
         _exitWatchdog.Arm();
         _window?.ViewModel.UpdateSessionState(BusinessSessionState.Closing);
-        _updates?.Dispose();
-        _ = _session?.RevokeAsync();
-        _ = _lifetime.CancelAsync();
+        if (_session is { } session)
+        {
+            ObserveBackground(
+                session.RevokeAsync(),
+                "application-close-session-revocation");
+        }
+        ObserveBackground(
+            _lifetime.CancelAsync(),
+            "application-close-lifetime-cancellation");
         CertificateLoginDiagnostics.Write("application-closing");
 
         Dispatcher.BeginInvoke(
@@ -499,9 +713,21 @@ public partial class App : Application
         if (_window is not null) _window.RetryRequested -= OnRetryRequested;
         var presence = _keyPresenceObserver;
         _keyPresenceObserver = null;
-        var releasePresence = presence is null ? Task.CompletedTask
-            : Task.Run(async () => await presence.DisposeAsync());
-        await Task.WhenAll(DisposeRuntimeAsync(), releasePresence);
+        var updates = _updates;
+        _updates = null;
+        var runtimeCleanup = CaptureTask(DisposeRuntimeAsync);
+        var releasePresence = CaptureTask(() => presence is null
+            ? Task.CompletedTask
+            : Task.Run(async () => await presence.DisposeAsync()));
+        var releaseUpdates = CaptureTask(() =>
+            updates?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+        await CleanupStageRunner.RunAsync(
+            [
+                AwaitStage("runtime", runtimeCleanup),
+                AwaitStage("presence-observer", releasePresence),
+                AwaitStage("update-presentation", releaseUpdates)
+            ],
+            ObserveCleanupStage);
     }
 
     private void CloseMainWindowAfterCleanup()
@@ -526,12 +752,12 @@ public partial class App : Application
 
     private Task DisposeRuntimeAsync()
     {
-        // Repeated stop/close calls join one cleanup. Clear ownership before yielding
-        // so late old events cannot be mistaken for events from the next session.
-        return _cleanupTask ??= DisposeRuntimeCoreAsync();
+        return _runtimeCleanup.RunAsync(
+            CaptureRuntimeCleanup,
+            ObserveCleanupStage);
     }
 
-    private async Task DisposeRuntimeCoreAsync()
+    private ApplicationRuntimeCleanupSnapshot CaptureRuntimeCleanup()
     {
         var session = _session;
         var runtime = _runtime;
@@ -540,7 +766,6 @@ public partial class App : Application
         var actions = _actions;
         var exporter = _documentsExporter;
         var start = _startTask;
-        var cancellation = session?.RevokeAsync() ?? Task.CompletedTask;
         var display = _currentCompanyDisplay;
         _currentCompanyDisplay = null;
         if (exporter is not null) exporter.StateChanged -= OnExportStateChanged;
@@ -559,38 +784,123 @@ public partial class App : Application
         _startTask = null;
         _pinCredentialTargetName = null;
 
-        // Start cancellation of every owner before awaiting any one dependency.
-        // Closing the actual browser also releases outstanding ExecuteScriptAsync.
-        var pending = new List<Task> { CleanupStepAsync("cancellation", () => cancellation, session?.Id) };
-        pending.Add(CleanupStepAsync("display", () => { display?.Dispose(); return Task.CompletedTask; }, session?.Id));
-        pending.Add(CleanupStepAsync("detach", () => { _window?.DetachBrowserControl(); return Task.CompletedTask; }, session?.Id));
-        if (exporter is not null) pending.Add(CleanupStepAsync("exports", () => exporter.DisposeAsync().AsTask(), session?.Id));
-        if (actions is not null) pending.Add(CleanupStepAsync("actions", () => actions.DisposeAsync().AsTask(), session?.Id));
-        if (runtime is not null) pending.Add(CleanupStepAsync("runtime", () => Task.Run(async () => await runtime.DisposeAsync()), session?.Id));
-        else if (host is not null) pending.Add(CleanupStepAsync("host", () => host.DisposeAsync().AsTask(), session?.Id));
-        if (browser is not null) pending.Add(CleanupStepAsync("browser", () => browser.DisposeAsync().AsTask(), session?.Id));
-        if (start is not null) pending.Add(CleanupStepAsync("start", async () =>
+        // Start independent release work before awaiting any owner so a blocked or
+        // failing stage cannot prevent later captured owners from beginning cleanup.
+        var stages = new List<CleanupStage>
         {
-            try { await start; } catch (OperationCanceledException) { }
-        }, session?.Id));
-        await Task.WhenAll(pending);
-        session?.Dispose();
-        if (ReferenceEquals(_session, session)) _session = null;
+            AwaitStage(
+                "cancellation",
+                CaptureTask(() => session?.RevokeAsync() ?? Task.CompletedTask)),
+            AwaitStage(
+                "display",
+                CaptureTask(() =>
+                {
+                    display?.Dispose();
+                    return Task.CompletedTask;
+                })),
+            AwaitStage(
+                "detach",
+                CaptureTask(() =>
+                {
+                    _window?.DetachBrowserControl();
+                    return Task.CompletedTask;
+                }))
+        };
+        if (exporter is not null)
+        {
+            stages.Add(AwaitStage(
+                "exports",
+                CaptureTask(() => exporter.DisposeAsync().AsTask())));
+        }
+        if (actions is not null)
+        {
+            stages.Add(AwaitStage(
+                "actions",
+                CaptureTask(() => actions.DisposeAsync().AsTask())));
+        }
+        if (runtime is not null)
+        {
+            stages.Add(AwaitStage(
+                "runtime",
+                CaptureTask(() => Task.Run(async () => await runtime.DisposeAsync()))));
+        }
+        else if (host is not null)
+        {
+            stages.Add(AwaitStage(
+                "host",
+                CaptureTask(() => host.DisposeAsync().AsTask())));
+        }
+        if (browser is not null)
+        {
+            stages.Add(AwaitStage(
+                "browser",
+                CaptureTask(() => browser.DisposeAsync().AsTask())));
+        }
+        if (start is not null)
+        {
+            stages.Add(AwaitStage(
+                "start",
+                CaptureTask(async () =>
+                {
+                    try
+                    {
+                        await start;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                })));
+        }
+
+        return new ApplicationRuntimeCleanupSnapshot(
+            session,
+            stages,
+            () =>
+            {
+                if (ReferenceEquals(_session, session))
+                {
+                    _session = null;
+                }
+            });
     }
 
-    private static async Task CleanupStepAsync(string stage, Func<Task> cleanup, long? sessionId)
+    private static Task CaptureTask(Func<Task> operation)
     {
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        CertificateLoginDiagnostics.Write("session-cleanup-start", new { stage, sessionId });
         try
         {
-            await cleanup();
-            CertificateLoginDiagnostics.Write("session-cleanup-complete", new { stage, sessionId, elapsedMs = clock.ElapsedMilliseconds });
+            return operation();
         }
-        catch
+        catch (Exception exception)
         {
-            CertificateLoginDiagnostics.Write("session-cleanup-error", new { stage, sessionId, elapsedMs = clock.ElapsedMilliseconds });
-            throw;
+            return Task.FromException(exception);
         }
     }
+
+    private static CleanupStage AwaitStage(string name, Task task) =>
+        new(name, () => new ValueTask(task));
+
+    private static void ObserveCleanupStage(CleanupStageObservation observation)
+    {
+        var eventName = observation.Status switch
+        {
+            CleanupStageStatus.Started => "session-cleanup-start",
+            CleanupStageStatus.Completed => "session-cleanup-complete",
+            CleanupStageStatus.Failed => "session-cleanup-error",
+            _ => "session-cleanup-observation"
+        };
+        CertificateLoginDiagnostics.Write(eventName, new
+        {
+            stage = observation.Stage,
+            elapsedMs = (long)observation.Elapsed.TotalMilliseconds,
+            exceptionType = observation.ExceptionType
+        });
+    }
+
+    private static void ObserveBackground(Task task, string operation) =>
+        BackgroundTaskObserver.Observe(
+            task,
+            operation,
+            fault => CertificateLoginDiagnostics.Write(
+                "background-task-error",
+                new { operation = fault.Operation, exceptionType = fault.ExceptionType }));
 }
