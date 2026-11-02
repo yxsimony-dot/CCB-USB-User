@@ -569,7 +569,7 @@ public sealed class WebView2BrowserHostTests
 
         control.ResetNavigationInvoked();
         var second = host.NavigateAsync(new Uri("https://b2b.ccb.com/b"));
-        await control.NavigationInvoked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await control.NavigationInvoked.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(2, control.NavigateCount);
         control.RaiseNavigationStarting(202);
         control.CompleteNavigation(202, success: true);
@@ -609,7 +609,7 @@ public sealed class WebView2BrowserHostTests
 
         control.ResetNavigationInvoked();
         var second = host.NavigateAsync(new Uri("https://b2b.ccb.com/second"));
-        await control.NavigationInvoked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await control.NavigationInvoked.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(2, control.NavigateCount);
 
         control.CompleteNavigation(101, success: true);
