@@ -7,13 +7,13 @@
   ],
   "baseline": {
     "fileCount": 284,
-    "unpackedBytes": 274559738
+    "unpackedBytes": 274560804
   },
   "maximum": {
     "fileCount": 284,
-    "unpackedBytes": 274560759
+    "unpackedBytes": 274561825
   },
-  "rationale": "The accepted 2026-11-03 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. Any further growth requires an explicit reviewed update.",
+  "rationale": "The accepted 2026-11-03 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. The committed Windows CRLF checkout contract adds 1,066 bytes compared with the mixed-line-ending development tree and makes byte-for-byte payload measurements stable across clean local and GitHub Actions checkouts. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. Any further growth requires an explicit reviewed update.",
   "reduction": {
     "unfilteredAppFileCount": 481,
     "acceptedAppFileCount": 277,

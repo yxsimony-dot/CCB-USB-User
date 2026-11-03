@@ -1,0 +1,10 @@
+# These files are embedded or copied byte-for-byte into the Windows release.
+# Keep their checkout representation stable so local and CI payloads match.
+src/UsbWebLauncher.App/Browser/*.js text eol=crlf
+src/UsbWebLauncher.NativePromptBroker/native-prompt-policy.json text eol=crlf
+src/UsbWebLauncher.App/launcher-profile.json text eol=crlf
+src/UsbWebLauncher.App/browser-extensions/ccb-ukey/*.json text eol=crlf
+src/UsbWebLauncher.App/browser-extensions/ccb-ukey/*.js text eol=crlf
+src/UsbWebLauncher.App/browser-extensions/ccb-ukey/_locales/**/*.json text eol=crlf
+installer/*.ps1 text eol=crlf
+installer/*.psm1 text eol=crlf
