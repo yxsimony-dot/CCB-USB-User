@@ -18,18 +18,28 @@ public sealed class StatementExportCoordinatorTests
                 "open-accounts" => new StatementPageReply("opened"),
                 "select-first" => new StatementPageReply("selected"),
                 "query" => new StatementPageReply("queried"),
-                "identify" => new StatementPageReply("empty", "results"),
+                "identify" => new StatementPageReply("empty", "results", Identity: Identity),
+                "prepare-empty-screenshot" => new StatementPageReply("screenshot-ready", "results"),
                 _ => new StatementPageReply("disposed")
             });
         });
         var stages = new Queue<string>(["accounts", "query", "results"]);
         page.InspectStage = () => stages.Dequeue();
         var messages = new List<string>();
-        var coordinator = new StatementExportCoordinator(page, _ => throw new Exception("must not create an empty PDF"));
+        var coordinator = new StatementExportCoordinator(
+            page,
+            _ => throw new Exception("must not create an empty PDF"),
+            captureEmptyScreenshot: (identity, _) =>
+            {
+                Assert.Same(Identity, identity);
+                calls.Add("capture");
+                return Task.FromResult("empty.png");
+            });
         var result = await coordinator.ExportAsync(StatementExportMonth.Create(new DateTime(2026, 10, 8), 9), messages.Add, CancellationToken.None);
-        Assert.Null(result);
-        Assert.Equal("流水页面为空，不需要导出该月份流水。", messages.Last());
-        Assert.Equal(new[] { "open-accounts", "select-first", "query", "identify", "dispose" }, calls);
+        Assert.Equal("empty.png", result.FilePath);
+        Assert.Equal(StatementExportArtifactKind.EmptyScreenshot, result.Kind);
+        Assert.Equal("空流水截图已保存：empty.png", messages.Last());
+        Assert.Equal(new[] { "open-accounts", "select-first", "query", "identify", "prepare-empty-screenshot", "capture", "dispose" }, calls);
     }
 
     [Fact]
@@ -47,6 +57,7 @@ public sealed class StatementExportCoordinatorTests
     [Theory]
     [InlineData("failed")]
     [InlineData("identified")]
+    [InlineData("empty")]
     public async Task MissingOrRejectedIdentityNeverArmsOrStartsDownload(string status)
     {
         var calls = new List<string>();
@@ -100,7 +111,8 @@ public sealed class StatementExportCoordinatorTests
 
         var result = await coordinator.ExportAsync(StatementExportMonth.Create(new DateTime(2026, 9, 30), 1), _ => { }, CancellationToken.None);
 
-        Assert.Equal("desktop.pdf", result);
+        Assert.Equal("desktop.pdf", result.FilePath);
+        Assert.Equal(StatementExportArtifactKind.Pdf, result.Kind);
         Assert.Equal(new[] { "open-accounts", "inspect", "select-first", "inspect", "query", "inspect", "identify", "armed", "download", "download-complete", "dispose" }, calls);
         Assert.True(download.Disposed);
         Assert.Single(page.RunIds.Distinct());
@@ -190,8 +202,10 @@ public sealed class StatementExportCoordinatorTests
         for (var month = 1; month <= 3; month++)
         {
             foreach (var stage in new[] { "results", "query", "query", "accounts", "query", "results" }) stages.Enqueue(stage);
-            Assert.Equal("statement.pdf", await coordinator.ExportAsync(
-                StatementExportMonth.Create(new DateTime(2026, 9, 30), month), _ => { }, CancellationToken.None));
+            var result = await coordinator.ExportAsync(
+                StatementExportMonth.Create(new DateTime(2026, 9, 30), month), _ => { }, CancellationToken.None);
+            Assert.Equal("statement.pdf", result.FilePath);
+            Assert.Equal(StatementExportArtifactKind.Pdf, result.Kind);
             Assert.Empty(stages);
         }
         Assert.Equal(3, selections);
@@ -220,8 +234,10 @@ public sealed class StatementExportCoordinatorTests
         var coordinator = new StatementExportCoordinator(page, _ => new Download(() => Task.FromResult("desktop.pdf")),
             (_, _) => { delays++; return Task.CompletedTask; });
 
-        Assert.Equal("desktop.pdf", await coordinator.ExportAsync(
-            StatementExportMonth.Create(new DateTime(2026, 9, 30), 9), _ => { }, CancellationToken.None));
+        var result = await coordinator.ExportAsync(
+            StatementExportMonth.Create(new DateTime(2026, 9, 30), 9), _ => { }, CancellationToken.None);
+        Assert.Equal("desktop.pdf", result.FilePath);
+        Assert.Equal(StatementExportArtifactKind.Pdf, result.Kind);
         Assert.Equal(3, delays);
         foreach (var operation in new[] { "open-accounts", "select-first", "query", "download" })
             Assert.Equal(1, calls.Count(call => call == operation));

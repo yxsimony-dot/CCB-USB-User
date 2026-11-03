@@ -2,6 +2,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Interop;
+using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
 namespace UsbWebLauncher.App.Browser;
@@ -41,10 +42,15 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
             var origin = source.GetLeftPart(UriPartial.Authority);
             var owner = Window.GetWindow(browser) ?? throw new StatementExportException("浏览器窗口不可用，请重开程序。");
             var coordinator = new StatementExportCoordinator(new Page(browser, origin),
-                identity => new WpfStatementDownload(core, origin, new WindowInteropHelper(owner).Handle, identity, directory));
-            var file = await coordinator.ExportAsync(range, Publish, total.Token);
-            if (file is not null) Publish("已导出：" + file);
-            return file is null ? DocumentExportResult.Empty(DocumentExportMessages.EmptyStatement) : DocumentExportResult.Completed(file);
+                identity => new WpfStatementDownload(core, origin, new WindowInteropHelper(owner).Handle, identity, directory),
+                captureEmptyScreenshot: (identity, captureToken) =>
+                    CaptureEmptyStatementAsync(core, origin, identity, directory, captureToken));
+            var artifact = await coordinator.ExportAsync(range, Publish, total.Token);
+            var result = artifact.Kind == StatementExportArtifactKind.EmptyScreenshot
+                ? DocumentExportResult.EmptyStatementScreenshot(artifact.FilePath)
+                : DocumentExportResult.Completed(artifact.FilePath);
+            Publish(result.Message);
+            return result;
         }
         catch (OperationCanceledException)
         {
@@ -54,7 +60,7 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
         }
         catch (StatementExportException error) { Publish(error.Message); }
         catch (InvalidOperationException) { Publish("当前月份尚未到达，或页面状态已变化，请检查月份后重试。"); }
-        catch (IOException) { Publish("PDF 未能保存，请检查下载目录和磁盘空间，或点击“下载目录”重新选择。"); }
+        catch (IOException) { Publish("文件未能保存，请检查下载目录和磁盘空间，或点击“下载目录”重新选择。"); }
         catch (UnauthorizedAccessException) { Publish("无法写入下载目录，请检查访问权限或点击“下载目录”重新选择。"); }
         catch
         {
@@ -67,6 +73,40 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
             NotifyState();
         }
         return DocumentExportResult.Failed(Message ?? "导出未完成。");
+    }
+
+    private static async Task<string> CaptureEmptyStatementAsync(
+        CoreWebView2 core,
+        string origin,
+        StatementExportIdentity identity,
+        string directory,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!Uri.TryCreate(core.Source, UriKind.Absolute, out var source) ||
+            source.GetLeftPart(UriPartial.Authority) != origin)
+            throw new StatementExportException("银行页面已变化，空流水截图未保存，请重新导出。");
+
+        using var file = StatementPngFile.Create(directory, identity);
+        await using (var stream = new FileStream(
+            file.TempPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            useAsync: true))
+        {
+            // WebView2 captures the visible page viewport only, excluding the WPF launcher chrome.
+            // The API itself is not cancellable, so keep the stream alive until capture completes.
+            await core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream);
+            token.ThrowIfCancellationRequested();
+            await stream.FlushAsync(token);
+        }
+
+        if (!Uri.TryCreate(core.Source, UriKind.Absolute, out source) ||
+            source.GetLeftPart(UriPartial.Authority) != origin)
+            throw new StatementExportException("银行页面已变化，空流水截图未保存，请重新导出。");
+        return await file.CompleteAsync(token);
     }
 
     private void Publish(string message)
@@ -112,7 +152,7 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
                 ? value.GetString() : null;
             var status = Read("status") ?? "failed";
             StatementExportIdentity? identity = null;
-            if (status == "identified")
+            if (status is "identified" or "empty")
             {
                 try { identity = StatementExportIdentity.Create(Read("companyName") ?? string.Empty, Read("accountLast4") ?? string.Empty, range.Month); }
                 catch (ArgumentException) { return new("failed", "results", "naming-identity"); }
@@ -122,12 +162,14 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
                 CertificateLoginDiagnostics.Write("statement-export-step", new
                 {
                     operation,
-                    status = reply.Status is "home-ready" or "opened" or "selected" or "queried" or "identified" or "empty" or "downloading" or "waiting" or "unsupported" or "ambiguous" or "failed"
+                    status = reply.Status is "home-ready" or "opened" or "selected" or "queried" or "identified" or "empty" or "screenshot-ready"
+                        or "downloading" or "waiting" or "unsupported" or "ambiguous" or "failed"
                         ? reply.Status : "unknown",
                     stage = reply.Stage is "home" or "accounts" or "query" or "results" or "unsupported" or "ambiguous" ? reply.Stage : "unknown",
                     code = reply.Code is "home-not-found" or "naming-identity" or "entry-not-found" or "result-lineage" or "result-identity" or "account-mismatch"
                         or "download-owner" or "download-menu" or "download-pdf" or "stale" or "run-conflict"
-                        or "missing-selection" or "missing-query" or "invalid-date" or "empty-result-unconfirmed" ? reply.Code : "none"
+                        or "missing-selection" or "missing-query" or "invalid-date" or "empty-result-unconfirmed" or "screenshot-region"
+                        ? reply.Code : "none"
                 });
             return reply;
         }

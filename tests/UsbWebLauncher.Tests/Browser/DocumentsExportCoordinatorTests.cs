@@ -25,12 +25,14 @@ public sealed class DocumentsExportCoordinatorTests
     }
 
     [Theory]
+    [InlineData(DocumentExportStatus.EmptyStatementScreenshot)]
     [InlineData(DocumentExportStatus.Empty)]
     [InlineData(DocumentExportStatus.Failed)]
     [InlineData(DocumentExportStatus.Cancelled)]
     public async Task StatementEmptyFailureOrCancellationNeverStartsReceipt(DocumentExportStatus status)
     {
         var statement = status switch {
+            DocumentExportStatus.EmptyStatementScreenshot => DocumentExportResult.EmptyStatementScreenshot("empty.png"),
             DocumentExportStatus.Empty => DocumentExportResult.Empty(DocumentExportMessages.EmptyStatement),
             DocumentExportStatus.Cancelled => DocumentExportResult.Cancelled(),
             _ => DocumentExportResult.Failed("无法核对流水账户。")
@@ -38,6 +40,7 @@ public sealed class DocumentsExportCoordinatorTests
         var coordinator = new DocumentsExportCoordinator((_, _) => Task.FromResult(statement), (_, _) => throw new Exception("must not navigate"));
         var result = await coordinator.ExportAsync(Context, _ => { }, CancellationToken.None);
         Assert.Same(statement, result.Statement); Assert.Null(result.Receipt);
+        if (status == DocumentExportStatus.EmptyStatementScreenshot) Assert.Equal("空流水截图已保存：empty.png", result.Message);
         if (status == DocumentExportStatus.Empty) Assert.Equal("流水页面为空，不需要导出该月份流水。", result.Message);
         if (status == DocumentExportStatus.Failed) Assert.Contains("无法核对流水账户", result.Message);
     }
@@ -122,7 +125,7 @@ public sealed class DocumentsExportCoordinatorTests
         var receiptStarted = false;
         var first = new StatementExportCoordinator(new StatementPage(), _ => new CleanupDownload(disposing, release));
         var coordinator = new DocumentsExportCoordinator(async (context, token) =>
-            DocumentExportResult.Completed((await first.ExportAsync(context.Range, _ => { }, token))!),
+            DocumentExportResult.Completed((await first.ExportAsync(context.Range, _ => { }, token)).FilePath),
             (_, _) => { receiptStarted = true; return Task.FromResult(DocumentExportResult.Completed("receipt.pdf")); });
         var running = coordinator.ExportAsync(Context, _ => { }, CancellationToken.None);
         await disposing.Task;

@@ -20,16 +20,21 @@ public interface IStatementExportDownload : IDisposable, IAsyncDisposable
     ValueTask IAsyncDisposable.DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
 }
 
+public enum StatementExportArtifactKind { Pdf, EmptyScreenshot }
+
+public sealed record StatementExportArtifact(string FilePath, StatementExportArtifactKind Kind);
+
 public sealed class StatementExportException(string message) : Exception(message);
 
 public sealed class StatementExportCoordinator(
     IStatementExportPage page,
     Func<StatementExportIdentity, IStatementExportDownload> createDownload,
-    Func<TimeSpan, CancellationToken, Task>? delay = null)
+    Func<TimeSpan, CancellationToken, Task>? delay = null,
+    Func<StatementExportIdentity, CancellationToken, Task<string>>? captureEmptyScreenshot = null)
 {
     private readonly Func<TimeSpan, CancellationToken, Task> _delay = delay ?? Task.Delay;
 
-    public async Task<string?> ExportAsync(StatementExportMonth range, Action<string> progress, CancellationToken token)
+    public async Task<StatementExportArtifact> ExportAsync(StatementExportMonth range, Action<string> progress, CancellationToken token)
     {
         var runId = Guid.NewGuid().ToString("N");
         try
@@ -49,14 +54,19 @@ public sealed class StatementExportCoordinator(
             var identified = await ActionAsync("identify", "identified", range, runId, token);
             if (identified.Status == "empty")
             {
-                progress(DocumentExportMessages.EmptyStatement);
-                return null;
+                var emptyIdentity = identified.Identity ?? throw Failure("identify", "failed", "naming-identity");
+                if (captureEmptyScreenshot is null) throw Failure("prepare-empty-screenshot", "failed", "screenshot-region");
+                progress("已确认该月无流水，正在保存银行页面截图…");
+                await ActionAsync("prepare-empty-screenshot", "screenshot-ready", range, runId, token);
+                var screenshot = await captureEmptyScreenshot(emptyIdentity, token);
+                progress("空流水截图已保存：" + screenshot);
+                return new StatementExportArtifact(screenshot, StatementExportArtifactKind.EmptyScreenshot);
             }
             var identity = identified.Identity ?? throw Failure("identify", "failed", "naming-identity");
             progress("正在下载全部流水 PDF…");
             await using var download = createDownload(identity);
             await ActionAsync("download", "downloading", range, runId, token);
-            return await download.WaitAsync(token);
+            return new StatementExportArtifact(await download.WaitAsync(token), StatementExportArtifactKind.Pdf);
         }
         finally
         {
@@ -126,6 +136,7 @@ public sealed class StatementExportCoordinator(
     private static StatementExportException Failure(string step, string status, string? code) => new(
         step == "ensure-home" ? "未能确认网银首页已就绪，请确认已登录并能打开首页后重试。" :
         code == "naming-identity" ? "无法核对公司全名和账号尾号，已停止导出，请查看账户信息。" :
+        code == "screenshot-region" ? "无法完整显示账户信息和零笔交易结果，空流水截图未保存，请查看银行页面后重试。" :
         code == "entry-not-found" ? "未找到活期账户入口，请回到网银首页后重试。" :
         code is "account-mismatch" or "result-mismatch" or "result-identity" or "result-lineage" ? "无法核对结果页的账户或日期，已停止导出，请重新查询。" :
         step == "open-accounts" && status == "unsupported" ? "请先启动业务并登录企业网银，再导出流水。" :

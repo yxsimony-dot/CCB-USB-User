@@ -63,10 +63,13 @@ function namingPage(t) {
     return { ...p, account, company, clicks: p.countClicks('li') };
 }
 
-// The table schema (rsTable/tableList and two TD header rows of 16/2 cells)
-// was verified offline in 21 cached nonempty bank results. This zero-row variant
-// is a conservative derived fixture, not a captured empty-result document.
-const emptyStatementTable = '<table id="rsTable" class="tableList"><tr class="tableListHead">' + '<td>表头</td>'.repeat(16) + '</tr><tr class="tableListHead"><td>借方</td><td>贷方</td></tr></table>';
+// Sanitized shape from the real zero-transaction page. The visible result must
+// prove the submitted range, both zero directions, and a zero-page pager.
+const emptyStatementTable = `<table id="rsTable" class="tableList">
+    <tr class="tableListHead"><td>选择</td><td>交易时间</td><td>借方（支取）</td><td>贷方（收入）</td><td>余额</td></tr>
+    <tr><td colspan="5">全选　本次查询时间：20260201–20260228　下载当前页　下载全部</td></tr>
+    <tr><td colspan="5">转出交易：0笔　金额：0.00元；　转入交易：0笔　金额：0.00元；　首页　上一页　0　下一页　共0页</td></tr>
+</table>`;
 function emptyStatementPage(t) {
     const p = namingPage(t);
     p.child.querySelectorAll('[name="SEQ_NO"]').forEach(node => node.remove());
@@ -78,7 +81,9 @@ function emptyStatementPage(t) {
 test('identifies a fresh complete strictly empty statement result without clicking download', t => {
     const p = emptyStatementPage(t);
     assert.deepEqual(p.run('inspect'), { status: 'ready', stage: 'results' });
-    assert.deepEqual(p.run('identify'), { status: 'empty', stage: 'results' });
+    assert.deepEqual(p.run('identify'), {
+        status: 'empty', stage: 'results', companyName: p.company, accountLast4: '0007'
+    });
     assert.equal(p.run('download').status, 'empty'); assert.equal(p.clicks(), 0);
 });
 
@@ -93,18 +98,23 @@ test('waits while a zero-row result candidate is parsing and recognizes empty on
         assert.equal(p.clicks(), 0);
     }
     readyState = 'complete';
-    assert.deepEqual(p.run('identify'), { status: 'empty', stage: 'results' });
+    assert.equal(p.run('identify').status, 'empty');
     assert.equal(p.clicks(), 0);
 });
 
-test('never calls missing or malformed result content an empty statement', t => {
+test('never calls missing malformed or nonzero result evidence an empty statement', t => {
     for (const mutate of [
         p => p.child.querySelector('#rsTable').remove(),
         p => p.child.querySelector('#rsTable').after(p.child.querySelector('#rsTable').cloneNode(true)),
         p => p.child.querySelector('#rsTable').insertRow().insertCell().textContent = '页面错误',
-        p => p.child.querySelector('#rsTable tr').deleteCell(0),
         p => p.child.querySelector('#rsTable').style.display = 'none',
         p => p.child.querySelector('#rsTable tr').style.display = 'none',
+        p => { p.child.querySelector('#rsTable').innerHTML = p.child.querySelector('#rsTable').innerHTML.replace('20260201', '20260101'); },
+        p => { p.child.querySelector('#rsTable').innerHTML = p.child.querySelector('#rsTable').innerHTML.replace('转出交易：0笔', '转出交易：1笔'); },
+        p => { p.child.querySelector('#rsTable').innerHTML = p.child.querySelector('#rsTable').innerHTML.replace('转入交易：0笔', '转入交易：2笔'); },
+        p => { p.child.querySelector('#rsTable').innerHTML = p.child.querySelector('#rsTable').innerHTML.replace('金额：0.00元', '金额：1.00元'); },
+        p => { p.child.querySelector('#rsTable').innerHTML = p.child.querySelector('#rsTable').innerHTML.replace('共0页', '共1页'); },
+        p => { p.child.querySelector('#rsTable').insertAdjacentText('beforeend', '共0页'); },
         p => p.child.querySelector('#headTable').remove(),
         p => p.child.querySelector('form[name="elecPrintForm"]').remove(),
         p => p.child.querySelector('form[name="jhform"]').insertAdjacentHTML('beforeend', '<input name="SEQ_NO" type="checkbox">'),
@@ -114,6 +124,49 @@ test('never calls missing or malformed result content an empty statement', t => 
         const p = emptyStatementPage(t); mutate(p);
         assert.notEqual(p.run('identify').status, 'empty'); assert.equal(p.clicks(), 0);
     }
+});
+
+function screenshotGeometry(p, options = {}) {
+    const frame = p.w.document.querySelector('iframe');
+    const head = p.child.querySelector('#headTable');
+    const table = p.child.querySelector('#rsTable');
+    const viewport = { width: 1903, height: 677 };
+    Object.defineProperty(p.w, 'innerWidth', { configurable: true, value: viewport.width });
+    Object.defineProperty(p.w, 'innerHeight', { configurable: true, value: viewport.height });
+    Object.defineProperty(frame, 'clientLeft', { configurable: true, value: 0 });
+    Object.defineProperty(frame, 'clientTop', { configurable: true, value: 0 });
+    frame.getBoundingClientRect = () => ({ left: 356, top: 0, right: 1516, bottom: 677, width: 1160, height: 677 });
+    head.getBoundingClientRect = () => options.head || ({ left: 0, top: 50, right: 1160, bottom: 234, width: 1160, height: 184 });
+    table.getBoundingClientRect = () => options.table || ({ left: 0, top: 292, right: 1160, bottom: 435, width: 1160, height: 143 });
+    let scrolls = 0, adjustments = 0;
+    p.w.scrollTo = () => scrolls++;
+    p.child.defaultView.scrollTo = () => scrolls++;
+    head.scrollIntoView = () => adjustments++;
+    return { scrolls: () => scrolls, adjustments: () => adjustments };
+}
+
+test('prepares the complete visible bank viewport before allowing an empty screenshot', t => {
+    const p = emptyStatementPage(t);
+    const geometry = screenshotGeometry(p);
+    assert.equal(p.run('identify').status, 'empty');
+    assert.deepEqual(p.run('prepare-empty-screenshot'), { status: 'waiting', stage: 'results' });
+    assert.ok(geometry.scrolls() >= 2);
+    assert.deepEqual(p.run('prepare-empty-screenshot'), { status: 'screenshot-ready', stage: 'results' });
+    assert.equal(geometry.adjustments(), 0);
+});
+
+test('refuses an empty screenshot when account and zero-result content cannot fit in the viewport', t => {
+    const p = emptyStatementPage(t);
+    const geometry = screenshotGeometry(p, {
+        table: { left: 0, top: 700, right: 1160, bottom: 843, width: 1160, height: 143 }
+    });
+    assert.equal(p.run('identify').status, 'empty');
+    assert.equal(p.run('prepare-empty-screenshot').status, 'waiting');
+    assert.equal(p.run('prepare-empty-screenshot').status, 'waiting');
+    assert.equal(geometry.adjustments(), 1);
+    assert.deepEqual(p.run('prepare-empty-screenshot'), {
+        status: 'failed', stage: 'results', code: 'screenshot-region'
+    });
 });
 
 test('empty statement requires completed new result and matching month account and naming', t => {

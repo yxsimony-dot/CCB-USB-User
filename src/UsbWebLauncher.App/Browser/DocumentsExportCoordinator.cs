@@ -9,7 +9,7 @@ public sealed record ExportBatchContext
         new(StatementExportMonth.Create(today, month), System.IO.Path.GetFullPath(directory));
 }
 
-public enum DocumentExportStatus { Completed, Empty, Failed, Cancelled }
+public enum DocumentExportStatus { Completed, EmptyStatementScreenshot, Empty, Failed, Cancelled }
 
 public static class DocumentExportMessages
 {
@@ -27,6 +27,11 @@ public sealed record DocumentExportResult
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         return new(DocumentExportStatus.Completed, "已保存：" + filePath, filePath);
+    }
+    public static DocumentExportResult EmptyStatementScreenshot(string filePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        return new(DocumentExportStatus.EmptyStatementScreenshot, "空流水截图已保存：" + filePath, filePath);
     }
     public static DocumentExportResult Empty(string message) => new(DocumentExportStatus.Empty, message);
     public static DocumentExportResult Failed(string message) => new(DocumentExportStatus.Failed, message);

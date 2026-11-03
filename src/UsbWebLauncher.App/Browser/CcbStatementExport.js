@@ -24,6 +24,7 @@
                 state.account = null; state.startDate = null; state.endDate = null; state.naming = null;
                 state.queryFrames = null; state.queryWindow = null; state.queryForm = null; state.queryDocument = null;
                 state.menuAnchor = null; state.menuBox = null;
+                state.empty = false; state.screenshotPrepared = false; state.screenshotAdjusted = false;
                 state.homeDocument = null;
                 state.disposed = true;
             }
@@ -235,10 +236,10 @@
             state.queried = true; submit.click();
             return result('queried', stage);
         }
-        if (request.operation === 'identify' || request.operation === 'download') {
+        if (request.operation === 'identify' || request.operation === 'download' || request.operation === 'prepare-empty-screenshot') {
             if (state.menuDispatching) return result('waiting', stage);
             if (!state.queried) return result('failed', stage, 'missing-query');
-            if (state.downloaded) return result('waiting', stage);
+            if (request.operation === 'download' && state.downloaded) return result('waiting', stage);
             if (stage !== 'results') return result('waiting', stage);
             // A result header can arrive before its rows or identity fields finish parsing.
             if (!list(doc, '[name="SEQ_NO"]').length && doc.readyState !== 'complete') return result('waiting', stage);
@@ -284,21 +285,78 @@
             };
             if (!namingMatches()) return result('failed', stage, 'naming-identity');
             if (!list(doc, '[name="SEQ_NO"]').length) {
-                // Derived zero-row case of the bank's verified rsTable schema. Missing DOM,
-                // an error row, or arbitrary "no records" prose is never treated as empty.
                 const table = one(form, 'table[id="rsTable"].tableList');
                 const rows = table ? list(table, 'tr') : [];
                 const newResult = state.queryForm && form !== state.queryForm &&
                     (doc !== state.queryDocument || !state.queryForm.isConnected);
                 const noLogin = !docs.some(item => list(item.doc, 'input[type="password"],#LOG_PWD,#LOGIN_BOX_BTN').some(visible));
+                const summary = table ? text(table) : '';
+                const dateRange = new RegExp(`本次查询时间[:：]${state.startDate}[-‐‑‒–—~～至]${state.endDate}`);
+                const count = pattern => (summary.match(pattern) || []).length;
+                // The real empty page retains the result header and proves zero rows with
+                // the submitted date range, both zero-direction summaries, and a zero pager.
                 const empty = doc.readyState === 'complete' && newResult && noLogin && table && canAct(table) &&
-                    rows.length === 2 && rows.every((row, index) => row.closest('table') === table && canAct(row) &&
-                        row.classList.contains('tableListHead') && row.cells.length === (index === 0 ? 16 : 2) &&
-                        [...row.cells].every(cell => cell.tagName === 'TD' && canAct(cell)));
+                    rows.length >= 2 && rows.length <= 3 &&
+                    rows.every(row => row.closest('table') === table && canAct(row) &&
+                        [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell))) &&
+                    rows[0].classList.contains('tableListHead') &&
+                    count(dateRange) === 1 &&
+                    count(/转出交易[:：]0笔金额[:：]0\.00元/g) === 1 &&
+                    count(/转入交易[:：]0笔金额[:：]0\.00元/g) === 1 &&
+                    count(/共0页/g) === 1;
                 if (!empty) return result('failed', stage, 'empty-result-unconfirmed');
-                if (!readNaming()) return result('failed', stage, 'naming-identity');
-                return result('empty', stage);
+                const naming = readNaming();
+                if (!naming) return result('failed', stage, 'naming-identity');
+                if (request.operation !== 'prepare-empty-screenshot') {
+                    state.naming = naming;
+                    state.empty = true;
+                    return { status: 'empty', stage, companyName: naming.companyName, accountLast4: naming.accountLast4 };
+                }
+                if (!state.empty || !namingMatches()) return result('failed', stage, 'naming-identity');
+                const head = one(form, 'table[id="headTable"]');
+                if (!head || !canAct(head)) return result('failed', stage, 'screenshot-region');
+                if (!state.screenshotPrepared) {
+                    state.screenshotPrepared = true;
+                    const views = [doc.defaultView, ...candidate.chain.map(pair => pair.frame.ownerDocument.defaultView)];
+                    for (const view of views) {
+                        try { if (typeof view.scrollTo === 'function') view.scrollTo({ top: 0, left: 0, behavior: 'instant' }); }
+                        catch (_) { /* A frameset or fixed viewport may not be scrollable. */ }
+                    }
+                    return result('waiting', stage);
+                }
+                const rootRect = node => {
+                    const rect = node.getBoundingClientRect();
+                    let left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom;
+                    for (let index = candidate.chain.length - 1; index >= 0; index--) {
+                        const frame = candidate.chain[index].frame;
+                        const frameRect = frame.getBoundingClientRect();
+                        left += frameRect.left + frame.clientLeft;
+                        right += frameRect.left + frame.clientLeft;
+                        top += frameRect.top + frame.clientTop;
+                        bottom += frameRect.top + frame.clientTop;
+                    }
+                    return { left, top, right, bottom };
+                };
+                const headRect = rootRect(head), tableRect = rootRect(table);
+                const viewportWidth = window.innerWidth, viewportHeight = window.innerHeight;
+                const finite = [headRect.left, headRect.top, headRect.right, headRect.bottom,
+                    tableRect.left, tableRect.top, tableRect.right, tableRect.bottom,
+                    viewportWidth, viewportHeight].every(Number.isFinite);
+                const fits = finite &&
+                    headRect.right > headRect.left && headRect.bottom > headRect.top &&
+                    tableRect.right > tableRect.left && tableRect.bottom > tableRect.top &&
+                    headRect.left >= 0 && headRect.top >= 0 && headRect.right <= viewportWidth && headRect.bottom <= viewportHeight &&
+                    tableRect.left >= 0 && tableRect.top >= 0 && tableRect.right <= viewportWidth && tableRect.bottom <= viewportHeight;
+                if (!fits && !state.screenshotAdjusted && finite) {
+                    state.screenshotAdjusted = true;
+                    if (typeof head.scrollIntoView === 'function')
+                        head.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+                    return result('waiting', stage);
+                }
+                if (!fits) return result('failed', stage, 'screenshot-region');
+                return result('screenshot-ready', stage);
             }
+            if (request.operation === 'prepare-empty-screenshot') return result('failed', stage, 'empty-result-unconfirmed');
             if (request.operation === 'identify') {
                 const naming = readNaming();
                 if (!naming) return result('failed', stage, 'naming-identity');
