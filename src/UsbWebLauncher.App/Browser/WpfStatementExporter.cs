@@ -44,7 +44,7 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
             var coordinator = new StatementExportCoordinator(new Page(browser, origin),
                 identity => new WpfStatementDownload(core, origin, new WindowInteropHelper(owner).Handle, identity, directory),
                 captureEmptyScreenshot: (identity, captureToken) =>
-                    CaptureEmptyStatementAsync(core, origin, identity, directory, captureToken));
+                    CaptureEmptyStatementAsync(core, owner, origin, identity, directory, captureToken));
             var artifact = await coordinator.ExportAsync(range, Publish, total.Token);
             var result = artifact.Kind == StatementExportArtifactKind.EmptyScreenshot
                 ? DocumentExportResult.EmptyStatementScreenshot(artifact.FilePath)
@@ -77,6 +77,7 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
 
     private static async Task<string> CaptureEmptyStatementAsync(
         CoreWebView2 core,
+        Window owner,
         string origin,
         StatementExportIdentity identity,
         string directory,
@@ -87,26 +88,51 @@ internal sealed class WpfStatementExporter(WebView2 browser) : IAsyncDisposable
             source.GetLeftPart(UriPartial.Authority) != origin)
             throw new StatementExportException("银行页面已变化，空流水截图未保存，请重新导出。");
 
-        using var file = StatementPngFile.Create(directory, identity);
-        await using (var stream = new FileStream(
-            file.TempPath,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.None,
-            bufferSize: 64 * 1024,
-            useAsync: true))
+        var originalWindowState = owner.WindowState;
+        try
         {
-            // WebView2 captures the visible page viewport only, excluding the WPF launcher chrome.
-            // The API itself is not cancellable, so keep the stream alive until capture completes.
-            await core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream);
             token.ThrowIfCancellationRequested();
-            await stream.FlushAsync(token);
-        }
+            if (originalWindowState != WindowState.Maximized)
+            {
+                owner.WindowState = WindowState.Maximized;
+                await owner.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle)
+                    .Task.WaitAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+            }
 
-        if (!Uri.TryCreate(core.Source, UriKind.Absolute, out source) ||
-            source.GetLeftPart(UriPartial.Authority) != origin)
-            throw new StatementExportException("银行页面已变化，空流水截图未保存，请重新导出。");
-        return await file.CompleteAsync(token);
+            using var file = StatementPngFile.Create(directory, identity);
+            await using (var stream = new FileStream(
+                file.TempPath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 64 * 1024,
+                useAsync: true))
+            {
+                // WebView2 captures the maximized visible page viewport only, excluding
+                // launcher chrome, so account details and the zero-row summary stay together.
+                await core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream);
+                token.ThrowIfCancellationRequested();
+                await stream.FlushAsync(token);
+            }
+
+            if (!Uri.TryCreate(core.Source, UriKind.Absolute, out source) ||
+                source.GetLeftPart(UriPartial.Authority) != origin)
+                throw new StatementExportException("银行页面已变化，空流水截图未保存，请重新导出。");
+            return await file.CompleteAsync(token);
+        }
+        finally
+        {
+            try
+            {
+                if (!owner.Dispatcher.HasShutdownStarted && owner.WindowState != originalWindowState)
+                    owner.WindowState = originalWindowState;
+            }
+            catch (InvalidOperationException)
+            {
+                // The owner can close while CapturePreviewAsync is completing.
+            }
+        }
     }
 
     private void Publish(string message)

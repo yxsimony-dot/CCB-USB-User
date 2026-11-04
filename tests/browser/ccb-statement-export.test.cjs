@@ -66,7 +66,8 @@ function namingPage(t) {
 // Sanitized shape from the real zero-transaction page. The visible result must
 // prove the submitted range, both zero directions, and a zero-page pager.
 const emptyStatementTable = `<table id="rsTable" class="tableList">
-    <tr class="tableListHead"><td>选择</td><td>交易时间</td><td>借方（支取）</td><td>贷方（收入）</td><td>余额</td></tr>
+    <tr class="tableListHead"><td rowspan="2">选择</td><td rowspan="2">交易时间</td><td colspan="2">发生额/元</td><td rowspan="2">余额</td></tr>
+    <tr class="tableListHead"><td>借方（支取）</td><td>贷方（收入）</td></tr>
     <tr><td colspan="5">全选　本次查询时间：20260201–20260228　下载当前页　下载全部</td></tr>
     <tr><td colspan="5">转出交易：0笔　金额：0.00元；　转入交易：0笔　金额：0.00元；　首页　上一页　0　下一页　共0页</td></tr>
 </table>`;
@@ -85,6 +86,25 @@ test('identifies a fresh complete strictly empty statement result without clicki
         status: 'empty', stage: 'results', companyName: p.company, accountLast4: '0007'
     });
     assert.equal(p.run('download').status, 'empty'); assert.equal(p.clicks(), 0);
+});
+
+test('recognizes the production two-row header when zero summaries are outside the result table', t => {
+    const p = emptyStatementPage(t);
+    const rows = p.child.querySelectorAll('#rsTable tr');
+    const date = rows[2], totals = rows[3];
+    p.child.querySelector('#rsTable').after(date, totals);
+    assert.deepEqual(p.run('identify'), {
+        status: 'empty', stage: 'results', companyName: p.company, accountLast4: '0007'
+    });
+    assert.equal(p.clicks(), 0);
+});
+
+test('recognizes an explicit zero total-count variant without directional summaries', t => {
+    const p = emptyStatementPage(t);
+    p.child.querySelector('#rsTable tr:last-child').innerHTML =
+        '<td colspan="5">交易笔数为0　首页　上一页　0　下一页　共0页</td>';
+    assert.equal(p.run('identify').status, 'empty');
+    assert.equal(p.clicks(), 0);
 });
 
 test('waits while a zero-row result candidate is parsing and recognizes empty only when complete', t => {
@@ -138,11 +158,10 @@ function screenshotGeometry(p, options = {}) {
     frame.getBoundingClientRect = () => ({ left: 356, top: 0, right: 1516, bottom: 677, width: 1160, height: 677 });
     head.getBoundingClientRect = () => options.head || ({ left: 0, top: 50, right: 1160, bottom: 234, width: 1160, height: 184 });
     table.getBoundingClientRect = () => options.table || ({ left: 0, top: 292, right: 1160, bottom: 435, width: 1160, height: 143 });
-    let scrolls = 0, adjustments = 0;
-    p.w.scrollTo = () => scrolls++;
-    p.child.defaultView.scrollTo = () => scrolls++;
+    let adjustments = 0;
+    frame.scrollIntoView = () => adjustments++;
     head.scrollIntoView = () => adjustments++;
-    return { scrolls: () => scrolls, adjustments: () => adjustments };
+    return { adjustments: () => adjustments };
 }
 
 test('prepares the complete visible bank viewport before allowing an empty screenshot', t => {
@@ -150,23 +169,19 @@ test('prepares the complete visible bank viewport before allowing an empty scree
     const geometry = screenshotGeometry(p);
     assert.equal(p.run('identify').status, 'empty');
     assert.deepEqual(p.run('prepare-empty-screenshot'), { status: 'waiting', stage: 'results' });
-    assert.ok(geometry.scrolls() >= 2);
+    assert.ok(geometry.adjustments() >= 2);
     assert.deepEqual(p.run('prepare-empty-screenshot'), { status: 'screenshot-ready', stage: 'results' });
-    assert.equal(geometry.adjustments(), 0);
 });
 
-test('refuses an empty screenshot when account and zero-result content cannot fit in the viewport', t => {
+test('prepares an empty screenshot even when the current window is too small before host maximization', t => {
     const p = emptyStatementPage(t);
     const geometry = screenshotGeometry(p, {
         table: { left: 0, top: 700, right: 1160, bottom: 843, width: 1160, height: 143 }
     });
     assert.equal(p.run('identify').status, 'empty');
     assert.equal(p.run('prepare-empty-screenshot').status, 'waiting');
-    assert.equal(p.run('prepare-empty-screenshot').status, 'waiting');
-    assert.equal(geometry.adjustments(), 1);
-    assert.deepEqual(p.run('prepare-empty-screenshot'), {
-        status: 'failed', stage: 'results', code: 'screenshot-region'
-    });
+    assert.ok(geometry.adjustments() >= 2);
+    assert.deepEqual(p.run('prepare-empty-screenshot'), { status: 'screenshot-ready', stage: 'results' });
 });
 
 test('empty statement requires completed new result and matching month account and naming', t => {

@@ -287,23 +287,28 @@
             if (!list(doc, '[name="SEQ_NO"]').length) {
                 const table = one(form, 'table[id="rsTable"].tableList');
                 const rows = table ? list(table, 'tr') : [];
+                const headerRows = rows.filter(row => row.classList.contains('tableListHead'));
                 const newResult = state.queryForm && form !== state.queryForm &&
                     (doc !== state.queryDocument || !state.queryForm.isConnected);
                 const noLogin = !docs.some(item => list(item.doc, 'input[type="password"],#LOG_PWD,#LOGIN_BOX_BTN').some(visible));
-                const summary = table ? text(table) : '';
+                const summary = text(form);
                 const dateRange = new RegExp(`本次查询时间[:：]${state.startDate}[-‐‑‒–—~～至]${state.endDate}`);
                 const count = pattern => (summary.match(pattern) || []).length;
-                // The real empty page retains the result header and proves zero rows with
-                // the submitted date range, both zero-direction summaries, and a zero pager.
-                const empty = doc.readyState === 'complete' && newResult && noLogin && table && canAct(table) &&
-                    rows.length >= 2 && rows.length <= 3 &&
-                    rows.every(row => row.closest('table') === table && canAct(row) &&
-                        [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell))) &&
-                    rows[0].classList.contains('tableListHead') &&
-                    count(dateRange) === 1 &&
+                const zeroDirections =
                     count(/转出交易[:：]0笔金额[:：]0\.00元/g) === 1 &&
-                    count(/转入交易[:：]0笔金额[:：]0\.00元/g) === 1 &&
-                    count(/共0页/g) === 1;
+                    count(/转入交易[:：]0笔金额[:：]0\.00元/g) === 1;
+                const zeroTotal = count(/(?:交易总笔数|交易笔数|总笔数)(?:[:：为])?0(?:笔)?/g) === 1;
+                const errorText = /(?:页面|系统|查询|网络|会话|登录)(?:错误|异常|失败|超时|失效)|请重新登录|未登录/;
+                // The bank uses two header rows in production. Zero summaries can be
+                // rendered either inside rsTable or in sibling controls in the same form.
+                const empty = doc.readyState === 'complete' && newResult && noLogin && table && canAct(table) &&
+                    rows.length >= 2 && headerRows.length >= 1 && headerRows.length <= 3 &&
+                    headerRows.every(row => row.closest('table') === table && canAct(row) &&
+                        row.cells.length > 0 && [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell))) &&
+                    count(dateRange) === 1 &&
+                    (zeroDirections || zeroTotal) &&
+                    count(/共0页/g) === 1 &&
+                    !errorText.test(summary);
                 if (!empty) return result('failed', stage, 'empty-result-unconfirmed');
                 const naming = readNaming();
                 if (!naming) return result('failed', stage, 'naming-identity');
@@ -315,13 +320,28 @@
                 if (!state.empty || !namingMatches()) return result('failed', stage, 'naming-identity');
                 const head = one(form, 'table[id="headTable"]');
                 if (!head || !canAct(head)) return result('failed', stage, 'screenshot-region');
+                const evidencePatterns = [
+                    dateRange,
+                    zeroDirections ? /转出交易[:：]0笔金额[:：]0\.00元/ : /(?:交易总笔数|交易笔数|总笔数)(?:[:：为])?0(?:笔)?/,
+                    zeroDirections ? /转入交易[:：]0笔金额[:：]0\.00元/ : /共0页/,
+                    /共0页/
+                ];
+                const smallestOwner = pattern => {
+                    const matches = [form, ...list(form, 'table,tbody,tr,td,th,div,span,p')]
+                        .filter(node => canAct(node) && pattern.test(text(node)));
+                    return matches.find(node => !matches.some(other => other !== node && node.contains(other))) || null;
+                };
+                const evidence = evidencePatterns.map(smallestOwner);
+                if (evidence.some(node => !node)) return result('failed', stage, 'screenshot-region');
+                const captureNodes = [head, table, ...evidence.filter(node => !table.contains(node))];
                 if (!state.screenshotPrepared) {
                     state.screenshotPrepared = true;
-                    const views = [doc.defaultView, ...candidate.chain.map(pair => pair.frame.ownerDocument.defaultView)];
-                    for (const view of views) {
-                        try { if (typeof view.scrollTo === 'function') view.scrollTo({ top: 0, left: 0, behavior: 'instant' }); }
-                        catch (_) { /* A frameset or fixed viewport may not be scrollable. */ }
+                    try {
+                        head.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+                        for (let index = candidate.chain.length - 1; index >= 0; index--)
+                            candidate.chain[index].frame.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
                     }
+                    catch (_) { /* The host will still maximize before taking the preview. */ }
                     return result('waiting', stage);
                 }
                 const rootRect = node => {
@@ -337,23 +357,11 @@
                     }
                     return { left, top, right, bottom };
                 };
-                const headRect = rootRect(head), tableRect = rootRect(table);
-                const viewportWidth = window.innerWidth, viewportHeight = window.innerHeight;
-                const finite = [headRect.left, headRect.top, headRect.right, headRect.bottom,
-                    tableRect.left, tableRect.top, tableRect.right, tableRect.bottom,
-                    viewportWidth, viewportHeight].every(Number.isFinite);
-                const fits = finite &&
-                    headRect.right > headRect.left && headRect.bottom > headRect.top &&
-                    tableRect.right > tableRect.left && tableRect.bottom > tableRect.top &&
-                    headRect.left >= 0 && headRect.top >= 0 && headRect.right <= viewportWidth && headRect.bottom <= viewportHeight &&
-                    tableRect.left >= 0 && tableRect.top >= 0 && tableRect.right <= viewportWidth && tableRect.bottom <= viewportHeight;
-                if (!fits && !state.screenshotAdjusted && finite) {
-                    state.screenshotAdjusted = true;
-                    if (typeof head.scrollIntoView === 'function')
-                        head.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
-                    return result('waiting', stage);
-                }
-                if (!fits) return result('failed', stage, 'screenshot-region');
+                const rectangles = captureNodes.map(rootRect);
+                const valid = rectangles.every(rect =>
+                    [rect.left, rect.top, rect.right, rect.bottom].every(Number.isFinite) &&
+                    rect.right > rect.left && rect.bottom > rect.top);
+                if (!valid) return result('failed', stage, 'screenshot-region');
                 return result('screenshot-ready', stage);
             }
             if (request.operation === 'prepare-empty-screenshot') return result('failed', stage, 'empty-result-unconfirmed');
