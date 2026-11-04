@@ -11,9 +11,9 @@
   },
   "maximum": {
     "fileCount": 284,
-    "unpackedBytes": 274562295
+    "unpackedBytes": 274562807
   },
-  "rationale": "The accepted 2026-11-04 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. Production two-row header detection and maximized empty-statement capture added 470 bytes to the measured two-digit release payload. The committed Windows CRLF checkout contract adds 1,066 bytes compared with the mixed-line-ending development tree and makes byte-for-byte payload measurements stable across clean local and GitHub Actions checkouts. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. Any further growth requires an explicit reviewed update.",
+  "rationale": "The accepted 2026-11-04 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. Production two-row header detection and maximized empty-statement capture added 470 bytes to the measured two-digit release payload. Visible-only zero-result evidence detection, including hidden-template filtering and CSS-independent labeled headers, added 512 bytes without changing the payload file set. The committed Windows CRLF checkout contract adds 1,066 bytes compared with the mixed-line-ending development tree and makes byte-for-byte payload measurements stable across clean local and GitHub Actions checkouts. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. Any further growth requires an explicit reviewed update.",
   "reduction": {
     "unfilteredAppFileCount": 481,
     "acceptedAppFileCount": 277,
