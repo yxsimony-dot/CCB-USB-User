@@ -46,6 +46,17 @@
         const available = node => node && node.isConnected && !node.disabled && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true';
         const enabled = node => available(node) && visible(node);
         const text = node => (node.textContent || '').replace(/\s+/g, '');
+        const visibleText = node => {
+            if (!node || !node.ownerDocument) return '';
+            const chunks = [];
+            const walker = node.ownerDocument.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+                const parent = current.parentElement;
+                if (parent && !['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(parent.tagName) && visible(parent))
+                    chunks.push(current.nodeValue || '');
+            }
+            return chunks.join('').replace(/\s+/g, '');
+        };
         const downloadLabel = node => {
             const copy = node.cloneNode(true);
             for (const menu of copy.querySelectorAll('ul,ol,[role="menu"]')) menu.remove();
@@ -287,11 +298,14 @@
             if (!list(doc, '[name="SEQ_NO"]').length) {
                 const table = one(form, 'table[id="rsTable"].tableList');
                 const rows = table ? list(table, 'tr') : [];
-                const headerRows = rows.filter(row => row.classList.contains('tableListHead'));
+                const structuralRows = rows.filter(row => canAct(row) && row.closest('table') === table &&
+                    row.cells.length > 0 && [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell)));
+                const hasResultHeader = structuralRows.some(row =>
+                    /交易时间/.test(visibleText(row)) && /余额/.test(visibleText(row)));
                 const newResult = state.queryForm && form !== state.queryForm &&
                     (doc !== state.queryDocument || !state.queryForm.isConnected);
                 const noLogin = !docs.some(item => list(item.doc, 'input[type="password"],#LOG_PWD,#LOGIN_BOX_BTN').some(visible));
-                const summary = text(form);
+                const summary = visibleText(form);
                 const dateRange = new RegExp(`本次查询时间[:：]${state.startDate}[-‐‑‒–—~～至]${state.endDate}`);
                 const count = pattern => (summary.match(pattern) || []).length;
                 const zeroDirections =
@@ -299,12 +313,11 @@
                     count(/转入交易[:：]0笔金额[:：]0\.00元/g) === 1;
                 const zeroTotal = count(/(?:交易总笔数|交易笔数|总笔数)(?:[:：为])?0(?:笔)?/g) === 1;
                 const errorText = /(?:页面|系统|查询|网络|会话|登录)(?:错误|异常|失败|超时|失效)|请重新登录|未登录/;
-                // The bank uses two header rows in production. Zero summaries can be
-                // rendered either inside rsTable or in sibling controls in the same form.
+                // The production page can move its second header row and zero summaries
+                // outside rsTable, and can retain hidden templates. Trust only visible
+                // zero-result evidence bound to the submitted account and date range.
                 const empty = doc.readyState === 'complete' && newResult && noLogin && table && canAct(table) &&
-                    rows.length >= 2 && headerRows.length >= 1 && headerRows.length <= 3 &&
-                    headerRows.every(row => row.closest('table') === table && canAct(row) &&
-                        row.cells.length > 0 && [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell))) &&
+                    structuralRows.length >= 1 && hasResultHeader &&
                     count(dateRange) === 1 &&
                     (zeroDirections || zeroTotal) &&
                     count(/共0页/g) === 1 &&
@@ -328,7 +341,7 @@
                 ];
                 const smallestOwner = pattern => {
                     const matches = [form, ...list(form, 'table,tbody,tr,td,th,div,span,p')]
-                        .filter(node => canAct(node) && pattern.test(text(node)));
+                        .filter(node => canAct(node) && pattern.test(visibleText(node)));
                     return matches.find(node => !matches.some(other => other !== node && node.contains(other))) || null;
                 };
                 const evidence = evidencePatterns.map(smallestOwner);

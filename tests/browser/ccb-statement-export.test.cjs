@@ -92,10 +92,27 @@ test('recognizes the production two-row header when zero summaries are outside t
     const p = emptyStatementPage(t);
     const rows = p.child.querySelectorAll('#rsTable tr');
     const date = rows[2], totals = rows[3];
+    rows[1].classList.remove('tableListHead');
     p.child.querySelector('#rsTable').after(date, totals);
     assert.deepEqual(p.run('identify'), {
         status: 'empty', stage: 'results', companyName: p.company, accountLast4: '0007'
     });
+    assert.equal(p.clicks(), 0);
+});
+
+test('recognizes a labeled production header without relying on bank CSS classes', t => {
+    const p = emptyStatementPage(t);
+    p.child.querySelectorAll('#rsTable .tableListHead').forEach(row => row.classList.remove('tableListHead'));
+    assert.equal(p.run('identify').status, 'empty');
+    assert.equal(p.clicks(), 0);
+});
+
+test('ignores hidden stale templates while proving visible zero-result evidence', t => {
+    const p = emptyStatementPage(t);
+    p.child.querySelector('form[name="jhform"]').insertAdjacentHTML('beforeend',
+        '<div style="display:none">本次查询时间：20260201-20260228　转出交易：0笔　金额：0.00元；' +
+        '转入交易：0笔　金额：0.00元；　共0页　页面错误</div>');
+    assert.equal(p.run('identify').status, 'empty');
     assert.equal(p.clicks(), 0);
 });
 
