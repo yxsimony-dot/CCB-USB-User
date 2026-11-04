@@ -298,10 +298,20 @@
             if (!list(doc, '[name="SEQ_NO"]').length) {
                 const table = one(form, 'table[id="rsTable"].tableList');
                 const rows = table ? list(table, 'tr') : [];
-                const structuralRows = rows.filter(row => canAct(row) && row.closest('table') === table &&
-                    row.cells.length > 0 && [...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName) && canAct(cell)));
-                const hasResultHeader = structuralRows.some(row =>
-                    /交易时间/.test(visibleText(row)) && /余额/.test(visibleText(row)));
+                const structuralRows = rows.filter(row => {
+                    if (!canAct(row) || row.closest('table') !== table || row.cells.length === 0 ||
+                        ![...row.cells].every(cell => ['TD', 'TH'].includes(cell.tagName))) return false;
+                    // The bank hides selected columns at narrower launcher widths. A real
+                    // result row remains structural when at least two of its cells are visible.
+                    return [...row.cells].filter(canAct).length >= 2;
+                });
+                const hasResultHeader = structuralRows.some(row => {
+                    const header = visibleText(row);
+                    const supportingColumns = ['对方户名', '对方账号', '开户机构', '记账日期', '摘要', '备注']
+                        .filter(label => header.includes(label)).length;
+                    return /交易时间/.test(header) && /发生额/.test(header) &&
+                        (/余额/.test(header) || supportingColumns >= 2);
+                });
                 const newResult = state.queryForm && form !== state.queryForm &&
                     (doc !== state.queryDocument || !state.queryForm.isConnected);
                 const noLogin = !docs.some(item => list(item.doc, 'input[type="password"],#LOG_PWD,#LOGIN_BOX_BTN').some(visible));

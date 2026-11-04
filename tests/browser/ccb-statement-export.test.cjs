@@ -66,10 +66,10 @@ function namingPage(t) {
 // Sanitized shape from the real zero-transaction page. The visible result must
 // prove the submitted range, both zero directions, and a zero-page pager.
 const emptyStatementTable = `<table id="rsTable" class="tableList">
-    <tr class="tableListHead"><td rowspan="2">选择</td><td rowspan="2">交易时间</td><td colspan="2">发生额/元</td><td rowspan="2">余额</td></tr>
+    <tr class="tableListHead"><td rowspan="2">选择</td><td rowspan="2">交易时间</td><td colspan="2">发生额/元</td><td class="balance" rowspan="2">余额</td><td rowspan="2">对方户名</td><td rowspan="2">对方账号</td><td rowspan="2">对方开户机构</td><td rowspan="2">记账日期</td><td rowspan="2">摘要</td><td rowspan="2">备注</td></tr>
     <tr class="tableListHead"><td>借方（支取）</td><td>贷方（收入）</td></tr>
-    <tr><td colspan="5">全选　本次查询时间：20260201–20260228　下载当前页　下载全部</td></tr>
-    <tr><td colspan="5">转出交易：0笔　金额：0.00元；　转入交易：0笔　金额：0.00元；　首页　上一页　0　下一页　共0页</td></tr>
+    <tr><td colspan="11">全选　本次查询时间：20260201–20260228　下载当前页　下载全部</td></tr>
+    <tr><td colspan="11">转出交易：0笔　金额：0.00元；　转入交易：0笔　金额：0.00元；　首页　上一页　0　下一页　共0页</td></tr>
 </table>`;
 function emptyStatementPage(t) {
     const p = namingPage(t);
@@ -103,6 +103,13 @@ test('recognizes the production two-row header when zero summaries are outside t
 test('recognizes a labeled production header without relying on bank CSS classes', t => {
     const p = emptyStatementPage(t);
     p.child.querySelectorAll('#rsTable .tableListHead').forEach(row => row.classList.remove('tableListHead'));
+    assert.equal(p.run('identify').status, 'empty');
+    assert.equal(p.clicks(), 0);
+});
+
+test('recognizes the responsive production header when the balance column is hidden', t => {
+    const p = emptyStatementPage(t);
+    p.child.querySelector('#rsTable .balance').style.display = 'none';
     assert.equal(p.run('identify').status, 'empty');
     assert.equal(p.clicks(), 0);
 });
