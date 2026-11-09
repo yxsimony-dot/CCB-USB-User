@@ -1,6 +1,19 @@
 using UsbWebLauncher.Core.Configuration;
+using UsbWebLauncher.Core.Devices;
 
 namespace UsbWebLauncher.Core.Authentication;
+
+public sealed record PsbcAuthenticationObservation(
+    AuthenticationStage Stage,
+    string BankId,
+    UsbKeyVendorFamily? VendorFamily,
+    AuthenticationErrorCategory ErrorCategory,
+    TimeSpan Elapsed);
+
+public interface IPsbcAuthenticationObserver
+{
+    void Record(PsbcAuthenticationObservation observation);
+}
 
 public interface IClientCertificateBusinessControl
 {
@@ -179,7 +192,8 @@ public enum ClientCertificateNativePromptStatus
     Replayed,
     TimedOut,
     Cancelled,
-    UnknownFailure
+    UnknownFailure,
+    PinRejected
 }
 
 public sealed record ClientCertificateNativePromptResult(

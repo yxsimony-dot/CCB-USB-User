@@ -8,21 +8,47 @@ public sealed class ClientCertificatePinSetupServiceTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task BrowserNative_SaveStoresSharedPinWithoutKeyValidationOrStamp(bool legacyEntryPoint)
+    public async Task BrowserNative_SaveStoresSharedPinWithPendingValidationStamp(bool legacyEntryPoint)
     {
         var calls = new List<string>();
+        var authentication = Authentication() with { AuthenticationMode = "BrowserNative" };
+        var stampStore = new RecordingStampStore(calls);
         var service = new ClientCertificatePinSetupService(
-            Authentication() with { AuthenticationMode = "BrowserNative" },
-            new RecordingPinStore(calls), new RecordingStampStore(calls),
+            authentication,
+            new RecordingPinStore(calls), stampStore,
             new RecordingUnlocker(calls, ClientCertificateTokenUnlockResult.Failed(ClientCertificateTokenUnlockStatus.ProviderUnavailable)),
             new RecordingVerifier(calls, new(ClientCertificateSetupValidationStatus.UnknownFailure)),
             new RecordingLifecycleObserver(calls));
         var pin = RandomPin();
         var saved = legacyEntryPoint ? (await service.ValidateAndSaveAsync(pin)).IsSuccess : await service.SaveFixedAsync(pin);
         Assert.True(saved);
-        Assert.Equal(new[] { "save-pin", "provisioned" }, calls);
+        Assert.Equal(new[] { "delete-stamp", "save-pin", "save-stamp", "provisioned" }, calls);
+        Assert.True(stampStore.StoredStamp?.IsPendingFor(
+            authentication.Id,
+            authentication.GetNormalizedHash()));
         Assert.DoesNotContain("验证成功", service.CurrentState.Message);
         Assert.All(pin.AsMemory().ToArray(), c => Assert.Equal('\0', c));
+    }
+
+    [Fact]
+    public async Task BrowserNative_DeleteRemovesValidationStampBeforeCredential()
+    {
+        var calls = new List<string>();
+        var service = new ClientCertificatePinSetupService(
+            Authentication() with { AuthenticationMode = "BrowserNative" },
+            new RecordingPinStore(calls),
+            new RecordingStampStore(calls),
+            new RecordingUnlocker(
+                calls,
+                ClientCertificateTokenUnlockResult.Failed(
+                    ClientCertificateTokenUnlockStatus.ProviderUnavailable)),
+            new RecordingVerifier(
+                calls,
+                new(ClientCertificateSetupValidationStatus.UnknownFailure)));
+
+        await service.DeleteAsync();
+
+        Assert.Equal(new[] { "delete-stamp", "delete-pin" }, calls);
     }
 
     [Fact]
@@ -346,9 +372,25 @@ public sealed class ClientCertificatePinSetupServiceTests
     private sealed class RecordingStampStore(List<string> calls) : IClientCertificateValidationStampStore
     {
         public bool ThrowOnSave { get; init; }
+        public ClientCertificateValidationStamp? StoredStamp { get; private set; }
         public ValueTask<ClientCertificateValidationStamp?> ReadAsync(string authenticationId, CancellationToken cancellationToken = default) => ValueTask.FromResult<ClientCertificateValidationStamp?>(null);
-        public ValueTask SaveAsync(ClientCertificateValidationStamp stamp, CancellationToken cancellationToken = default) { calls.Add("save-stamp"); return ThrowOnSave ? ValueTask.FromException(new InvalidOperationException("test failure")) : ValueTask.CompletedTask; }
-        public ValueTask DeleteAsync(string authenticationId, CancellationToken cancellationToken = default) { calls.Add("delete-stamp"); return ValueTask.CompletedTask; }
+        public ValueTask SaveAsync(ClientCertificateValidationStamp stamp, CancellationToken cancellationToken = default)
+        {
+            calls.Add("save-stamp");
+            if (ThrowOnSave)
+            {
+                return ValueTask.FromException(new InvalidOperationException("test failure"));
+            }
+
+            StoredStamp = stamp;
+            return ValueTask.CompletedTask;
+        }
+        public ValueTask DeleteAsync(string authenticationId, CancellationToken cancellationToken = default)
+        {
+            calls.Add("delete-stamp");
+            StoredStamp = null;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class RecordingUnlocker(List<string> calls, ClientCertificateTokenUnlockResult result) : IClientCertificateTokenUnlocker

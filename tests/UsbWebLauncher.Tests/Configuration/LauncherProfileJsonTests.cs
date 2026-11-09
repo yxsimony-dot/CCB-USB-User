@@ -471,6 +471,27 @@ public sealed class LauncherProfileJsonTests
         Assert.Contains("diagnostics[1].secretValue", exception.Message);
     }
 
+    [Theory]
+    [InlineData("installCcbUKeyExtension")]
+    [InlineData("enableCcbPageCoordination")]
+    [InlineData("ccbPageScript")]
+    public void Parse_RejectsCcbBrowserConfigurationInPsbcProfile(
+        string propertyName)
+    {
+        var json = $$"""
+            {
+              "targetUrl": "https://corpebank.psbc.com/#/login",
+              "usbDetectionStrategy": "psbcUsbKey",
+              "{{propertyName}}": true
+            }
+            """;
+
+        var exception = Assert.Throws<LauncherProfileException>(
+            () => LauncherProfileJson.Parse(json));
+
+        Assert.Contains(propertyName, exception.Message);
+    }
+
     [Fact]
     public void Parse_ComputesStableClientCertificateAuthenticationHashAcrossFieldOrderAndCasingDifferences()
     {
@@ -606,41 +627,53 @@ public sealed class LauncherProfileJsonTests
     }
 
     [Fact]
-    public void ShippedNativePromptPolicy_ExactlyMatchesShippedAuthenticationProfile()
+    public void ShippedNativePromptPolicy_ExactlyMatchesAllShippedAuthenticationProfiles()
     {
-        var profilePath = FindRepoRootPath("src", "UsbWebLauncher.App", "launcher-profile.json");
         var policyPath = FindRepoRootPath(
             "src",
             "UsbWebLauncher.NativePromptBroker",
             WindowsNativePromptBrokerInstaller.PolicyFileName);
-        var authentication = Assert.IsType<UsbWebLauncher.Core.Configuration.ClientCertificateAuthenticationOptions>(
-            LauncherProfileJson.Parse(File.ReadAllText(profilePath)).ClientCertificateAuthentication);
-        var expectedPrompt = Assert.IsType<UsbWebLauncher.Core.Configuration.ClientCertificateNativePromptOptions>(
-            authentication.NativePromptContinuation);
-
         var policy = NativePromptBrokerPolicyFile.Load(policyPath);
 
-        Assert.Equal(authentication.GetNormalizedHash(), policy.PolicyHash);
-        Assert.Equal(expectedPrompt.Enabled, policy.Prompt.Enabled);
-        Assert.Equal(expectedPrompt.BrokerPipeName, policy.Prompt.BrokerPipeName);
-        Assert.Equal(expectedPrompt.PolicyId, policy.Prompt.PolicyId);
-        Assert.Equal(expectedPrompt.ProcessPath, policy.Prompt.ProcessPath);
-        Assert.Equal(expectedPrompt.ProcessSha256, policy.Prompt.ProcessSha256);
-        Assert.Equal(
-            expectedPrompt.PublisherCertificateThumbprint,
-            policy.Prompt.PublisherCertificateThumbprint);
-        Assert.Equal(expectedPrompt.WindowTitle, policy.Prompt.WindowTitle);
-        Assert.Equal(expectedPrompt.WindowClass, policy.Prompt.WindowClass);
-        Assert.Equal(expectedPrompt.RequiredChildWindowClasses, policy.Prompt.RequiredChildWindowClasses);
-        Assert.Equal(expectedPrompt.TimeoutMilliseconds, policy.Prompt.TimeoutMilliseconds);
-        Assert.Equal(expectedPrompt.WindowScope, policy.Prompt.WindowScope);
-        Assert.Equal(expectedPrompt.ProcessFileName, policy.Prompt.ProcessFileName);
-        Assert.Equal(expectedPrompt.TrustedRootWindowTitle, policy.Prompt.TrustedRootWindowTitle);
-        Assert.Equal(expectedPrompt.TrustedRootWindowClassPrefix, policy.Prompt.TrustedRootWindowClassPrefix);
-        Assert.Equal(expectedPrompt.InputWindowClass, policy.Prompt.InputWindowClass);
-        Assert.Equal(expectedPrompt.InputControlId, policy.Prompt.InputControlId);
-        Assert.Equal(expectedPrompt.SubmitWindowClass, policy.Prompt.SubmitWindowClass);
-        Assert.Equal(expectedPrompt.SubmitControlId, policy.Prompt.SubmitControlId);
+        var profileFiles = new[]
+        {
+            "launcher-profile.json",
+            "psbc-launcher-profile.json"
+        };
+        Assert.Equal(profileFiles.Length, policy.Policies.Count);
+        foreach (var profileFile in profileFiles)
+        {
+            var profilePath = FindRepoRootPath("src", "UsbWebLauncher.App", profileFile);
+            var authentication =
+                Assert.IsType<UsbWebLauncher.Core.Configuration.ClientCertificateAuthenticationOptions>(
+                    LauncherProfileJson.Parse(File.ReadAllText(profilePath)).ClientCertificateAuthentication);
+            var expectedPrompt =
+                Assert.IsType<UsbWebLauncher.Core.Configuration.ClientCertificateNativePromptOptions>(
+                    authentication.NativePromptContinuation);
+            Assert.True(policy.TryGetPolicy(expectedPrompt.PolicyId, out var entry));
+
+            Assert.Equal(authentication.GetNormalizedHash(), entry.PolicyHash);
+            Assert.Equal(expectedPrompt.Enabled, entry.Prompt.Enabled);
+            Assert.Equal(expectedPrompt.BrokerPipeName, entry.Prompt.BrokerPipeName);
+            Assert.Equal(expectedPrompt.PolicyId, entry.Prompt.PolicyId);
+            Assert.Equal(expectedPrompt.ProcessPath, entry.Prompt.ProcessPath);
+            Assert.Equal(expectedPrompt.ProcessSha256, entry.Prompt.ProcessSha256);
+            Assert.Equal(
+                expectedPrompt.PublisherCertificateThumbprint,
+                entry.Prompt.PublisherCertificateThumbprint);
+            Assert.Equal(expectedPrompt.WindowTitle, entry.Prompt.WindowTitle);
+            Assert.Equal(expectedPrompt.WindowClass, entry.Prompt.WindowClass);
+            Assert.Equal(expectedPrompt.RequiredChildWindowClasses, entry.Prompt.RequiredChildWindowClasses);
+            Assert.Equal(expectedPrompt.TimeoutMilliseconds, entry.Prompt.TimeoutMilliseconds);
+            Assert.Equal(expectedPrompt.WindowScope, entry.Prompt.WindowScope);
+            Assert.Equal(expectedPrompt.ProcessFileName, entry.Prompt.ProcessFileName);
+            Assert.Equal(expectedPrompt.TrustedRootWindowTitle, entry.Prompt.TrustedRootWindowTitle);
+            Assert.Equal(expectedPrompt.TrustedRootWindowClassPrefix, entry.Prompt.TrustedRootWindowClassPrefix);
+            Assert.Equal(expectedPrompt.InputWindowClass, entry.Prompt.InputWindowClass);
+            Assert.Equal(expectedPrompt.InputControlId, entry.Prompt.InputControlId);
+            Assert.Equal(expectedPrompt.SubmitWindowClass, entry.Prompt.SubmitWindowClass);
+            Assert.Equal(expectedPrompt.SubmitControlId, entry.Prompt.SubmitControlId);
+        }
     }
 
     [Fact]

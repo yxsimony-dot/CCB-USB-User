@@ -224,6 +224,37 @@ public sealed class WindowsUsbDeviceMonitorTests
     }
 
     [Fact]
+    public async Task ActiveBankRetryPolicyControlsWhenMetadataIsReady()
+    {
+        var pending = new UsbDeviceDescriptor(
+            "USB\\VID_1780&PID_0401\\PSBC",
+            ["USB\\VID_1780&PID_0401"],
+            "Tendyron Token",
+            [],
+            [],
+            [],
+            Service: "USBSTOR");
+        var ready = pending with
+        {
+            CdRomNames = ["TENDYRON U-DISK"],
+            VolumeLabels = ["PSBC"]
+        };
+        var enumerator = new SequenceEnumerator([pending], [ready]);
+        await using var monitor = new WindowsUsbDeviceMonitor(
+            enumerator,
+            new RecordingChangeSource(),
+            TimeSpan.Zero,
+            new PsbcFixtureMetadataRetryPolicy(),
+            metadataRetryDelay: TimeSpan.Zero,
+            maxMetadataRetries: 2);
+
+        var result = await monitor.GetConnectedDevicesAsync();
+
+        Assert.Equal("PSBC", Assert.Single(result).VolumeLabels.Single());
+        Assert.Equal(2, enumerator.CallCount);
+    }
+
+    [Fact]
     public async Task CcbEventScan_PublishesResolvedMetadataOnce()
     {
         var enumerator = new SequenceEnumerator([PendingDevice()], [CcbDevice()]);
@@ -442,6 +473,19 @@ public sealed class WindowsUsbDeviceMonitorTests
         instanceId, [], null, [], [], [], Service: "USBSTOR");
 
     private static UsbDeviceDescriptor CcbDevice() => PendingDevice() with { CdRomNames = ["CCB USB CD"] };
+
+    private sealed class PsbcFixtureMetadataRetryPolicy : IUsbMetadataRetryPolicy
+    {
+        public bool IsEnabled => true;
+
+        public bool IsMetadataReady(UsbDeviceDescriptor device) =>
+            device.CdRomNames.Contains("TENDYRON U-DISK", StringComparer.OrdinalIgnoreCase) &&
+            device.VolumeLabels.Contains("PSBC", StringComparer.OrdinalIgnoreCase);
+
+        public bool IsRetryCandidate(UsbDeviceDescriptor device) =>
+            device.HardwareIds.Any(id =>
+                id.Contains("VID_1780&PID_0401", StringComparison.OrdinalIgnoreCase));
+    }
 
     private sealed class SequenceEnumerator(params IReadOnlyList<UsbDeviceDescriptor>[] snapshots) : IWindowsUsbDeviceEnumerator
     {

@@ -422,6 +422,33 @@ public sealed class NativePromptProtocolTests
     }
 
     [Fact]
+    public async Task CompletionResponse_RoundTripsPinRejectedAsWireStatusTwelve()
+    {
+        var attempt = new NativePromptAttemptId(7, 11, null);
+        var stream = new MemoryStream();
+
+        await NativePromptProtocol.WriteCompletionAsync(
+            stream,
+            new(attempt, ClientCertificateNativePromptStatus.PinRejected, 87),
+            CancellationToken.None);
+
+        var frame = stream.ToArray();
+        var statusOffset =
+            NativePromptProtocol.HeaderBytes +
+            sizeof(long) +
+            sizeof(long) +
+            sizeof(byte);
+        Assert.Equal(12, BinaryPrimitives.ReadInt32LittleEndian(frame.AsSpan(statusOffset)));
+
+        stream.Position = 0;
+        var completion = await NativePromptProtocol.ReadCompletionAsync(stream, CancellationToken.None);
+
+        Assert.Equal(attempt, completion.AttemptId);
+        Assert.Equal(ClientCertificateNativePromptStatus.PinRejected, completion.Status);
+        Assert.Equal(87, completion.PublicErrorCode);
+    }
+
+    [Fact]
     public async Task ReadArmRequest_RejectsDeclaredPinOverCharacterLimit()
     {
         var pin = CreateRandomSecret(NativePromptProtocol.MaxPinCharacters + 1);

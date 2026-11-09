@@ -125,6 +125,41 @@ public sealed class ClientCertificateRequestMatcherTests
     }
 
     [Fact]
+    public void Match_PsbcAllowsOnlyExactObservedHttpsEndpoint()
+    {
+        var result = Match(
+            new Uri("https://corpebank.psbc.com/#/login"),
+            isProxy: false,
+            isTokenUnlocked: true,
+            CreatePsbcAuthenticationOptions(),
+            ("1111111111111111111111111111111111111111", "Synthetic PSBC", "Synthetic Issuer"));
+
+        Assert.Equal("Selected", GetStatus(result));
+    }
+
+    [Theory]
+    [InlineData("https://sub.corpebank.psbc.com/", false, "UnauthorizedTarget")]
+    [InlineData("https://corpebank.psbc.com.evil/", false, "UnauthorizedTarget")]
+    [InlineData("https://corpebank.psbc.com:8443/", false, "UnauthorizedTarget")]
+    [InlineData("http://corpebank.psbc.com/", false, "InvalidRequest")]
+    [InlineData("https://corpebank.psbc.com/", true, "InvalidRequest")]
+    public void Match_PsbcRejectsRequestsOutsideExactObservedHttpsEndpoint(
+        string requestUri,
+        bool isProxy,
+        string expectedStatus)
+    {
+        var result = Match(
+            new Uri(requestUri),
+            isProxy,
+            isTokenUnlocked: true,
+            CreatePsbcAuthenticationOptions(),
+            ("1111111111111111111111111111111111111111", "Synthetic PSBC", "Synthetic Issuer"));
+
+        Assert.Equal(expectedStatus, GetStatus(result));
+        Assert.Null(GetPropertyValue(result, "SelectedCertificate"));
+    }
+
+    [Fact]
     public void Match_ReportsLockedTokenBeforeSelectingCertificate()
     {
         var result = Match(
@@ -262,4 +297,24 @@ public sealed class ClientCertificateRequestMatcherTests
             "SAMPLE_KEY_CONTAINER_1_RSA",
             "AT_KEYEXCHANGE"),
         "UsbWebLauncher/ClientCertificate/ccb-client-certificate");
+
+    private static ClientCertificateAuthenticationOptions CreatePsbcAuthenticationOptions() => new(
+        "psbc-client-certificate",
+        "corpebank.psbc.com",
+        443,
+        new ClientCertificateIdentityOptions(string.Empty, string.Empty, string.Empty),
+        new ClientCertificateCryptographicProviderOptions(string.Empty, 0, string.Empty, string.Empty),
+        "UsbWebLauncher/ClientCertificate/psbc-client-certificate",
+        NativePromptContinuation: new ClientCertificateNativePromptOptions(
+            true,
+            "UsbWebLauncher.NativePromptBroker.v1",
+            "psbc-uk-password-v1",
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            "校验UK密码",
+            "#32770",
+            [],
+            10000),
+        AuthenticationMode: "BrowserNative");
 }

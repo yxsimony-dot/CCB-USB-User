@@ -12,6 +12,11 @@ public static class ClientCertificateRequestMatcher
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(authentication);
 
+        if (!authentication.Enabled)
+        {
+            return ClientCertificateRequestMatchResult.UnauthorizedTarget();
+        }
+
         if (!IsValidRequest(request))
         {
             return ClientCertificateRequestMatchResult.InvalidRequest();

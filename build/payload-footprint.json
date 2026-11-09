@@ -6,14 +6,14 @@
     "zh-Hans"
   ],
   "baseline": {
-    "fileCount": 284,
-    "unpackedBytes": 274560804
+    "fileCount": 285,
+    "unpackedBytes": 274890262
   },
   "maximum": {
-    "fileCount": 284,
-    "unpackedBytes": 274564385
+    "fileCount": 285,
+    "unpackedBytes": 274893843
   },
-  "rationale": "The accepted 2026-11-04 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. Production two-row header detection and maximized empty-statement capture added 470 bytes to the measured two-digit release payload. Visible-only zero-result evidence detection, including hidden-template filtering and CSS-independent labeled headers, added 512 bytes without changing the payload file set. Responsive empty-statement header recognition, allowing hidden layout cells while requiring visible transaction columns, added 1,024 bytes without changing the payload file set. The committed Windows CRLF checkout contract adds 1,066 bytes compared with the mixed-line-ending development tree. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. The pinned GitHub Actions windows-2022 toolchain produced another 554 bytes of generated binary metadata compared with the verified local clean build, for an accepted 274,564,385-byte payload with the same 284-file set. Any further growth requires an explicit reviewed update.",
+  "rationale": "The accepted 2026-11-04 conventional self-contained win-x64 payload keeps required runtime, WebView2, extension, profile, broker, installer, update code, lifecycle cleanup, and empty-statement screenshot support while removing unreachable embedded diagnostics and unsupported satellite resources. Empty-statement screenshot support increased UsbWebLauncher.App.dll by 10,240 bytes without changing the payload file set. Production two-row header detection and maximized empty-statement capture added 470 bytes to the measured two-digit release payload. Visible-only zero-result evidence detection, including hidden-template filtering and CSS-independent labeled headers, added 512 bytes without changing the payload file set. Responsive empty-statement header recognition, allowing hidden layout cells while requiring visible transaction columns, added 1,024 bytes without changing the payload file set. The committed Windows CRLF checkout contract adds 1,066 bytes compared with the mixed-line-ending development tree. A two-digit release sequence adds 1,021 bytes of measured assembly version metadata above the base-version payload. The pinned GitHub Actions windows-2022 toolchain produced another 554 bytes of generated binary metadata compared with the verified local clean build. The reviewed 2026-11-06 PSBC business-authentication payload adds one 1,199-byte bank-specific profile and 328,259 bytes across the App, Core, Windows, broker, broker policy, and product metadata, increasing the accepted bound by exactly 329,458 bytes while preserving the prior 3,581-byte toolchain allowance. The resulting accepted maximum is 274,893,843 bytes with 285 files. Any further growth requires an explicit reviewed update.",
   "reduction": {
     "unfilteredAppFileCount": 481,
     "acceptedAppFileCount": 277,

@@ -441,6 +441,220 @@ public sealed class NativePromptWindowMatcherTests
     }
 
     [Fact]
+    public void IsMatch_PsbcStrictTopLevelWithExactIdentity_ReturnsTrue()
+    {
+        Assert.True(NativePromptWindowMatcher.IsMatch(
+            PsbcStrictTopLevelPolicy(),
+            PsbcStrictTopLevelCandidate(),
+            TrustedClientProcessId));
+    }
+
+    [Fact]
+    public void TryFindUniqueMatch_PsbcStrictTopLevelNoCompleteCandidate_ReturnsFalse()
+    {
+        var candidates = new[]
+        {
+            PsbcStrictTopLevelCandidate() with { WindowTitle = "校验UK密码 " }
+        };
+
+        Assert.False(NativePromptWindowMatcher.TryFindUniqueMatch(
+            PsbcStrictTopLevelPolicy(),
+            candidates,
+            TrustedClientProcessId,
+            out var match));
+        Assert.Null(match);
+    }
+
+    [Fact]
+    public void TryFindUniqueMatch_PsbcStrictTopLevelOneCompleteCandidate_ReturnsExactSnapshot()
+    {
+        var exact = PsbcStrictTopLevelCandidate();
+        var candidates = new[]
+        {
+            exact with { ProcessSha256 = new string('0', 64) },
+            exact,
+            exact with { InputControlId = 3006 }
+        };
+
+        Assert.True(NativePromptWindowMatcher.TryFindUniqueMatch(
+            PsbcStrictTopLevelPolicy(),
+            candidates,
+            TrustedClientProcessId,
+            out var match));
+        Assert.Same(exact, match);
+    }
+
+    [Fact]
+    public void TryFindUniqueMatch_PsbcStrictTopLevelMultipleCompleteCandidates_ReturnsFalse()
+    {
+        var exact = PsbcStrictTopLevelCandidate();
+        var candidates = new[]
+        {
+            exact,
+            exact with
+            {
+                WindowHandle = new IntPtr(0x5100),
+                RootWindowHandle = new IntPtr(0x5100)
+            }
+        };
+
+        Assert.False(NativePromptWindowMatcher.TryFindUniqueMatch(
+            PsbcStrictTopLevelPolicy(),
+            candidates,
+            TrustedClientProcessId,
+            out var match));
+        Assert.Null(match);
+    }
+
+    [Theory]
+    [InlineData("application-itself")]
+    [InlineData("grandchild")]
+    [InlineData("not-top-level")]
+    [InlineData("wrong-root")]
+    [InlineData("wrong-root-process")]
+    [InlineData("wrong-title")]
+    [InlineData("title-variant")]
+    [InlineData("wrong-class")]
+    [InlineData("wrong-process-file")]
+    [InlineData("wrong-hash")]
+    [InlineData("invalid-signature")]
+    [InlineData("wrong-signer")]
+    [InlineData("wrong-owner")]
+    [InlineData("wrong-current-user")]
+    [InlineData("wrong-session")]
+    [InlineData("wrong-interactive-session")]
+    [InlineData("wrong-integrity")]
+    [InlineData("missing-input")]
+    [InlineData("wrong-input-class")]
+    [InlineData("wrong-input-id")]
+    [InlineData("missing-submit")]
+    [InlineData("wrong-submit-class")]
+    [InlineData("wrong-submit-id")]
+    [InlineData("alternative-controls")]
+    [InlineData("enter-submit")]
+    public void IsMatch_PsbcStrictTopLevelIdentityDifference_ReturnsFalse(string difference)
+    {
+        var candidate = PsbcStrictTopLevelCandidate();
+        candidate = difference switch
+        {
+            "application-itself" => candidate with
+            {
+                ProcessId = TrustedClientProcessId,
+                ParentProcessId = 100,
+                RootProcessId = TrustedClientProcessId
+            },
+            "grandchild" => candidate with { ParentProcessId = TrustedClientProcessId + 1 },
+            "not-top-level" => candidate with { IsTopLevel = false },
+            "wrong-root" => candidate with { RootWindowHandle = new IntPtr(0x9999) },
+            "wrong-root-process" => candidate with { RootProcessId = TrustedClientProcessId },
+            "wrong-title" => candidate with { WindowTitle = "其他密码窗口" },
+            "title-variant" => candidate with { WindowTitle = "校验UK密码 " },
+            "wrong-class" => candidate with { WindowClass = "OtherClass" },
+            "wrong-process-file" => candidate with { ProcessPath = @"C:\Windows\notepad.exe" },
+            "wrong-hash" => candidate with { ProcessSha256 = new string('F', 64) },
+            "invalid-signature" => candidate with { IsAuthenticodeValid = false },
+            "wrong-signer" => candidate with
+            {
+                SignerCertificateThumbprint = new string('F', 40)
+            },
+            "wrong-owner" => candidate with { ProcessOwnerSid = "S-1-5-21-2000" },
+            "wrong-current-user" => candidate with { CurrentUserSid = "S-1-5-21-3000" },
+            "wrong-session" => candidate with { ProcessSessionId = 4 },
+            "wrong-interactive-session" => candidate with { CurrentInteractiveSessionId = 5 },
+            "wrong-integrity" => candidate with { IntegrityRid = 0x3000 },
+            "missing-input" => candidate with { InputControlHandle = IntPtr.Zero },
+            "wrong-input-class" => candidate with { InputWindowClass = "Other" },
+            "wrong-input-id" => candidate with { InputControlId = 3006 },
+            "missing-submit" => candidate with { SubmitControlHandle = IntPtr.Zero },
+            "wrong-submit-class" => candidate with { SubmitWindowClass = "Other" },
+            "wrong-submit-id" => candidate with { SubmitControlId = 2 },
+            "alternative-controls" => candidate with { HasVerifiedAlternativeControls = true },
+            "enter-submit" => candidate with
+            {
+                SubmitControlHandle = IntPtr.Zero,
+                SubmitWindowClass = string.Empty,
+                SubmitControlId = 0,
+                HasVerifiedAlternativeControls = true,
+                UsesDialogEnterSubmit = true,
+                DialogEnterLayout = NativePromptDialogEnterLayout.TitledPasswordEdit
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(difference))
+        };
+
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            PsbcStrictTopLevelPolicy(),
+            candidate,
+            TrustedClientProcessId));
+    }
+
+    [Fact]
+    public void HasSameIdentity_PsbcStrictTopLevelTitleChange_ReturnsFalse()
+    {
+        var policy = PsbcStrictTopLevelPolicy();
+        var candidate = PsbcStrictTopLevelCandidate();
+
+        Assert.False(NativePromptWindowMatcher.HasSameIdentity(
+            policy,
+            candidate,
+            candidate with { WindowTitle = "校验UK密码 " }));
+    }
+
+    [Theory]
+    [InlineData("missing-input")]
+    [InlineData("duplicate-input")]
+    [InlineData("missing-submit")]
+    [InlineData("duplicate-submit")]
+    public void TryFindTrustedClientStrictTopLevelControls_IncompleteOrAmbiguousControls_ReturnsFalse(
+        string difference)
+    {
+        var input = Control(new IntPtr(0x5001), "Edit", 3005);
+        var submit = Control(new IntPtr(0x5002), "Button", 1);
+        var controls = difference switch
+        {
+            "missing-input" => new[] { submit },
+            "duplicate-input" => new[]
+            {
+                input,
+                input with { WindowHandle = new IntPtr(0x5003) },
+                submit
+            },
+            "missing-submit" => new[] { input },
+            "duplicate-submit" => new[]
+            {
+                input,
+                submit,
+                submit with { WindowHandle = new IntPtr(0x5003) }
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(difference))
+        };
+
+        Assert.False(NativePromptWindowMatcher.TryFindTrustedClientStrictTopLevelControls(
+            controls,
+            expectedProcessId: 500,
+            PsbcStrictTopLevelPolicy(),
+            out var matchedInput,
+            out var matchedSubmit));
+        Assert.Null(matchedInput);
+        Assert.Null(matchedSubmit);
+    }
+
+    [Fact]
+    public void TryFindTrustedClientStrictTopLevelControls_ExactUniquePair_ReturnsBothControls()
+    {
+        var input = Control(new IntPtr(0x5001), "Edit", 3005);
+        var submit = Control(new IntPtr(0x5002), "Button", 1);
+
+        Assert.True(NativePromptWindowMatcher.TryFindTrustedClientStrictTopLevelControls(
+            [input, submit],
+            expectedProcessId: 500,
+            PsbcStrictTopLevelPolicy(),
+            out var matchedInput,
+            out var matchedSubmit));
+        Assert.Same(input, matchedInput);
+        Assert.Same(submit, matchedSubmit);
+    }
+
+    [Fact]
     public void TryFindUniqueControl_TwoMatchingPasswordInputs_FailsClosed()
     {
         var controls = new[]
@@ -518,39 +732,58 @@ public sealed class NativePromptWindowMatcherTests
 
     internal static ClientCertificateNativePromptOptions DescendantPolicy(
         int timeoutMilliseconds = 50) => Policy(timeoutMilliseconds) with
-    {
-        WindowScope = NativePromptWindowScopes.TrustedClientDescendant,
-        ProcessPath = string.Empty,
-        ProcessSha256 = string.Empty,
-        ProcessFileName = "msedgewebview2.exe",
-        PublisherCertificateThumbprint = "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
-        WindowTitle = string.Empty,
-        RequiredChildWindowClasses = [],
-        TrustedRootWindowTitle = "USB Web Launcher",
-        TrustedRootWindowClassPrefix = "HwndWrapper[UsbWebLauncher.App;",
-        InputWindowClass = "Edit",
-        InputControlId = 1010,
-        SubmitWindowClass = "Button",
-        SubmitControlId = 1
-    };
+        {
+            WindowScope = NativePromptWindowScopes.TrustedClientDescendant,
+            ProcessPath = string.Empty,
+            ProcessSha256 = string.Empty,
+            ProcessFileName = "msedgewebview2.exe",
+            PublisherCertificateThumbprint = "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
+            WindowTitle = string.Empty,
+            RequiredChildWindowClasses = [],
+            TrustedRootWindowTitle = "USB Web Launcher",
+            TrustedRootWindowClassPrefix = "HwndWrapper[UsbWebLauncher.App;",
+            InputWindowClass = "Edit",
+            InputControlId = 1010,
+            SubmitWindowClass = "Button",
+            SubmitControlId = 1
+        };
 
     internal static ClientCertificateNativePromptOptions TrustedClientTopLevelPolicy(
         int timeoutMilliseconds = 50) => Policy(timeoutMilliseconds) with
-    {
-        WindowScope = NativePromptWindowScopes.TrustedClientTopLevel,
-        ProcessPath = string.Empty,
-        ProcessSha256 = string.Empty,
-        ProcessFileName = "msedgewebview2.exe",
-        PublisherCertificateThumbprint = string.Empty,
-        WindowTitle = "验证通用盾密码",
-        RequiredChildWindowClasses = [],
-        TrustedRootWindowTitle = string.Empty,
-        TrustedRootWindowClassPrefix = string.Empty,
-        InputWindowClass = "Edit",
-        InputControlId = 3743,
-        SubmitWindowClass = "Button",
-        SubmitControlId = 4000
-    };
+        {
+            WindowScope = NativePromptWindowScopes.TrustedClientTopLevel,
+            ProcessPath = string.Empty,
+            ProcessSha256 = string.Empty,
+            ProcessFileName = "msedgewebview2.exe",
+            PublisherCertificateThumbprint = string.Empty,
+            WindowTitle = "验证通用盾密码",
+            RequiredChildWindowClasses = [],
+            TrustedRootWindowTitle = string.Empty,
+            TrustedRootWindowClassPrefix = string.Empty,
+            InputWindowClass = "Edit",
+            InputControlId = 3743,
+            SubmitWindowClass = "Button",
+            SubmitControlId = 4000
+        };
+
+    internal static ClientCertificateNativePromptOptions PsbcStrictTopLevelPolicy(
+        int timeoutMilliseconds = 50) => Policy(timeoutMilliseconds) with
+        {
+            PolicyId = "psbc-uk-password-v1",
+            WindowScope = NativePromptWindowScopes.TrustedClientStrictTopLevel,
+            ProcessPath = string.Empty,
+            ProcessSha256 = "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+            ProcessFileName = "msedgewebview2.exe",
+            PublisherCertificateThumbprint = "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
+            WindowTitle = "校验UK密码",
+            RequiredChildWindowClasses = [],
+            TrustedRootWindowTitle = string.Empty,
+            TrustedRootWindowClassPrefix = string.Empty,
+            InputWindowClass = "Edit",
+            InputControlId = 3005,
+            SubmitWindowClass = "Button",
+            SubmitControlId = 1
+        };
 
     internal static NativePromptWindowSnapshot Candidate() => new(
         WindowHandle: new IntPtr(0x1234),
@@ -633,6 +866,34 @@ public sealed class NativePromptWindowMatcherTests
         SubmitControlId: 4000,
         ParentProcessId: TrustedClientProcessId);
 
+    internal static NativePromptWindowSnapshot PsbcStrictTopLevelCandidate() => new(
+        WindowHandle: new IntPtr(0x5000),
+        IsTopLevel: true,
+        IsVisible: true,
+        IsEnabled: true,
+        WindowTitle: "校验UK密码",
+        WindowClass: "#32770",
+        DirectDescendantClassAncestry: [],
+        ProcessId: 500,
+        ProcessPath: @"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\152.0.4191.66\msedgewebview2.exe",
+        ProcessSha256: "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+        IsAuthenticodeValid: true,
+        SignerCertificateThumbprint: "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
+        ProcessOwnerSid: "S-1-5-21-1000",
+        CurrentUserSid: "S-1-5-21-1000",
+        ProcessSessionId: 3,
+        CurrentInteractiveSessionId: 3,
+        IntegrityRid: 0x2000,
+        RootWindowHandle: new IntPtr(0x5000),
+        RootProcessId: 500,
+        InputControlHandle: new IntPtr(0x5001),
+        InputWindowClass: "Edit",
+        InputControlId: 3005,
+        SubmitControlHandle: new IntPtr(0x5002),
+        SubmitWindowClass: "Button",
+        SubmitControlId: 1,
+        ParentProcessId: TrustedClientProcessId);
+
     private static NativePromptControlSnapshot Control(
         IntPtr handle,
         string windowClass,
@@ -647,32 +908,32 @@ public sealed class NativePromptWindowMatcherTests
     internal static NativePromptWindowSnapshot Mutate(
         NativePromptWindowSnapshot candidate,
         string difference) => difference switch
-    {
-        "zero-hwnd" => candidate with { WindowHandle = IntPtr.Zero },
-        "not-top-level" => candidate with { IsTopLevel = false },
-        "invisible" => candidate with { IsVisible = false },
-        "disabled" => candidate with { IsEnabled = false },
-        "title" => candidate with { WindowTitle = "Other title" },
-        "class" => candidate with { WindowClass = "OtherClass" },
-        "child-chain" => candidate with
         {
-            DirectDescendantClassAncestry = new[]
+            "zero-hwnd" => candidate with { WindowHandle = IntPtr.Zero },
+            "not-top-level" => candidate with { IsTopLevel = false },
+            "invisible" => candidate with { IsVisible = false },
+            "disabled" => candidate with { IsEnabled = false },
+            "title" => candidate with { WindowTitle = "Other title" },
+            "class" => candidate with { WindowClass = "OtherClass" },
+            "child-chain" => candidate with
             {
+                DirectDescendantClassAncestry = new[]
+                {
                 "Shell Embedding",
                 "Unexpected",
                 "Internet Explorer_Server"
             }
-        },
-        "process-id" => candidate with { ProcessId = 0 },
-        "path" => candidate with { ProcessPath = @"C:\Windows\System32\notepad.exe" },
-        "hash" => candidate with { ProcessSha256 = new string('F', 64) },
-        "authenticode" => candidate with { IsAuthenticodeValid = false },
-        "signer" => candidate with { SignerCertificateThumbprint = new string('F', 40) },
-        "owner-sid" => candidate with { ProcessOwnerSid = "S-1-5-21-2000" },
-        "current-user-sid" => candidate with { CurrentUserSid = "S-1-5-21-3000" },
-        "session" => candidate with { ProcessSessionId = 4 },
-        "interactive-session" => candidate with { CurrentInteractiveSessionId = 5 },
-        "integrity" => candidate with { IntegrityRid = 0x4000 },
-        _ => throw new ArgumentOutOfRangeException(nameof(difference))
-    };
+            },
+            "process-id" => candidate with { ProcessId = 0 },
+            "path" => candidate with { ProcessPath = @"C:\Windows\System32\notepad.exe" },
+            "hash" => candidate with { ProcessSha256 = new string('F', 64) },
+            "authenticode" => candidate with { IsAuthenticodeValid = false },
+            "signer" => candidate with { SignerCertificateThumbprint = new string('F', 40) },
+            "owner-sid" => candidate with { ProcessOwnerSid = "S-1-5-21-2000" },
+            "current-user-sid" => candidate with { CurrentUserSid = "S-1-5-21-3000" },
+            "session" => candidate with { ProcessSessionId = 4 },
+            "interactive-session" => candidate with { CurrentInteractiveSessionId = 5 },
+            "integrity" => candidate with { IntegrityRid = 0x4000 },
+            _ => throw new ArgumentOutOfRangeException(nameof(difference))
+        };
 }

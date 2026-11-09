@@ -12,19 +12,34 @@ public sealed class WindowsClientCertificateAuthenticationRuntimeFactory
     : IClientCertificateAuthenticationRuntimeFactory
 {
     public IClientCertificateAuthenticationRuntime Create(
+        BankAuthenticationRuntimeKind runtimeKind,
         ClientCertificateAuthenticationOptions authentication,
         ICorrelatedBrowserHost browser,
-        Uri target)
+        Uri target,
+        IPsbcAuthenticationRuntimeContext? psbcRuntimeContext = null)
     {
+        var resolvedCredentialTarget = BankCredentialTargetResolver.Resolve(
+            runtimeKind,
+            authentication.Id);
+        if (!string.Equals(
+                resolvedCredentialTarget,
+                authentication.CredentialTargetName,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "认证配置的凭据目标与当前银行运行时不一致。");
+        }
+
         var stores = WindowsClientCertificateAuthenticationStores.Create(
             authentication.Id,
             useValidationStamps: !authentication.UsesBrowserNativeAuthentication);
         if (!string.Equals(
                 stores.CredentialTargetName,
-                authentication.CredentialTargetName,
+                resolvedCredentialTarget,
                 StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("认证配置的凭据目标与本机存储目标不一致。");
+            throw new InvalidOperationException(
+                "当前银行的凭据目标与本机存储目标不一致。");
         }
 
         var tokenUnlocker = WindowsClientCertificateTokenUnlockerFactory.Create(authentication);
@@ -37,7 +52,12 @@ public sealed class WindowsClientCertificateAuthenticationRuntimeFactory
             stores.PinStore,
             stores.ValidationStampStore,
             tokenUnlocker,
-            nativePromptContinuation: nativePromptContinuation);
+            nativePromptContinuation: nativePromptContinuation,
+            psbcRuntimeContext: psbcRuntimeContext,
+            psbcAuthenticationObserver:
+                runtimeKind == BankAuthenticationRuntimeKind.PostalSavingsBank
+                    ? new PsbcAuthenticationDiagnosticsObserver()
+                    : null);
         var router = new ClientCertificateAuthenticationFlowRouter(
             authentication,
             browser,
@@ -45,7 +65,9 @@ public sealed class WindowsClientCertificateAuthenticationRuntimeFactory
             coordinator,
             coordinator,
             nativePromptContinuation);
-        var manualGate = new ManualAuthenticationGate(new AuthenticationLauncherGate(coordinator), coordinator);
+        var manualGate = new ManualAuthenticationGate(
+            new AuthenticationLauncherGate(runtimeKind, coordinator),
+            coordinator);
         var setupService = new ClientCertificatePinSetupService(
             authentication,
             stores.PinStore,
@@ -54,6 +76,7 @@ public sealed class WindowsClientCertificateAuthenticationRuntimeFactory
             router,
             manualGate);
         return new WindowsClientCertificateAuthenticationRuntime(
+            runtimeKind,
             coordinator,
             router,
             setupService,
@@ -74,6 +97,7 @@ public sealed class WindowsClientCertificateAuthenticationRuntime :
     private int _disposed;
 
     internal WindowsClientCertificateAuthenticationRuntime(
+        BankAuthenticationRuntimeKind runtimeKind,
         AuthenticationCoordinator coordinator,
         ClientCertificateAuthenticationFlowRouter router,
         ClientCertificatePinSetupService setupService,
@@ -81,6 +105,7 @@ public sealed class WindowsClientCertificateAuthenticationRuntime :
         INativePromptBrokerPrerequisites brokerPrerequisites,
         IClientCertificatePinStore? pinStore = null)
     {
+        RuntimeKind = runtimeKind;
         _coordinator = coordinator;
         _router = router;
         _setupService = setupService;
@@ -93,6 +118,8 @@ public sealed class WindowsClientCertificateAuthenticationRuntime :
     }
 
     public event EventHandler<AuthenticationStateChangedEventArgs>? StateChanged;
+
+    public BankAuthenticationRuntimeKind RuntimeKind { get; }
 
     public AuthenticationState CurrentState => _coordinator.CurrentState;
 
@@ -126,7 +153,9 @@ public sealed class WindowsClientCertificateAuthenticationRuntime :
         StateChanged?.Invoke(this, eventArgs);
 }
 
-internal sealed class AuthenticationLauncherGate(AuthenticationCoordinator coordinator)
+internal sealed class AuthenticationLauncherGate(
+    BankAuthenticationRuntimeKind runtimeKind,
+    AuthenticationCoordinator coordinator)
     : ILauncherAuthenticationGate, ILauncherAuthenticationMetadataInvalidationGate
 {
     public Task InvalidateDeviceMetadataAsync(CancellationToken cancellationToken = default) =>
@@ -138,14 +167,20 @@ internal sealed class AuthenticationLauncherGate(AuthenticationCoordinator coord
     {
         await coordinator.HandleDevicePresenceAsync(isTargetDevicePresent, cancellationToken)
             .ConfigureAwait(false);
-        return AllowsNavigation(isTargetDevicePresent, coordinator.CurrentState.Stage);
+        return AllowsNavigation(
+            runtimeKind,
+            isTargetDevicePresent,
+            coordinator.CurrentState.Stage);
     }
 
     internal static bool AllowsNavigation(
+        BankAuthenticationRuntimeKind runtimeKind,
         bool isTargetDevicePresent,
         AuthenticationStage stage) =>
         !isTargetDevicePresent || stage is
             AuthenticationStage.AwaitingCertificate or
             AuthenticationStage.Authenticating or
-            AuthenticationStage.Ready;
+            AuthenticationStage.Ready ||
+        runtimeKind == BankAuthenticationRuntimeKind.PostalSavingsBank &&
+        stage == AuthenticationStage.RequiresPinSetup;
 }

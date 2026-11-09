@@ -641,6 +641,7 @@ internal static class NativePromptProtocol
         ClientCertificateNativePromptStatus.TimedOut => 9,
         ClientCertificateNativePromptStatus.Cancelled => 10,
         ClientCertificateNativePromptStatus.UnknownFailure => 11,
+        ClientCertificateNativePromptStatus.PinRejected => 12,
         _ => throw new InvalidDataException("Native prompt completion status is unknown.")
     };
 
@@ -658,6 +659,7 @@ internal static class NativePromptProtocol
         9 => ClientCertificateNativePromptStatus.TimedOut,
         10 => ClientCertificateNativePromptStatus.Cancelled,
         11 => ClientCertificateNativePromptStatus.UnknownFailure,
+        12 => ClientCertificateNativePromptStatus.PinRejected,
         _ => throw new InvalidDataException("Native prompt completion status is unknown.")
     };
 

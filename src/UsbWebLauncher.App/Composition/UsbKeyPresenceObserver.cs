@@ -2,12 +2,17 @@ using UsbWebLauncher.Core.Devices;
 
 namespace UsbWebLauncher.App.Composition;
 
+internal interface IUsbKeyPresenceObserver : IAsyncDisposable
+{
+    Task StartAsync(CancellationToken cancellationToken = default);
+}
+
 // Application-level observation only. This object never grants business or
 // authentication permission and is independent of each business-session monitor.
 internal sealed class UsbKeyPresenceObserver(
     IUsbDeviceMonitor inner,
     Func<UsbDeviceDescriptor, bool> matches,
-    Action<bool?> publish) : IAsyncDisposable
+    Action<bool?> publish) : IUsbKeyPresenceObserver
 {
     private readonly object sync = new();
     private readonly CancellationTokenSource lifetime = new();

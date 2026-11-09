@@ -1,24 +1,51 @@
 {
   "ProtocolVersion": 1,
-  "PolicyHash": "8A988F8C8B6E69AC527E225814D61CAE64F1CDFC4A911E1EC51E98B3CC92F722",
-  "Prompt": {
-    "Enabled": true,
-    "BrokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
-    "PolicyId": "ccb-hdzb-client-certificate-v1",
-    "ProcessPath": "",
-    "ProcessSha256": "",
-    "PublisherCertificateThumbprint": "",
-    "WindowTitle": "验证通用盾密码",
-    "WindowClass": "#32770",
-    "RequiredChildWindowClasses": [],
-    "TimeoutMilliseconds": 30000,
-    "WindowScope": "TrustedClientTopLevel",
-    "ProcessFileName": "msedgewebview2.exe",
-    "TrustedRootWindowTitle": "",
-    "TrustedRootWindowClassPrefix": "",
-    "InputWindowClass": "Edit",
-    "InputControlId": 3743,
-    "SubmitWindowClass": "Button",
-    "SubmitControlId": 4000
-  }
+  "Policies": [
+    {
+      "PolicyHash": "8A988F8C8B6E69AC527E225814D61CAE64F1CDFC4A911E1EC51E98B3CC92F722",
+      "Prompt": {
+        "Enabled": true,
+        "BrokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
+        "PolicyId": "ccb-hdzb-client-certificate-v1",
+        "ProcessPath": "",
+        "ProcessSha256": "",
+        "PublisherCertificateThumbprint": "",
+        "WindowTitle": "验证通用盾密码",
+        "WindowClass": "#32770",
+        "RequiredChildWindowClasses": [],
+        "TimeoutMilliseconds": 30000,
+        "WindowScope": "TrustedClientTopLevel",
+        "ProcessFileName": "msedgewebview2.exe",
+        "TrustedRootWindowTitle": "",
+        "TrustedRootWindowClassPrefix": "",
+        "InputWindowClass": "Edit",
+        "InputControlId": 3743,
+        "SubmitWindowClass": "Button",
+        "SubmitControlId": 4000
+      }
+    },
+    {
+      "PolicyHash": "86E57F7B1CFDED775AF02BAD09E02DE1A09C09782FEA88FF09B94D5461E24562",
+      "Prompt": {
+        "Enabled": true,
+        "BrokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
+        "PolicyId": "psbc-uk-password-v1",
+        "ProcessPath": "",
+        "ProcessSha256": "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+        "PublisherCertificateThumbprint": "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
+        "WindowTitle": "校验UK密码",
+        "WindowClass": "#32770",
+        "RequiredChildWindowClasses": [],
+        "TimeoutMilliseconds": 30000,
+        "WindowScope": "TrustedClientStrictTopLevel",
+        "ProcessFileName": "msedgewebview2.exe",
+        "TrustedRootWindowTitle": "",
+        "TrustedRootWindowClassPrefix": "",
+        "InputWindowClass": "Edit",
+        "InputControlId": 3005,
+        "SubmitWindowClass": "Button",
+        "SubmitControlId": 1
+      }
+    }
+  ]
 }

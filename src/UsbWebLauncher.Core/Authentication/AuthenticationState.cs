@@ -27,8 +27,11 @@ public enum AuthenticationErrorCategory
     UnauthorizedTarget,
     CertificateMissing,
     CertificateConflict,
+    WindowConflict,
     TlsFailed,
-    TimedOut
+    TimedOut,
+    Cancelled,
+    BankChanged
 }
 
 public sealed record AuthenticationAttempt(

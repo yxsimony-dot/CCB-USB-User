@@ -48,6 +48,7 @@ try {
     Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/install-directory.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-contract.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/version.tests.ps1')
+    Run 'pwsh' @('-NoProfile','-File','tests/packaging/local-version.tests.ps1')
     Run 'pwsh' @('-NoProfile','-File','tests/packaging/build-entry.tests.ps1')
     Run 'node' @('--test','tests/packaging/release.test.cjs')
     Run 'powershell.exe' @('-NoProfile','-File','tests/packaging/payload-integrity.tests.ps1')

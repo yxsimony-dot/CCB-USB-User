@@ -5,29 +5,91 @@ using UsbWebLauncher.Windows.Authentication;
 
 namespace UsbWebLauncher.Windows.Authentication.NativePrompt;
 
-internal sealed partial record NativePromptBrokerPolicy(
+internal sealed record NativePromptBrokerPolicyEntry(
     string PolicyHash,
-    ClientCertificateNativePromptOptions Prompt,
-    NativePromptBrokerTrustedClient? TrustedClient = null)
+    ClientCertificateNativePromptOptions Prompt);
+
+internal sealed partial record NativePromptBrokerPolicy
 {
+    public NativePromptBrokerPolicy(
+        string policyHash,
+        ClientCertificateNativePromptOptions prompt,
+        NativePromptBrokerTrustedClient? trustedClient = null)
+        : this([new NativePromptBrokerPolicyEntry(policyHash, prompt)], trustedClient)
+    {
+    }
+
+    public NativePromptBrokerPolicy(
+        IReadOnlyList<NativePromptBrokerPolicyEntry> policies,
+        NativePromptBrokerTrustedClient? trustedClient = null)
+    {
+        Policies = policies?.ToArray() ?? [];
+        TrustedClient = trustedClient;
+    }
+
+    public IReadOnlyList<NativePromptBrokerPolicyEntry> Policies { get; }
+
+    public NativePromptBrokerTrustedClient? TrustedClient { get; }
+
+    public string BrokerPipeName => Policies.Count == 0
+        ? string.Empty
+        : Policies[0].Prompt.BrokerPipeName;
+
+    public string PolicyHash => Policies[0].PolicyHash;
+
+    public ClientCertificateNativePromptOptions Prompt => Policies[0].Prompt;
+
     public bool IsPackageValid =>
-        Prompt is
+        Policies.Count > 0 &&
+        Policies.All(IsEntryValid) &&
+        HasUniquePolicyIdentities() &&
+        Policies.All(entry => string.Equals(
+            entry.Prompt.BrokerPipeName,
+            BrokerPipeName,
+            StringComparison.Ordinal));
+
+    public bool IsValid => IsPackageValid && TrustedClient?.IsValid == true;
+
+    public bool TryGetPolicy(string policyId, out NativePromptBrokerPolicyEntry policy)
+    {
+        policy = Policies.FirstOrDefault(candidate =>
+            string.Equals(candidate.Prompt.PolicyId, policyId, StringComparison.Ordinal))!;
+        return policy is not null;
+    }
+
+    private static bool IsEntryValid(NativePromptBrokerPolicyEntry entry) =>
+        entry is not null &&
+        entry.Prompt is
         {
             Enabled: true,
             TimeoutMilliseconds: >= 1000 and <= 30000
         } &&
         string.Equals(
-            Prompt.BrokerPipeName,
+            entry.Prompt.BrokerPipeName,
             WindowsNativePromptBrokerInstaller.BrokerPipeName,
             StringComparison.Ordinal) &&
-        !string.IsNullOrWhiteSpace(Prompt.BrokerPipeName) &&
-        !string.IsNullOrWhiteSpace(Prompt.PolicyId) &&
-        UpperSha256().IsMatch(PolicyHash) &&
-        !string.IsNullOrWhiteSpace(Prompt.WindowClass) &&
-        IsPublisherValid(Prompt) &&
-        IsPromptTargetValid(Prompt);
+        !string.IsNullOrWhiteSpace(entry.Prompt.BrokerPipeName) &&
+        !string.IsNullOrWhiteSpace(entry.Prompt.PolicyId) &&
+        UpperSha256().IsMatch(entry.PolicyHash) &&
+        !string.IsNullOrWhiteSpace(entry.Prompt.WindowClass) &&
+        IsPublisherValid(entry.Prompt) &&
+        IsPromptTargetValid(entry.Prompt);
 
-    public bool IsValid => IsPackageValid && TrustedClient?.IsValid == true;
+    private bool HasUniquePolicyIdentities()
+    {
+        var policyIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var policyHashes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in Policies)
+        {
+            if (!policyIds.Add(entry.Prompt.PolicyId) ||
+                !policyHashes.Add(entry.PolicyHash))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private static bool IsPromptTargetValid(ClientCertificateNativePromptOptions prompt)
     {
@@ -51,11 +113,17 @@ internal sealed partial record NativePromptBrokerPolicy(
             prompt.WindowScope,
             NativePromptWindowScopes.TrustedClientTopLevel,
             StringComparison.Ordinal);
-        return (isTrustedClientDescendant || isTrustedClientTopLevel) &&
+        var isTrustedClientStrictTopLevel = string.Equals(
+            prompt.WindowScope,
+            NativePromptWindowScopes.TrustedClientStrictTopLevel,
+            StringComparison.Ordinal);
+        return (isTrustedClientDescendant || isTrustedClientTopLevel || isTrustedClientStrictTopLevel) &&
                string.IsNullOrEmpty(prompt.ProcessPath) &&
-               (string.IsNullOrEmpty(prompt.ProcessSha256) || UpperSha256().IsMatch(prompt.ProcessSha256)) &&
+               (isTrustedClientStrictTopLevel
+                   ? UpperSha256().IsMatch(prompt.ProcessSha256)
+                   : string.IsNullOrEmpty(prompt.ProcessSha256) || UpperSha256().IsMatch(prompt.ProcessSha256)) &&
                IsExecutableFileName(prompt.ProcessFileName) &&
-               (isTrustedClientTopLevel
+               (isTrustedClientTopLevel || isTrustedClientStrictTopLevel
                    ? !string.IsNullOrWhiteSpace(prompt.WindowTitle)
                    : prompt.WindowTitle is not null) &&
                prompt.RequiredChildWindowClasses is { Count: 0 } &&
@@ -366,8 +434,8 @@ internal sealed partial class WindowsNativePromptBrokerServer : IAsyncDisposable
             }
 
             if (!_policy.IsValid ||
-                !string.Equals(request.PolicyId, _policy.Prompt.PolicyId, StringComparison.Ordinal) ||
-                !string.Equals(request.PolicyHash, _policy.PolicyHash, StringComparison.Ordinal) ||
+                !_policy.TryGetPolicy(request.PolicyId, out var selectedPolicy) ||
+                !string.Equals(request.PolicyHash, selectedPolicy.PolicyHash, StringComparison.Ordinal) ||
                 !UpperSha256().IsMatch(request.PolicyHash))
             {
                 return Rejected(request.AttemptId, ClientCertificateNativePromptArmStatus.PolicyMismatch);
@@ -393,7 +461,7 @@ internal sealed partial class WindowsNativePromptBrokerServer : IAsyncDisposable
             ownedPin = new ClearableSecretBuffer(request.Pin.Span);
             var attempt = new NativePromptBrokerAttempt(
                 _executor,
-                _policy.Prompt,
+                selectedPolicy.Prompt,
                 ownedPin,
                 identity.ProcessId,
                 _shutdown.Token,

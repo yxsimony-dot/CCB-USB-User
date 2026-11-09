@@ -550,6 +550,16 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
                 currentSessionId);
         }
 
+        if (IsTrustedClientStrictTopLevel(policy))
+        {
+            return CaptureTrustedClientStrictTopLevelSnapshot(
+                windowHandle,
+                policy,
+                trustedClientProcessId,
+                currentUserSid,
+                currentSessionId);
+        }
+
         if (IsTrustedClientTopLevel(policy))
         {
             return CaptureTrustedClientTopLevelSnapshot(
@@ -875,6 +885,97 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
         }
     }
 
+    private static NativePromptWindowSnapshot? CaptureTrustedClientStrictTopLevelSnapshot(
+        IntPtr windowHandle,
+        ClientCertificateNativePromptOptions policy,
+        int trustedClientProcessId,
+        string currentUserSid,
+        int currentSessionId)
+    {
+        try
+        {
+            if (trustedClientProcessId <= 0 ||
+                windowHandle == IntPtr.Zero ||
+                GetAncestor(windowHandle, GetAncestorRoot) != windowHandle ||
+                !IsWindowVisible(windowHandle) ||
+                !IsWindowEnabled(windowHandle) ||
+                !TryGetWindowText(windowHandle, out var windowTitle) ||
+                !string.Equals(windowTitle, policy.WindowTitle, StringComparison.Ordinal) ||
+                !TryGetWindowClass(windowHandle, out var windowClass) ||
+                !string.Equals(windowClass, policy.WindowClass, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            GetWindowThreadProcessId(windowHandle, out var nativeProcessId);
+            if (nativeProcessId is 0 or > int.MaxValue)
+            {
+                return null;
+            }
+
+            var processId = checked((int)nativeProcessId);
+            var controls = CaptureDescendantControls(windowHandle, includeButtonText: false);
+            if (!NativePromptWindowMatcher.TryFindTrustedClientStrictTopLevelControls(
+                    controls,
+                    processId,
+                    policy,
+                    out var input,
+                    out var submit))
+            {
+                return null;
+            }
+
+            using var process = OpenProcess(
+                ProcessQueryLimitedInformation,
+                inheritHandle: false,
+                nativeProcessId);
+            if (process.IsInvalid ||
+                !TryGetParentProcessId(process, out var parentProcessId) ||
+                parentProcessId != trustedClientProcessId ||
+                !TryGetProcessPath(process, out var processPath) ||
+                !TryGetProcessSecurity(process, out var ownerSid, out var integrityRid) ||
+                !ProcessIdToSessionId(nativeProcessId, out var nativeSessionId) ||
+                nativeSessionId > int.MaxValue ||
+                !TryComputeSha256(processPath, out var processSha256) ||
+                !TryVerifyAuthenticode(processPath, out var signerThumbprint))
+            {
+                return null;
+            }
+
+            return new NativePromptWindowSnapshot(
+                WindowHandle: windowHandle,
+                IsTopLevel: true,
+                IsVisible: true,
+                IsEnabled: true,
+                WindowTitle: windowTitle,
+                WindowClass: windowClass,
+                DirectDescendantClassAncestry: [],
+                ProcessId: processId,
+                ProcessPath: processPath,
+                ProcessSha256: processSha256,
+                IsAuthenticodeValid: true,
+                SignerCertificateThumbprint: signerThumbprint,
+                ProcessOwnerSid: ownerSid,
+                CurrentUserSid: currentUserSid,
+                ProcessSessionId: checked((int)nativeSessionId),
+                CurrentInteractiveSessionId: currentSessionId,
+                IntegrityRid: integrityRid,
+                RootWindowHandle: windowHandle,
+                RootProcessId: processId,
+                InputControlHandle: input!.WindowHandle,
+                InputWindowClass: input.WindowClass,
+                InputControlId: input.ControlId,
+                SubmitControlHandle: submit!.WindowHandle,
+                SubmitWindowClass: submit.WindowClass,
+                SubmitControlId: submit.ControlId,
+                ParentProcessId: parentProcessId);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static bool TryFindUniqueDescendantControl(
         IntPtr root,
         uint expectedProcessId,
@@ -938,6 +1039,12 @@ internal sealed class WindowsNativePromptApi : IWindowsNativePromptApi
         string.Equals(
             policy.WindowScope,
             NativePromptWindowScopes.TrustedClientTopLevel,
+            StringComparison.Ordinal);
+
+    private static bool IsTrustedClientStrictTopLevel(ClientCertificateNativePromptOptions policy) =>
+        string.Equals(
+            policy.WindowScope,
+            NativePromptWindowScopes.TrustedClientStrictTopLevel,
             StringComparison.Ordinal);
 
     private static bool TryGetCurrentIdentity(out string userSid, out int sessionId)

@@ -493,6 +493,13 @@ public sealed class WebView2BrowserHost :
             return WebClientCertificateSelection.Deny();
         }
 
+        if (result.Status ==
+            ClientCertificateRequestMatchStatus.BrowserSelectionRequired)
+        {
+            return WebClientCertificateSelection.PassThrough(
+                new ClientCertificateSelectionAuthorization());
+        }
+
         var requiresManualSelection =
             result.Status is ClientCertificateRequestMatchStatus.CertificateMissing
                 or ClientCertificateRequestMatchStatus.CertificateConflict;

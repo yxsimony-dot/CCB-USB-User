@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using UsbWebLauncher.Core.Configuration;
 
 namespace UsbWebLauncher.App.Configuration;
@@ -7,7 +8,8 @@ public static class LauncherProfileJson
 {
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
     };
 
     public static LauncherProfile Parse(string json)

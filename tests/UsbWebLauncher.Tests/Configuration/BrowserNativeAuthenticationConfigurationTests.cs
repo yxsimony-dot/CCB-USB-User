@@ -62,6 +62,34 @@ public sealed class BrowserNativeAuthenticationConfigurationTests
         Assert.NotEqual(first.GetNormalizedHash(), (first with { AuthenticationMode = "ConfiguredToken" }).GetNormalizedHash());
     }
 
+    [Fact]
+    public void BrowserNative_DisabledConfigurationAllowsDormantPromptIdentity()
+    {
+        var auth = Options() with
+        {
+            Enabled = false,
+            NativePromptContinuation = DormantPrompt()
+        };
+
+        Assert.True(Validate(auth).IsValid);
+    }
+
+    [Fact]
+    public void BrowserNative_HashChangesWhenAuthenticationIsDisabled()
+    {
+        var enabled = Options();
+        var disabled = enabled with
+        {
+            Enabled = false,
+            NativePromptContinuation = enabled.NativePromptContinuation! with
+            {
+                Enabled = false
+            }
+        };
+
+        Assert.NotEqual(enabled.GetNormalizedHash(), disabled.GetNormalizedHash());
+    }
+
     [Theory]
     [InlineData("id")]
     [InlineData("host")]
@@ -99,6 +127,33 @@ public sealed class BrowserNativeAuthenticationConfigurationTests
         else Assert.Null(result.SelectedCertificate);
     }
 
+    [Fact]
+    public void BrowserNative_DisabledConfigurationNeverSelectsCertificate()
+    {
+        var candidate = new ClientCertificateCandidate(
+            new string('C', 40),
+            "Company C",
+            "Issuer C");
+        var request = new ClientCertificateRequestSnapshot(
+            new Uri("https://bank.example/"),
+            false,
+            [candidate]);
+
+        var result = ClientCertificateRequestMatcher.Match(
+            request,
+            Options() with
+            {
+                Enabled = false,
+                NativePromptContinuation = DormantPrompt()
+            },
+            true);
+
+        Assert.Equal(
+            ClientCertificateRequestMatchStatus.UnauthorizedTarget,
+            result.Status);
+        Assert.Null(result.SelectedCertificate);
+    }
+
     [Theory]
     [InlineData("https://bank.example/", true, true, ClientCertificateRequestMatchStatus.InvalidRequest)]
     [InlineData("http://bank.example/", false, true, ClientCertificateRequestMatchStatus.InvalidRequest)]
@@ -126,4 +181,16 @@ public sealed class BrowserNativeAuthenticationConfigurationTests
             WindowScope: NativePromptWindowScopes.TrustedClientTopLevel,
             ProcessFileName: "UsbWebLauncher.App.exe", InputWindowClass: "Edit", InputControlId: 1010,
             SubmitWindowClass: "Button", SubmitControlId: 1), AuthenticationMode: "BrowserNative");
+
+    private static ClientCertificateNativePromptOptions DormantPrompt() => new(
+        false,
+        "test-pipe",
+        "test-policy",
+        "",
+        "",
+        "",
+        "",
+        "",
+        [],
+        0);
 }

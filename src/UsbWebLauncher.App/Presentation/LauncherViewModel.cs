@@ -1,10 +1,19 @@
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Windows.Input;
+using UsbWebLauncher.App.Configuration;
 using UsbWebLauncher.Core.Authentication;
 using UsbWebLauncher.Core.Coordination;
+using UsbWebLauncher.Core.Devices;
 
 namespace UsbWebLauncher.App.Presentation;
+
+public enum PinCredentialStatus
+{
+    NotSet,
+    Set,
+    ReadFailed
+}
 
 public sealed class LauncherViewModel : INotifyPropertyChanged
 {
@@ -13,12 +22,48 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
     private readonly object _handoffGate = new();
     private bool _businessStartRunning;
     private bool _updateInstallInProgress;
+    private BankFlowDefinition _selectedBankFlow = BankFlowCatalog.ChinaConstructionBank;
+    private bool _bankFlowSwitching;
+    private string? _bankFlowUnavailableMessage;
 
     public bool UpdateInstallInProgress => _updateInstallInProgress;
     private bool IsIdleForUpdate => _initialized && _sessionState == BusinessSessionState.Idle &&
         !_started && !IsBusy && !_businessStartRunning;
     public bool CanInstallUpdate => IsIdleForUpdate && !_updateInstallInProgress;
     public bool CanContinueUpdateInstall => IsIdleForUpdate && _updateInstallInProgress;
+
+    public IReadOnlyList<BankFlowDefinition> BankFlows => BankFlowCatalog.All;
+
+    public BankFlowDefinition SelectedBankFlow
+    {
+        get => _selectedBankFlow;
+        set
+        {
+            if (value is null || value == _selectedBankFlow)
+            {
+                return;
+            }
+
+            if (!CanChangeBank)
+            {
+                RaisePropertyChanged();
+                return;
+            }
+
+            var previous = _selectedBankFlow;
+            _selectedBankFlow = value;
+            RaisePropertyChanged();
+            BankFlowChangeRequested?.Invoke(this, new(previous, value));
+        }
+    }
+
+    public bool IsBankFlowSwitching => _bankFlowSwitching;
+
+    public bool CanChangeBank => !_bankFlowSwitching &&
+        _sessionState == BusinessSessionState.Idle &&
+        !IsBusy &&
+        !_businessStartRunning &&
+        !_updateInstallInProgress;
 
     public bool TryBeginUpdateInstall()
     {
@@ -51,6 +96,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
     {
         lock (_handoffGate) _businessStartRunning = false;
         RaisePropertyChanged(nameof(CanInstallUpdate));
+        RaisePropertyChanged(nameof(CanChangeBank));
     }
 
     public BusinessSessionState SessionState => _sessionState;
@@ -140,30 +186,77 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
     private int _exportCommandRunning;
     private int _activeExportMonth;
     private bool _exportBusy;
+    private int _maintenanceCommandRunning;
     private string _exportStatusText = string.Empty;
     private string _currentPinText = "当前 PIN：未设置";
     private string _currentCompanyText = "启动业务并登录后显示";
 
-    private bool? _availableUsbKey;
+    private UsbKeyDetectionStatus? _usbKeyDetectionStatus;
     private bool _keyDetectionCompleted;
     private bool ShowIdleKeyHint => !_started && _sessionState == BusinessSessionState.Idle;
+    private bool IsPostalSavingsBank =>
+        SelectedBankFlow.Kind == BankFlowKind.PostalSavingsBank;
     public string CompanyCardTitle => ShowIdleKeyHint ? "USB Key 状态" : "当前公司";
-    public string CurrentCompanyText => ShowIdleKeyHint
+    public string CurrentCompanyText => _bankFlowSwitching
+        ? $"正在切换到{SelectedBankFlow.DisplayName}…"
+        : _bankFlowUnavailableMessage is not null
+            ? $"{SelectedBankFlow.DisplayName} Key 识别待配置"
+        : ShowIdleKeyHint
         ? !_keyDetectionCompleted ? "正在检测 USB Key…"
-            : _availableUsbKey switch
-            {
-                true => "已检测到可用 USB Key，点击启动业务开始",
-                false => "未检测到可用 USB Key，请插入",
-                null => "USB Key 检测失败，请重新插拔或重启程序"
-            }
+            : GetIdleUsbKeyHint()
         : _currentCompanyText;
 
     public void UpdateUsbKeyPresence(bool? present)
     {
-        _availableUsbKey = present;
+        UpdateUsbKeyDetectionStatus(present switch
+        {
+            true => UsbKeyDetectionStatus.Ready,
+            false => UsbKeyDetectionStatus.Absent,
+            null => null
+        });
+    }
+
+    public void UpdateUsbKeyDetectionStatus(UsbKeyDetectionStatus? status)
+    {
+        if (_bankFlowUnavailableMessage is not null)
+        {
+            return;
+        }
+
+        _usbKeyDetectionStatus = status;
         _keyDetectionCompleted = true;
         RaisePropertyChanged(nameof(CurrentCompanyText));
         RaisePropertyChanged(nameof(DeviceStatusText));
+    }
+
+    private string GetIdleUsbKeyHint()
+    {
+        if (IsPostalSavingsBank)
+        {
+            return _usbKeyDetectionStatus switch
+            {
+                UsbKeyDetectionStatus.Ready =>
+                    "可用邮储 Key 已就绪，点击启动业务开始",
+                UsbKeyDetectionStatus.PresentButEnvironmentUnavailable =>
+                    "邮储 Key 已连接，但驱动/服务环境不可用",
+                UsbKeyDetectionStatus.Absent =>
+                    "未检测到受支持的邮储 Key，请插入",
+                null => "邮储 Key 检测失败，请重新插拔或重启程序",
+                _ => "邮储 Key 检测失败，请重新插拔或重启程序"
+            };
+        }
+
+        return _usbKeyDetectionStatus switch
+        {
+            UsbKeyDetectionStatus.Ready =>
+                "已检测到可用 USB Key，点击启动业务开始",
+            UsbKeyDetectionStatus.Absent =>
+                "未检测到可用 USB Key，请插入",
+            UsbKeyDetectionStatus.PresentButEnvironmentUnavailable =>
+                "USB Key 已连接，但运行环境不可用",
+            null => "USB Key 检测失败，请重新插拔或重启程序",
+            _ => "USB Key 检测失败，请重新插拔或重启程序"
+        };
     }
 
     public void UpdateCurrentCompany(string text)
@@ -183,19 +276,29 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         _pinCommands = pinCommands ?? throw new ArgumentNullException(nameof(pinCommands));
         ValidateAndSavePinCommand = new AsyncDelegateCommand(
             cancellationToken => _pinCommands.ValidateAndSaveAsync(cancellationToken),
-            () => CanValidateAndSavePin);
+            () => CanValidateAndSavePin,
+            TryBeginMaintenanceCommand,
+            EndMaintenanceCommand);
         ResetPinCommand = new AsyncDelegateCommand(
             cancellationToken => _pinCommands.ResetAsync(cancellationToken),
-            () => CanResetPin);
+            () => CanResetPin,
+            TryBeginMaintenanceCommand,
+            EndMaintenanceCommand);
         DeletePinCommand = new AsyncDelegateCommand(
             cancellationToken => _pinCommands.DeleteAsync(cancellationToken),
-            () => CanDeletePin);
+            () => CanDeletePin,
+            TryBeginMaintenanceCommand,
+            EndMaintenanceCommand);
         InstallNativePromptBrokerCommand = new AsyncDelegateCommand(
             cancellationToken => _brokerCommands.InstallNativePromptBrokerAsync(cancellationToken),
-            () => CanInstallNativePromptBroker);
+            () => CanInstallNativePromptBroker,
+            TryBeginMaintenanceCommand,
+            EndMaintenanceCommand);
         UninstallNativePromptBrokerCommand = new AsyncDelegateCommand(
             cancellationToken => _brokerCommands.UninstallNativePromptBrokerAsync(cancellationToken),
-            () => CanUninstallNativePromptBroker);
+            () => CanUninstallNativePromptBroker,
+            TryBeginMaintenanceCommand,
+            EndMaintenanceCommand);
         StartBusinessCommand = new AsyncDelegateCommand(
             cancellationToken => _startBusiness!(cancellationToken),
             () => CanStartBusiness, TryBeginBusinessStart, EndBusinessStart);
@@ -212,6 +315,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+    public event EventHandler<BankFlowChangedEventArgs>? BankFlowChangeRequested;
 
     public IReadOnlyList<int> ExportNumbers { get; } = Array.AsReadOnly(Enumerable.Range(1, 12).ToArray());
 
@@ -239,21 +343,58 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         ? _authenticationState.Message
         : "本次认证未完成，请检查 USB Key 后重新插入。";
 
-    public string StatusText => SessionStatusText ?? (HasAuthenticationFailure ? AuthenticationFailureMessage : _businessMessage ??
+    public string StatusText => SessionStatusText ??
+        (_bankFlowSwitching ? $"正在切换到{SelectedBankFlow.DisplayName}流程…" :
+        _bankFlowUnavailableMessage ??
+        (HasAuthenticationFailure ? AuthenticationFailureMessage : _businessMessage ??
         (!_initialized ? (_state.CanRetry ? _state.Message : "正在初始化…") :
         !_started ? "业务未启动，请点击“启动业务”。" :
-        _awaitingExplicitStart ? "准备完成后，请点击“启动业务”继续。" : _state.Message));
+        _awaitingExplicitStart ? "准备完成后，请点击“启动业务”继续。" : _state.Message)));
 
-    public string DeviceStatusText => !_started ? !_keyDetectionCompleted ? "正在检测 USB Key…" :
-        _availableUsbKey switch { true => "USB Key 已连接", false => "等待 USB Key", null => "USB Key 检测失败" } :
+    public string DeviceStatusText => _bankFlowSwitching ? "正在切换银行" :
+        _bankFlowUnavailableMessage is not null ? $"{SelectedBankFlow.DisplayName}待配置" :
+        !_started ? !_keyDetectionCompleted ? "正在检测 USB Key…" :
+        GetIdleDeviceStatusText() :
         IsUsbPresent ? "USB Key 已连接" : "等待 USB Key";
 
-    public string IdleTitle => HasAuthenticationFailure ? "本次认证未完成" :
+    private string GetIdleDeviceStatusText()
+    {
+        if (IsPostalSavingsBank)
+        {
+            return _usbKeyDetectionStatus switch
+            {
+                UsbKeyDetectionStatus.Ready => "可用邮储 Key 已就绪",
+                UsbKeyDetectionStatus.PresentButEnvironmentUnavailable =>
+                    "邮储 Key 驱动/服务环境不可用",
+                UsbKeyDetectionStatus.Absent => "等待邮储 Key",
+                null => "邮储 Key 检测失败",
+                _ => "邮储 Key 检测失败"
+            };
+        }
+
+        return _usbKeyDetectionStatus switch
+        {
+            UsbKeyDetectionStatus.Ready => "USB Key 已连接",
+            UsbKeyDetectionStatus.PresentButEnvironmentUnavailable =>
+                "USB Key 环境不可用",
+            UsbKeyDetectionStatus.Absent => "等待 USB Key",
+            null => "USB Key 检测失败",
+            _ => "USB Key 检测失败"
+        };
+    }
+
+    public string IdleTitle => _bankFlowSwitching ? "正在切换银行流程" :
+        _bankFlowUnavailableMessage is not null ? $"{SelectedBankFlow.DisplayName}流程待配置" :
+        HasAuthenticationFailure ? "本次认证未完成" :
         !_initialized ? (_state.CanRetry ? "初始化未完成" : "正在初始化") :
         !_started ? "点击“启动业务”开始" :
         _awaitingExplicitStart ? "等待您继续业务" : "请插入已配置的 USB Key";
 
-    public string IdleDescription => HasAuthenticationFailure
+    public string IdleDescription => _bankFlowSwitching
+        ? "正在停止当前银行流程并清理相关状态。"
+        : _bankFlowUnavailableMessage is not null
+            ? $"请先配置{SelectedBankFlow.DisplayName} Key 的识别信息、登录地址和认证参数。"
+        : HasAuthenticationFailure
         ? "请检查设备和 PIN 设置，再拔出并重新插入 USB Key。"
         : !_initialized ? "请等待初始化完成；如遇错误，可点击重试。" :
         !_started ? "可先完成所需准备，再点击上方按钮启动业务。" :
@@ -272,7 +413,10 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         (_stopBusiness is null || _sessionState == BusinessSessionState.Idle) &&
         (!_started || _awaitingExplicitStart || _state.CanRetry);
 
-    public bool IsBusy => _operationBusy || IsAuthenticationBusy || IsExportBusy;
+    public bool IsBusy => _operationBusy ||
+        IsAuthenticationBusy ||
+        IsExportBusy ||
+        Volatile.Read(ref _maintenanceCommandRunning) != 0;
 
     public bool CanExportDocuments => CanOperate && _exportDocuments is not null &&
         (_stopBusiness is null || _sessionState == BusinessSessionState.Active);
@@ -283,11 +427,18 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
 
     public string CurrentPinText => _currentPinText;
 
-    private bool CanOperate => _initialized && !IsBusy && SessionAllowsOperations && !_updateInstallInProgress;
+    private bool CanOperate => _initialized &&
+        !_bankFlowSwitching &&
+        _bankFlowUnavailableMessage is null &&
+        !IsBusy &&
+        SessionAllowsOperations &&
+        !_updateInstallInProgress;
 
     public AuthenticationStage AuthenticationStage => _authenticationState.Stage;
 
-    public string AuthenticationStatusText => !_isAuthenticationConfigured
+    public string AuthenticationStatusText => _bankFlowUnavailableMessage is not null
+        ? $"PIN 设置不适用：{SelectedBankFlow.DisplayName}认证流程尚未配置。"
+        : !_isAuthenticationConfigured
         ? "PIN 设置不适用：当前配置未启用认证。"
         : !_started ? "可提前设置 PIN；保存后请手动启动业务。"
         : _authenticationState.Message ?? string.Empty;
@@ -326,7 +477,9 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         CanMaintain && _isAuthenticationConfigured &&
         _brokerCommands.CurrentState is { IsRequired: true, IsInstalled: true };
 
-    public string NativePromptBrokerStatusText => !_isAuthenticationConfigured
+    public string NativePromptBrokerStatusText => _bankFlowUnavailableMessage is not null
+        ? $"环境安装不适用：{SelectedBankFlow.DisplayName}认证流程尚未配置。"
+        : !_isAuthenticationConfigured
         ? "环境安装不适用：当前配置未启用认证。"
         : !_brokerCommands.CurrentState.IsRequired ? "当前认证方式无需安装环境。"
         : _brokerCommands.CurrentState.StatusText;
@@ -388,12 +541,95 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         PublishCommandAvailability();
     }
 
-    public void UpdateCurrentPin(string? pin)
+    public void UpdateCurrentPinStatus(PinCredentialStatus status)
     {
-        _currentPinText = string.IsNullOrEmpty(pin)
-            ? "当前 PIN：未设置"
-            : $"当前 PIN：{pin}";
+        _currentPinText = status switch
+        {
+            PinCredentialStatus.NotSet => "当前 PIN：未设置",
+            PinCredentialStatus.Set => "当前 PIN：已设置",
+            PinCredentialStatus.ReadFailed => "当前 PIN：读取失败",
+            _ => throw new ArgumentOutOfRangeException(nameof(status), status, null)
+        };
         RaisePropertyChanged(nameof(CurrentPinText));
+    }
+
+    public void BeginBankFlowSwitch()
+    {
+        _bankFlowSwitching = true;
+        _bankFlowUnavailableMessage = null;
+        ClearBankRuntimeBindings();
+        _state = new(LauncherStage.WaitingForUsb, false, "正在切换银行流程。");
+        _authenticationState = new(
+            AuthenticationStage.WaitingForDevice,
+            null,
+            Message: "正在等待银行流程初始化。");
+        _sessionState = BusinessSessionState.Idle;
+        _initialized = false;
+        _started = false;
+        _awaitingExplicitStart = true;
+        _operationBusy = true;
+        _businessMessage = null;
+        _businessStartRunning = false;
+        _usbKeyDetectionStatus = null;
+        _keyDetectionCompleted = false;
+        _selectedExportNumber = 1;
+        _exportBusy = false;
+        Volatile.Write(ref _exportCommandRunning, 0);
+        Volatile.Write(ref _maintenanceCommandRunning, 0);
+        _exportStatusText = string.Empty;
+        _currentPinText = "当前 PIN：未设置";
+        _currentCompanyText = "启动业务并登录后显示";
+        PublishBankFlowState();
+    }
+
+    public void CompleteBankFlowSwitch(string? unavailableMessage = null)
+    {
+        _bankFlowSwitching = false;
+        _bankFlowUnavailableMessage = string.IsNullOrWhiteSpace(unavailableMessage)
+            ? null
+            : unavailableMessage;
+        if (_bankFlowUnavailableMessage is not null)
+        {
+            _initialized = true;
+            _operationBusy = false;
+            _awaitingExplicitStart = true;
+        }
+        PublishBankFlowState();
+    }
+
+    private void ClearBankRuntimeBindings()
+    {
+        _brokerCommands.StateChanged -= OnNativePromptBrokerStateChanged;
+        _pinCommands = NullLocalPinCommands.Instance;
+        _brokerCommands = NullNativePromptBrokerCommands.Instance;
+        _isAuthenticationConfigured = false;
+        _startBusiness = null;
+        _stopBusiness = null;
+        _exportDocuments = null;
+    }
+
+    private void PublishBankFlowState()
+    {
+        foreach (var property in new[]
+        {
+            nameof(IsBankFlowSwitching),
+            nameof(CanChangeBank),
+            nameof(SessionState),
+            nameof(Stage),
+            nameof(AuthenticationStage),
+            nameof(IsAuthenticationBusy),
+            nameof(IsUsbPresent),
+            nameof(IsBrowserVisible),
+            nameof(IsExportBusy),
+            nameof(ExportStatusText),
+            nameof(CurrentPinText),
+            nameof(SelectedExportNumber),
+            nameof(IsAuthenticationConfigured)
+        })
+        {
+            RaisePropertyChanged(property);
+        }
+        PublishBusinessState();
     }
 
     private bool TryBeginExportCommand()
@@ -402,6 +638,24 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
             return false;
         _activeExportMonth = SelectedExportNumber;
         return true;
+    }
+
+    private bool TryBeginMaintenanceCommand()
+    {
+        if (!CanMaintain ||
+            Interlocked.CompareExchange(ref _maintenanceCommandRunning, 1, 0) != 0)
+        {
+            return false;
+        }
+
+        PublishCommandAvailability();
+        return true;
+    }
+
+    private void EndMaintenanceCommand()
+    {
+        Volatile.Write(ref _maintenanceCommandRunning, 0);
+        PublishCommandAvailability();
     }
 
     private void EndExportCommand()
@@ -451,6 +705,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         RaisePropertyChanged(nameof(UpdateInstallInProgress));
         RaisePropertyChanged(nameof(IsBusy));
         RaisePropertyChanged(nameof(CanRetry));
+        RaisePropertyChanged(nameof(CanChangeBank));
         RaisePropertyChanged(nameof(CanStartBusiness));
         RaisePropertyChanged(nameof(CanStopBusiness));
         RaisePropertyChanged(nameof(BusinessButtonText));

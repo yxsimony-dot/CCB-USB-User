@@ -174,6 +174,7 @@ public sealed class ClientCertificateAuthenticationFlowRouterTests
     [InlineData(ClientCertificateNativePromptStatus.TargetMismatch, ClientCertificateSetupValidationStatus.Incompatible)]
     [InlineData(ClientCertificateNativePromptStatus.TimedOut, ClientCertificateSetupValidationStatus.TimedOut)]
     [InlineData(ClientCertificateNativePromptStatus.Cancelled, ClientCertificateSetupValidationStatus.Cancelled)]
+    [InlineData(ClientCertificateNativePromptStatus.PinRejected, ClientCertificateSetupValidationStatus.PinRejected)]
     public async Task SetupContinuationFailure_PreventsSuccessAndDisposesAttempt(
         ClientCertificateNativePromptStatus promptStatus,
         ClientCertificateSetupValidationStatus expectedStatus)

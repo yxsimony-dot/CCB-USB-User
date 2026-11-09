@@ -10,6 +10,7 @@ public sealed class LauncherCoordinator : IAsyncDisposable
     private readonly IBrowserHost _browserHost;
     private readonly LauncherProfile _profile;
     private readonly ILauncherAuthenticationGate? _authenticationGate;
+    private readonly Func<UsbDeviceDescriptor, bool> _deviceMatcher;
     private readonly SemaphoreSlim _transitionGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly object _stateSync = new();
@@ -31,12 +32,15 @@ public sealed class LauncherCoordinator : IAsyncDisposable
         IUsbDeviceMonitor deviceMonitor,
         IBrowserHost browserHost,
         LauncherProfile profile,
-        ILauncherAuthenticationGate? authenticationGate = null)
+        ILauncherAuthenticationGate? authenticationGate = null,
+        Func<UsbDeviceDescriptor, bool>? deviceMatcher = null)
     {
         _deviceMonitor = deviceMonitor ?? throw new ArgumentNullException(nameof(deviceMonitor));
         _browserHost = browserHost ?? throw new ArgumentNullException(nameof(browserHost));
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _authenticationGate = authenticationGate;
+        _deviceMatcher = deviceMatcher ??
+            (device => UsbDeviceMatcher.IsMatch(device, _profile));
     }
 
     public event EventHandler<LauncherStateChangedEventArgs>? StateChanged;
@@ -288,7 +292,7 @@ public sealed class LauncherCoordinator : IAsyncDisposable
                     _deviceMetadataInvalidated = false;
                 }
 
-                foreach (var device in devices.Where(UsbDeviceMatcher.IsCcbUsbStorMatch))
+                foreach (var device in devices.Where(_deviceMatcher))
                 {
                     _matchedPhysicalInstanceIds.Add(device.InstanceId);
                 }
@@ -728,7 +732,7 @@ public sealed class LauncherCoordinator : IAsyncDisposable
     }
 
     private bool ContainsMatchingDevice(IEnumerable<UsbDeviceDescriptor> devices) =>
-        devices.Any(device => UsbDeviceMatcher.IsMatch(device, _profile));
+        devices.Any(_deviceMatcher);
 
     private void SetFailure(FailedOperation operation, Exception exception)
     {

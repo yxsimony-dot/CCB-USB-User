@@ -781,6 +781,39 @@ public sealed class WebView2BrowserHostTests
     }
 
     [Fact]
+    public async Task ClientCertificateRequest_WhenBrowserSelectionIsRequired_PassesThroughWithoutAttempt()
+    {
+        var control = new RecordingWebViewControl();
+        var handler = new ManualSelectionHandler(
+            ClientCertificateRequestMatchStatus.BrowserSelectionRequired,
+            null);
+        var reporter = new RecordingAuthenticationReporter();
+        var host = new WebView2BrowserHost(control);
+
+        await host.ConfigureClientCertificateAuthenticationAsync(
+            handler,
+            reporter,
+            TimeSpan.FromSeconds(30));
+        await host.InitializeAsync();
+        var navigation = host.NavigateAsync(
+            new Uri("https://corpebank.psbc.com/#/login"));
+
+        var selection = await control.RaiseClientCertificateRequestAsync(
+            new WebClientCertificateRequest(
+                new Uri("https://corpebank.psbc.com/#/login"),
+                false,
+                [new WebClientCertificate("AA11", "CN=Target", "CN=Issuer")]));
+
+        Assert.False(selection.Handled);
+        Assert.Null(selection.SelectedCertificate);
+        Assert.NotNull(selection.Authorization);
+        Assert.Null(reporter.CertificateSelectedAttempt);
+
+        control.CompleteNavigation(1, success: true);
+        await navigation;
+    }
+
+    [Fact]
     public async Task ClientCertificateRequest_WhenHandlerThrows_AlwaysDeniesWithoutFallback()
     {
         var control = new RecordingWebViewControl();
@@ -1624,7 +1657,7 @@ public sealed class WebView2BrowserHostTests
 
     private sealed class ManualSelectionHandler(
         ClientCertificateRequestMatchStatus status,
-        AuthenticationAttempt attempt)
+        AuthenticationAttempt? attempt)
         : IBrowserClientCertificateRequestHandler
     {
         public ValueTask<ClientCertificateRequestMatchResult> HandleAsync(

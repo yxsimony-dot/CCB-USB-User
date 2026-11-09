@@ -85,6 +85,19 @@
                     CornerRadius="8">
                 <StackPanel>
                     <WrapPanel Orientation="Horizontal">
+                        <StackPanel Orientation="Horizontal" Margin="0,0,18,0" VerticalAlignment="Center">
+                            <TextBlock Text="当前银行" Margin="0,0,8,0"
+                                       Foreground="#637083" VerticalAlignment="Center" />
+                            <ComboBox Width="140" Padding="10,7"
+                                      VerticalContentAlignment="Center"
+                                      IsEditable="False"
+                                      ItemsSource="{Binding BankFlows}"
+                                      DisplayMemberPath="DisplayName"
+                                      SelectedItem="{Binding SelectedBankFlow, Mode=TwoWay}"
+                                      IsEnabled="{Binding CanChangeBank}"
+                                      AutomationProperties.Name="当前银行"
+                                      ToolTip="选择本次使用的银行流程" />
+                        </StackPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,14,0">
                             <Button Content="安装环境" Padding="20,9" MinWidth="120"
                                     Command="{Binding InstallNativePromptBrokerCommand}" />

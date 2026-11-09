@@ -8,11 +8,53 @@ namespace UsbWebLauncher.Tests.Coordination;
 public sealed class LauncherCoordinatorTests
 {
     [Fact]
+    public async Task InjectedMatcherEnablesPsbcWithoutChangingDefaultMatcher()
+    {
+        var device = CreateTendyronDevice() with
+        {
+            VolumeLabels = ["PSBC"]
+        };
+        var profile = new LauncherProfile(
+            "https://psbc.example.test/",
+            UsbDetectionStrategy: "psbcUsbKey");
+        var defaultBrowser = new RecordingBrowserHost();
+        await using (var defaultCoordinator = new LauncherCoordinator(
+                         new FakeUsbDeviceMonitor([device]),
+                         defaultBrowser,
+                         profile))
+        {
+            await defaultCoordinator.StartAsync();
+            Assert.Equal(
+                LauncherStage.WaitingForUsb,
+                defaultCoordinator.CurrentState.Stage);
+            Assert.Empty(defaultBrowser.NavigatedTargets);
+        }
+
+        var psbcBrowser = new RecordingBrowserHost();
+        await using var psbcCoordinator = new LauncherCoordinator(
+            new FakeUsbDeviceMonitor([device]),
+            psbcBrowser,
+            profile,
+            deviceMatcher: PsbcUsbKeyMatcher.IsCandidate);
+
+        await psbcCoordinator.StartAsync();
+
+        Assert.Equal(LauncherStage.Ready, psbcCoordinator.CurrentState.Stage);
+        Assert.Single(psbcBrowser.NavigatedTargets);
+    }
+
+    [Fact]
     public async Task CcbMetadataLoss_UnsupportedGateFailsClosedWithoutInventingRemoval()
     {
         var order = new List<string>();
-        var device = CreateMatchingDevice() with { InstanceId = "USB\\VID_9999&PID_9999\\KEY",
-            HardwareIds = ["USB\\VID_9999&PID_9999"], Service = "USBSTOR", CdRomNames = ["CCB"], VolumeLabels = [] };
+        var device = CreateMatchingDevice() with
+        {
+            InstanceId = "USB\\VID_9999&PID_9999\\KEY",
+            HardwareIds = ["USB\\VID_9999&PID_9999"],
+            Service = "USBSTOR",
+            CdRomNames = ["CCB"],
+            VolumeLabels = []
+        };
         var monitor = new FakeUsbDeviceMonitor([device]);
         var browser = new RecordingBrowserHost();
         var gate = new RecordingAuthenticationGate(order, true);

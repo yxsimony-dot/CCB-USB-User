@@ -26,6 +26,7 @@ public static class UsbDeviceMatcher
         return profile.UsbDetectionStrategy switch
         {
             "ccbUsbStor" => IsCcbUsbStorMatch(device),
+            "psbcUsbKey" => false,
             "legacyAllowlist" => profile.GetUsbDeviceAllowlist().Any(options => IsMatch(device, options)),
             _ => false
         };

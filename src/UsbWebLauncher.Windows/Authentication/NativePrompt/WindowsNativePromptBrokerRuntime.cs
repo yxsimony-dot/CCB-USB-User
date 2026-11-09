@@ -675,6 +675,15 @@ internal sealed record NativePromptBrokerPolicyDocument(
     ClientCertificateNativePromptOptions Prompt,
     NativePromptBrokerTrustedClient? TrustedClient = null);
 
+internal sealed record NativePromptBrokerPolicyEntryDocument(
+    string PolicyHash,
+    ClientCertificateNativePromptOptions Prompt);
+
+internal sealed record NativePromptBrokerPolicyPackageDocument(
+    int ProtocolVersion,
+    IReadOnlyList<NativePromptBrokerPolicyEntryDocument?>? Policies,
+    NativePromptBrokerTrustedClient? TrustedClient = null);
+
 internal static class NativePromptBrokerPolicyFile
 {
     private static readonly HashSet<string> ForbiddenSecretFields = new(
@@ -726,6 +735,18 @@ internal static class NativePromptBrokerPolicyFile
             throw new InvalidDataException("Package policy cannot preselect a trusted client.");
         }
 
+        if (IsPolicyPackage(packageJson))
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyPackageDocument(
+                NativePromptProtocol.ProtocolVersion,
+                package.Policies
+                    .Select(entry => new NativePromptBrokerPolicyEntryDocument(
+                        entry.PolicyHash,
+                        entry.Prompt))
+                    .ToArray(),
+                trustedClient));
+        }
+
         return JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyDocument(
             NativePromptProtocol.ProtocolVersion,
             package.PolicyHash,
@@ -740,40 +761,93 @@ internal static class NativePromptBrokerPolicyFile
             throw new InvalidDataException("Native prompt broker policy size is invalid.");
         }
 
-        using var parsed = JsonDocument.Parse(json, new JsonDocumentOptions
-        {
-            AllowTrailingCommas = false,
-            CommentHandling = JsonCommentHandling.Disallow,
-            MaxDepth = 32
-        });
-        RejectSecretFields(parsed.RootElement);
-        NativePromptBrokerPolicyDocument document;
         try
         {
-            document = JsonSerializer.Deserialize<NativePromptBrokerPolicyDocument>(
-                json.Span,
-                new JsonSerializerOptions
+            using var parsed = JsonDocument.Parse(json, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 32
+            });
+            if (parsed.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException("Native prompt broker policy root must be an object.");
+            }
+
+            RejectSecretFields(parsed.RootElement);
+            var hasPolicies = parsed.RootElement.TryGetProperty("Policies", out _);
+            var hasLegacyFields =
+                parsed.RootElement.TryGetProperty("PolicyHash", out _) ||
+                parsed.RootElement.TryGetProperty("Prompt", out _);
+            if (hasPolicies && hasLegacyFields)
+            {
+                throw new InvalidDataException(
+                    "Native prompt broker policy cannot mix package and legacy policy fields.");
+            }
+
+            var serializerOptions = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = false,
+                UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
+            };
+            NativePromptBrokerPolicy policy;
+            int protocolVersion;
+            NativePromptBrokerTrustedClient? trustedClient;
+            if (hasPolicies)
+            {
+                var document = JsonSerializer.Deserialize<NativePromptBrokerPolicyPackageDocument>(
+                        json.Span,
+                        serializerOptions)
+                    ?? throw new InvalidDataException("Native prompt broker policy is empty.");
+                if (document.Policies is null || document.Policies.Any(entry => entry is null))
                 {
-                    PropertyNameCaseInsensitive = false,
-                    UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
-                }) ?? throw new InvalidDataException("Native prompt broker policy is empty.");
+                    throw new InvalidDataException("Native prompt broker policy list is invalid.");
+                }
+
+                policy = new NativePromptBrokerPolicy(
+                    document.Policies
+                        .Select(entry => new NativePromptBrokerPolicyEntry(
+                            entry!.PolicyHash,
+                            entry.Prompt))
+                        .ToArray(),
+                    document.TrustedClient);
+                protocolVersion = document.ProtocolVersion;
+                trustedClient = document.TrustedClient;
+            }
+            else
+            {
+                var document = JsonSerializer.Deserialize<NativePromptBrokerPolicyDocument>(
+                        json.Span,
+                        serializerOptions)
+                    ?? throw new InvalidDataException("Native prompt broker policy is empty.");
+                policy = new NativePromptBrokerPolicy(
+                    document.PolicyHash,
+                    document.Prompt,
+                    document.TrustedClient);
+                protocolVersion = document.ProtocolVersion;
+                trustedClient = document.TrustedClient;
+            }
+
+            if (protocolVersion != NativePromptProtocol.ProtocolVersion ||
+                !policy.IsPackageValid ||
+                (trustedClient is not null && !trustedClient.IsValid))
+            {
+                throw new InvalidDataException("Native prompt broker policy is invalid.");
+            }
+
+            return policy;
         }
         catch (JsonException exception)
         {
             throw new InvalidDataException("Native prompt broker policy JSON is invalid.", exception);
         }
-        var policy = new NativePromptBrokerPolicy(
-            document.PolicyHash,
-            document.Prompt,
-            document.TrustedClient);
-        if (document.ProtocolVersion != NativePromptProtocol.ProtocolVersion ||
-            !policy.IsPackageValid ||
-            (document.TrustedClient is not null && !document.TrustedClient.IsValid))
-        {
-            throw new InvalidDataException("Native prompt broker policy is invalid.");
-        }
+    }
 
-        return policy;
+    private static bool IsPolicyPackage(ReadOnlyMemory<byte> json)
+    {
+        using var parsed = JsonDocument.Parse(json);
+        return parsed.RootElement.ValueKind == JsonValueKind.Object &&
+               parsed.RootElement.TryGetProperty("Policies", out _);
     }
 
     private static void RejectSecretFields(JsonElement element)
@@ -825,7 +899,7 @@ internal static class WindowsNativePromptBrokerRuntime
             new WindowsNativePromptExecutor());
         var host = new WindowsNativePromptBrokerHost(
             server,
-            policy.Prompt.BrokerPipeName,
+            policy.BrokerPipeName,
             updateFinalizer: new WindowsNativePromptBrokerUpdateFinalizer());
         await host.RunAsync(cancellationToken).ConfigureAwait(false);
         return 0;

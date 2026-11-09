@@ -51,7 +51,8 @@ public sealed record ClientCertificateAuthenticationOptions(
     ClientCertificateTokenUnlockOptions? TokenUnlock = null,
     ClientCertificateNativePromptOptions? NativePromptContinuation = null,
     IReadOnlyList<ClientCertificateEndpointOptions>? AdditionalEndpoints = null,
-    string AuthenticationMode = "ConfiguredToken")
+    string AuthenticationMode = "ConfiguredToken",
+    bool Enabled = true)
 {
     public bool UsesBrowserNativeAuthentication => AuthenticationMode == "BrowserNative";
 
@@ -95,6 +96,11 @@ public sealed record ClientCertificateAuthenticationOptions(
             .OrderBy(endpoint => endpoint.Host, StringComparer.Ordinal)
             .ThenBy(endpoint => endpoint.Port)
             .ToArray() ?? [];
+
+        if (!Enabled)
+        {
+            fields.Add("AuthenticationDisabled");
+        }
 
         if (NativePromptContinuation is null && additionalEndpoints.Length == 0)
         {
@@ -234,4 +240,5 @@ public static class NativePromptWindowScopes
     public const string TopLevelProcess = "TopLevelProcess";
     public const string TrustedClientDescendant = "TrustedClientDescendant";
     public const string TrustedClientTopLevel = "TrustedClientTopLevel";
+    public const string TrustedClientStrictTopLevel = "TrustedClientStrictTopLevel";
 }

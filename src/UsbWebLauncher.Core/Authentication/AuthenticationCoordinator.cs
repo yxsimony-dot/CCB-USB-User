@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using UsbWebLauncher.Core.Configuration;
+using UsbWebLauncher.Core.Devices;
 
 namespace UsbWebLauncher.Core.Authentication;
 
@@ -14,6 +16,9 @@ public sealed class AuthenticationCoordinator :
     private readonly IClientCertificateValidationStampStore _stampStore;
     private readonly IClientCertificateTokenUnlocker _unlocker;
     private readonly IClientCertificateNativePromptContinuation? _nativePromptContinuation;
+    private readonly IPsbcAuthenticationRuntimeContext? _psbcRuntimeContext;
+    private readonly IPsbcAuthenticationObserver? _psbcAuthenticationObserver;
+    private readonly EventHandler? _psbcRuntimeContextChangedHandler;
     private readonly SemaphoreSlim _transitionGate = new(1, 1);
     private readonly object _stateSync = new();
     private readonly object _notificationSync = new();
@@ -26,27 +31,43 @@ public sealed class AuthenticationCoordinator :
     private IClientCertificateNativePromptAttempt? _nativePromptAttempt;
     private AuthenticationAttempt? _activeAttempt;
     private ClientCertificateSelectionAuthorization? _selectionAuthorization;
+    private CancellationTokenSource? _psbcArmCancellation;
+    private PsbcAuthenticationBinding? _psbcPreparedBinding;
+    private PsbcAuthenticationBinding? _psbcAttemptBinding;
     private NavigationCycleBinding? _navigationBinding;
     private bool _devicePresent;
     private bool _attempted;
+    private bool _psbcAttemptConsumed;
     private bool _pinReuseBlocked;
     private bool _validationStampPending;
     private bool _disposed;
+    private int _psbcCleanupQueued;
     private long _nextCycleId;
     private long _nextCertificateRequestId;
+    private long _psbcCycleStartedTimestamp;
+    private UsbKeyVendorFamily? _psbcCycleVendorFamily;
 
     public AuthenticationCoordinator(
         ClientCertificateAuthenticationOptions authentication,
         IClientCertificatePinStore pinStore,
         IClientCertificateValidationStampStore stampStore,
         IClientCertificateTokenUnlocker unlocker,
-        IClientCertificateNativePromptContinuation? nativePromptContinuation = null)
+        IClientCertificateNativePromptContinuation? nativePromptContinuation = null,
+        IPsbcAuthenticationRuntimeContext? psbcRuntimeContext = null,
+        IPsbcAuthenticationObserver? psbcAuthenticationObserver = null)
     {
         _authentication = authentication ?? throw new ArgumentNullException(nameof(authentication));
         _pinStore = pinStore ?? throw new ArgumentNullException(nameof(pinStore));
         _stampStore = stampStore ?? throw new ArgumentNullException(nameof(stampStore));
         _unlocker = unlocker ?? throw new ArgumentNullException(nameof(unlocker));
         _nativePromptContinuation = nativePromptContinuation;
+        _psbcRuntimeContext = psbcRuntimeContext;
+        _psbcAuthenticationObserver = psbcAuthenticationObserver;
+        if (_psbcRuntimeContext is not null)
+        {
+            _psbcRuntimeContextChangedHandler = OnPsbcRuntimeContextChanged;
+            _psbcRuntimeContext.Changed += _psbcRuntimeContextChangedHandler;
+        }
     }
 
     public event EventHandler<AuthenticationStateChangedEventArgs>? StateChanged;
@@ -64,7 +85,7 @@ public sealed class AuthenticationCoordinator :
                 _navigationBinding = null;
                 if (_activeAttempt is not null)
                 {
-                    await EndCycleWithFailureAsync(AuthenticationErrorCategory.UnknownFailure, null).ConfigureAwait(false);
+                    await EndCycleWithFailureAsync(AuthenticationErrorCategory.Cancelled, null).ConfigureAwait(false);
                 }
             }
         }
@@ -125,12 +146,14 @@ public sealed class AuthenticationCoordinator :
 
                 _devicePresent = false;
                 _attempted = false;
+                _psbcAttemptConsumed = false;
                 _activeAttempt = null;
                 await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
                 SetState(new(
                     AuthenticationStage.WaitingForDevice,
                     CurrentState.InsertionCycleId,
-                    Message: "Waiting for the configured security device."));
+                    AuthenticationErrorCategory.DeviceUnavailable,
+                    Message: GetFailureMessage(AuthenticationErrorCategory.DeviceUnavailable)));
                 return;
             }
 
@@ -165,15 +188,38 @@ public sealed class AuthenticationCoordinator :
             if (_businessSuspended || request.BrowserOperationId is not long browserOperationId ||
                 _navigationBinding is not { } navigationBinding ||
                 navigationBinding.BrowserOperationId != browserOperationId ||
-                CurrentState.InsertionCycleId != navigationBinding.CycleId)
+                CurrentState.InsertionCycleId != navigationBinding.CycleId ||
+                (_psbcRuntimeContext is not null && _psbcAttemptConsumed))
             {
                 return ClientCertificateRequestMatchResult.InvalidRequest();
             }
 
-            var result = ClientCertificateRequestMatcher.Match(
-                request,
-                _authentication,
-                HasPreparedAuthentication);
+            var result = _psbcRuntimeContext is null
+                ? ClientCertificateRequestMatcher.Match(
+                    request,
+                    _authentication,
+                    HasPreparedAuthentication)
+                : MatchPsbcCertificateRequest(request);
+
+            if (result.Status == ClientCertificateRequestMatchStatus.BrowserSelectionRequired)
+            {
+                return result;
+            }
+
+            if (_psbcRuntimeContext is not null)
+            {
+                _psbcAttemptConsumed = true;
+                if (result.Status is
+                    ClientCertificateRequestMatchStatus.CertificateMissing or
+                    ClientCertificateRequestMatchStatus.CertificateConflict)
+                {
+                    await EndCycleWithFailureAsync(
+                            MapRequestFailure(result.Status),
+                            null)
+                        .ConfigureAwait(false);
+                    return result;
+                }
+            }
 
             if (result.Status == ClientCertificateRequestMatchStatus.Selected ||
                 result.Status == ClientCertificateRequestMatchStatus.CertificateMissing ||
@@ -188,6 +234,7 @@ public sealed class AuthenticationCoordinator :
                     CurrentState.InsertionCycleId!.Value,
                     ++_nextCertificateRequestId,
                     browserOperationId);
+                _psbcAttemptBinding = _psbcPreparedBinding;
                 SetState(new(
                     AuthenticationStage.Authenticating,
                     CurrentState.InsertionCycleId,
@@ -282,9 +329,13 @@ public sealed class AuthenticationCoordinator :
         try
         {
             ThrowIfDisposed();
-            if (_businessSuspended || !_devicePresent || !HasPreparedAuthentication ||
+            var canUsePsbcBrowserSelection = CanUsePsbcBrowserCertificateSelection;
+            if (_businessSuspended || !_devicePresent ||
+                (!HasPreparedAuthentication && !canUsePsbcBrowserSelection) ||
+                (_psbcRuntimeContext is not null && _psbcAttemptConsumed) ||
                 (CurrentState.Stage != AuthenticationStage.AwaitingCertificate &&
-                 !(_browserNativePrepared && CurrentState.Stage == AuthenticationStage.Ready)) ||
+                 !(_browserNativePrepared && CurrentState.Stage == AuthenticationStage.Ready) &&
+                 !canUsePsbcBrowserSelection) ||
                 CurrentState.InsertionCycleId is not long cycleId)
             {
                 return;
@@ -321,7 +372,7 @@ public sealed class AuthenticationCoordinator :
             {
                 if (!_disposed && IsCurrentAttempt(attempt))
                 {
-                    await EndCycleWithFailureAsync(AuthenticationErrorCategory.UnknownFailure, null)
+                    await EndCycleWithFailureAsync(AuthenticationErrorCategory.Cancelled, null)
                         .ConfigureAwait(false);
                 }
 
@@ -344,29 +395,85 @@ public sealed class AuthenticationCoordinator :
                 return null;
             }
 
-            if (_selectionAuthorization is not null)
+            if (Volatile.Read(ref _selectionAuthorization) is { } existingAuthorization)
             {
-                return _selectionAuthorization;
+                return existingAuthorization;
             }
 
             if (_authentication.NativePromptContinuation is not { Enabled: true })
             {
-                return _selectionAuthorization = new ClientCertificateSelectionAuthorization();
+                var authorization = new ClientCertificateSelectionAuthorization();
+                Interlocked.Exchange(ref _selectionAuthorization, authorization);
+                if (!IsCurrentAttempt(attempt))
+                {
+                    authorization.Revoke();
+                    Interlocked.CompareExchange(
+                        ref _selectionAuthorization,
+                        null,
+                        authorization);
+                    return null;
+                }
+
+                return authorization;
             }
 
-            if (_nativePromptContinuation is null || _continuationPin is null)
+            var continuationPin = Volatile.Read(ref _continuationPin);
+            if (_nativePromptContinuation is null || continuationPin is null)
             {
                 await EndCycleWithFailureAsync(AuthenticationErrorCategory.UnknownFailure, null)
                     .ConfigureAwait(false);
                 return null;
             }
 
+            CancellationTokenSource? armCancellation = null;
+            var armToken = cancellationToken;
+            if (_psbcRuntimeContext is not null)
+            {
+                if (!IsCurrentPsbcAttempt())
+                {
+                    await EndCycleWithFailureAsync(
+                            GetPsbcContextFailureCategory(),
+                            null)
+                        .ConfigureAwait(false);
+                    return null;
+                }
+
+                armCancellation =
+                    CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken);
+                var previousCancellation = Interlocked.Exchange(
+                    ref _psbcArmCancellation,
+                    armCancellation);
+                Cancel(previousCancellation);
+                previousCancellation?.Dispose();
+                armToken = armCancellation.Token;
+                if (!IsCurrentPsbcAttempt())
+                {
+                    Cancel(armCancellation);
+                }
+            }
+
             ClientCertificateNativePromptArmResult armResult;
             try
             {
                 armResult = await _nativePromptContinuation
-                    .ArmAsync(_authentication, attempt, _continuationPin, cancellationToken)
+                    .ArmAsync(
+                        _authentication,
+                        attempt,
+                        continuationPin,
+                        armToken)
                     .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                var category = cancellationToken.IsCancellationRequested
+                    ? AuthenticationErrorCategory.Cancelled
+                    : _psbcRuntimeContext is not null
+                        ? GetPsbcContextFailureCategory()
+                        : AuthenticationErrorCategory.Cancelled;
+                await EndCycleWithFailureAsync(category, null)
+                    .ConfigureAwait(false);
+                return null;
             }
             catch
             {
@@ -377,6 +484,14 @@ public sealed class AuthenticationCoordinator :
             finally
             {
                 DisposeContinuationPin();
+                if (armCancellation is not null)
+                {
+                    Interlocked.CompareExchange(
+                        ref _psbcArmCancellation,
+                        null,
+                        armCancellation);
+                    armCancellation.Dispose();
+                }
             }
 
             if (!armResult.IsArmed)
@@ -401,10 +516,52 @@ public sealed class AuthenticationCoordinator :
                 return null;
             }
 
-            _nativePromptAttempt = armResult.Attempt;
-            _selectionAuthorization = new ClientCertificateSelectionAuthorization();
+            if (!IsCurrentAttempt(attempt))
+            {
+                await DisposeNativePromptAttemptAsync(armResult.Attempt!).ConfigureAwait(false);
+                if (_psbcRuntimeContext is not null)
+                {
+                    await EndCycleWithFailureAsync(
+                            GetPsbcContextFailureCategory(),
+                            null)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
+                    _activeAttempt = null;
+                }
+
+                return null;
+            }
+
+            Interlocked.Exchange(ref _nativePromptAttempt, armResult.Attempt);
+            var selectionAuthorization =
+                new ClientCertificateSelectionAuthorization();
+            Interlocked.Exchange(
+                ref _selectionAuthorization,
+                selectionAuthorization);
+            if (!IsCurrentAttempt(attempt))
+            {
+                selectionAuthorization.Revoke();
+                if (_psbcRuntimeContext is not null)
+                {
+                    await EndCycleWithFailureAsync(
+                            GetPsbcContextFailureCategory(),
+                            null)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
+                    _activeAttempt = null;
+                }
+
+                return null;
+            }
+
             _ = ObserveNativePromptCompletionAsync(attempt, armResult.Attempt!);
-            return _selectionAuthorization;
+            return selectionAuthorization;
         }
         finally
         {
@@ -543,12 +700,24 @@ public sealed class AuthenticationCoordinator :
         {
             ThrowIfDisposed();
             _pinReuseBlocked = false;
-            _attempted = false;
+            var psbcAttemptConsumed =
+                _psbcRuntimeContext is not null && _psbcAttemptConsumed;
+            _attempted = psbcAttemptConsumed;
             _activeAttempt = null;
             await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
             if (_devicePresent)
             {
-                await StartCycleAsync(++_nextCycleId, cancellationToken).ConfigureAwait(false);
+                if (psbcAttemptConsumed)
+                {
+                    SetState(new(
+                        AuthenticationStage.Ready,
+                        CurrentState.InsertionCycleId,
+                        Message: "PIN saved. Restart the business session or reinsert the USB Key to authenticate again."));
+                }
+                else
+                {
+                    await StartCycleAsync(++_nextCycleId, cancellationToken).ConfigureAwait(false);
+                }
             }
             else
             {
@@ -580,6 +749,14 @@ public sealed class AuthenticationCoordinator :
             _disposed = true;
         }
 
+        if (_psbcRuntimeContext is not null &&
+            _psbcRuntimeContextChangedHandler is not null)
+        {
+            _psbcRuntimeContext.Changed -=
+                _psbcRuntimeContextChangedHandler;
+        }
+        RevokePsbcAuthenticationResourcesImmediately();
+
         await _transitionGate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -595,6 +772,7 @@ public sealed class AuthenticationCoordinator :
     {
         if (_pinReuseBlocked)
         {
+            BeginPsbcObservationCycle();
             SetState(new(
                 AuthenticationStage.RequiresPinSetup,
                 cycleId,
@@ -609,6 +787,7 @@ public sealed class AuthenticationCoordinator :
         }
 
         _attempted = true;
+        BeginPsbcObservationCycle();
         if (_authentication.UsesBrowserNativeAuthentication)
         {
             await PrepareBrowserNativeAuthenticationAsync(cycleId, cancellationToken).ConfigureAwait(false);
@@ -754,22 +933,64 @@ public sealed class AuthenticationCoordinator :
             return;
         }
 
+        if (_psbcRuntimeContext is not null)
+        {
+            if (!TryCreatePsbcBinding(
+                    _psbcRuntimeContext.Current,
+                    out _psbcPreparedBinding))
+            {
+                await EndCycleWithFailureAsync(
+                        GetPsbcContextFailureCategory(),
+                        null)
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
+
+        ClientCertificateValidationStamp? stamp;
         try
         {
+            stamp = await _stampStore.ReadAsync(_authentication.Id, cancellationToken)
+                .ConfigureAwait(false);
+            var hasMatchingStamp = HasMatchingStamp(stamp);
+            var hasPendingStamp = HasPendingStamp(stamp);
+            if (!hasMatchingStamp && !hasPendingStamp)
+            {
+                SetState(new(
+                    AuthenticationStage.RequiresPinSetup,
+                    cycleId,
+                    stamp is null
+                        ? AuthenticationErrorCategory.CredentialsUnavailable
+                        : AuthenticationErrorCategory.ValidationStampInvalid,
+                    Message: "未设置邮储 PIN；登录网站仍会打开，自动认证暂不可用。"));
+                return;
+            }
+
             using var pin = await _pinStore.ReadAsync(_authentication.CredentialTargetName, cancellationToken)
                 .ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            if (_psbcRuntimeContext is not null &&
+                !IsCurrentPsbcBinding(_psbcPreparedBinding))
+            {
+                await EndCycleWithFailureAsync(
+                        GetPsbcContextFailureCategory(),
+                        null)
+                    .ConfigureAwait(false);
+                return;
+            }
+
             if (pin is null || pin.AsMemory().IsEmpty)
             {
                 SetState(new(AuthenticationStage.RequiresPinSetup, cycleId,
                     AuthenticationErrorCategory.CredentialsUnavailable,
-                    Message: "未找到已保存的 PIN，请先设置 PIN，再启动业务。"));
+                    Message: "未设置邮储 PIN；登录网站仍会打开，自动认证暂不可用。"));
                 return;
             }
 
-            // No local CSP, container, certificate identity, or per-Key validation stamp is consulted.
-            // The browser and bank perform authentication using the actual certificate request.
-            _continuationPin = ClientCertificatePin.CopyOf(pin.AsMemory());
+            _validationStampPending = hasPendingStamp;
+            Interlocked.Exchange(
+                ref _continuationPin,
+                ClientCertificatePin.CopyOf(pin.AsMemory()))?.Dispose();
             _browserNativePrepared = true;
             SetState(new(AuthenticationStage.AwaitingCertificate, cycleId,
                 Message: "已读取统一 PIN，正在打开银行登录页面。"));
@@ -871,11 +1092,21 @@ public sealed class AuthenticationCoordinator :
         _browserNativePrepared = false;
         _validationStampPending = false;
         _navigationBinding = null;
-        _selectionAuthorization?.Revoke();
-        _selectionAuthorization = null;
+        _psbcPreparedBinding = null;
+        _psbcAttemptBinding = null;
+        var armCancellation = Interlocked.Exchange(
+            ref _psbcArmCancellation,
+            null);
+        Cancel(armCancellation);
+        armCancellation?.Dispose();
+        var selectionAuthorization = Interlocked.Exchange(
+            ref _selectionAuthorization,
+            null);
+        selectionAuthorization?.Revoke();
         DisposeContinuationPin();
-        var nativePromptAttempt = _nativePromptAttempt;
-        _nativePromptAttempt = null;
+        var nativePromptAttempt = Interlocked.Exchange(
+            ref _nativePromptAttempt,
+            null);
         var session = _unlockSession;
         _unlockSession = null;
         try
@@ -893,8 +1124,7 @@ public sealed class AuthenticationCoordinator :
 
     private void DisposeContinuationPin()
     {
-        var pin = _continuationPin;
-        _continuationPin = null;
+        var pin = Interlocked.Exchange(ref _continuationPin, null);
         pin?.Dispose();
     }
 
@@ -943,6 +1173,21 @@ public sealed class AuthenticationCoordinator :
                 return;
             }
 
+            if (result.Status == ClientCertificateNativePromptStatus.PinRejected)
+            {
+                _pinReuseBlocked = true;
+                await ClearRejectedPinAsync().ConfigureAwait(false);
+                await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
+                _activeAttempt = null;
+                SetState(new(
+                    AuthenticationStage.RequiresPinSetup,
+                    CurrentState.InsertionCycleId,
+                    AuthenticationErrorCategory.PinRejected,
+                    result.PublicErrorCode,
+                    "The stored PIN was rejected and must be set up again."));
+                return;
+            }
+
             await EndCycleWithFailureAsync(
                     MapNativePromptFailure(result.Status),
                     result.PublicErrorCode)
@@ -955,21 +1200,316 @@ public sealed class AuthenticationCoordinator :
         }
     }
 
+    private ClientCertificateRequestMatchResult MatchPsbcCertificateRequest(
+        ClientCertificateRequestSnapshot request)
+    {
+        var snapshot = _psbcRuntimeContext!.Current;
+        var selection = PsbcClientCertificateSelector.Select(
+            request,
+            _authentication,
+            new(
+                snapshot.IsPostalSavingsBank,
+                snapshot.OwnerSessionId,
+                snapshot.OwnerRevision,
+                snapshot.CurrentSessionId,
+                snapshot.CurrentRevision,
+                snapshot.ReadyKey,
+                DateTimeOffset.UtcNow,
+                snapshot.IsSessionCurrent,
+                snapshot.OwnsCurrentRuntime));
+
+        if (selection.Status == PsbcClientCertificateSelectionStatus.Selected)
+        {
+            if (CanUsePsbcBrowserCertificateSelection)
+            {
+                return ClientCertificateRequestMatchResult.BrowserSelectionRequired();
+            }
+
+            if (!HasPreparedAuthentication ||
+                !IsCurrentPsbcBinding(_psbcPreparedBinding))
+            {
+                return ClientCertificateRequestMatchResult.TokenNotUnlocked();
+            }
+        }
+
+        return selection.Status switch
+        {
+            PsbcClientCertificateSelectionStatus.Selected =>
+                ClientCertificateRequestMatchResult.Selected(
+                    selection.SelectedCertificate!),
+            PsbcClientCertificateSelectionStatus.InvalidRequest =>
+                ClientCertificateRequestMatchResult.InvalidRequest(),
+            PsbcClientCertificateSelectionStatus.CertificateMissing =>
+                ClientCertificateRequestMatchResult.CertificateMissing(),
+            PsbcClientCertificateSelectionStatus.CertificateConflict =>
+                ClientCertificateRequestMatchResult.CertificateConflict(),
+            PsbcClientCertificateSelectionStatus.KeyNotReady =>
+                ClientCertificateRequestMatchResult.TokenNotUnlocked(),
+            _ => ClientCertificateRequestMatchResult.UnauthorizedTarget()
+        };
+    }
+
+    private void OnPsbcRuntimeContextChanged(
+        object? sender,
+        EventArgs eventArgs)
+    {
+        if (!ReferenceEquals(sender, _psbcRuntimeContext) || IsDisposed())
+        {
+            return;
+        }
+
+        var preparedBinding = Volatile.Read(ref _psbcPreparedBinding);
+        var attemptBinding = Volatile.Read(ref _psbcAttemptBinding);
+        var hadResources =
+            preparedBinding is not null ||
+            attemptBinding is not null ||
+            Volatile.Read(ref _selectionAuthorization) is not null ||
+            Volatile.Read(ref _continuationPin) is not null ||
+            Volatile.Read(ref _psbcArmCancellation) is not null ||
+            Volatile.Read(ref _nativePromptAttempt) is not null;
+        var failureCategory = GetPsbcContextFailureCategory();
+        RevokePsbcAuthenticationResourcesImmediately();
+        if (!hadResources ||
+            Interlocked.Exchange(ref _psbcCleanupQueued, 1) != 0)
+        {
+            return;
+        }
+
+        _ = CleanupInvalidPsbcContextAsync(
+            preparedBinding,
+            attemptBinding,
+            failureCategory);
+    }
+
+    private void RevokePsbcAuthenticationResourcesImmediately()
+    {
+        var authorization = Interlocked.Exchange(
+            ref _selectionAuthorization,
+            null);
+        authorization?.Revoke();
+        DisposeContinuationPin();
+        var armCancellation = Interlocked.Exchange(
+            ref _psbcArmCancellation,
+            null);
+        Cancel(armCancellation);
+        var nativePromptAttempt = Interlocked.Exchange(
+            ref _nativePromptAttempt,
+            null);
+        if (nativePromptAttempt is not null)
+        {
+            _ = DisposeNativePromptAttemptAsync(nativePromptAttempt).AsTask();
+        }
+    }
+
+    private async Task CleanupInvalidPsbcContextAsync(
+        PsbcAuthenticationBinding? preparedBinding,
+        PsbcAuthenticationBinding? attemptBinding,
+        AuthenticationErrorCategory failureCategory)
+    {
+        try
+        {
+            await _transitionGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                var ownsInvalidatedCycle =
+                    preparedBinding is not null &&
+                    ReferenceEquals(_psbcPreparedBinding, preparedBinding) ||
+                    attemptBinding is not null &&
+                    ReferenceEquals(_psbcAttemptBinding, attemptBinding);
+                if (!ownsInvalidatedCycle)
+                {
+                    return;
+                }
+
+                await EndCycleWithFailureAsync(
+                        failureCategory,
+                        null)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _transitionGate.Release();
+                PublishPendingStateChanges();
+            }
+        }
+        catch
+        {
+            // Context invalidation already revoked all sensitive resources.
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _psbcCleanupQueued, 0);
+        }
+    }
+
+    private bool IsCurrentPsbcAttempt() =>
+        IsCurrentPsbcBinding(_psbcAttemptBinding);
+
+    private AuthenticationErrorCategory GetPsbcContextFailureCategory()
+    {
+        if (_psbcRuntimeContext is null)
+        {
+            return AuthenticationErrorCategory.Cancelled;
+        }
+
+        var snapshot = _psbcRuntimeContext.Current;
+        if (!snapshot.IsPostalSavingsBank)
+        {
+            return AuthenticationErrorCategory.BankChanged;
+        }
+
+        if (!snapshot.IsSessionCurrent ||
+            !snapshot.OwnsCurrentRuntime ||
+            snapshot.OwnerSessionId <= 0 ||
+            snapshot.OwnerRevision <= 0 ||
+            snapshot.OwnerSessionId != snapshot.CurrentSessionId ||
+            snapshot.OwnerRevision != snapshot.CurrentRevision)
+        {
+            return AuthenticationErrorCategory.Cancelled;
+        }
+
+        return AuthenticationErrorCategory.DeviceUnavailable;
+    }
+
+    private bool CanUsePsbcBrowserCertificateSelection =>
+        _psbcRuntimeContext is not null &&
+        _devicePresent &&
+        CurrentState.Stage == AuthenticationStage.RequiresPinSetup &&
+        IsCurrentPsbcBinding(_psbcPreparedBinding);
+
+    private bool IsCurrentPsbcBinding(
+        PsbcAuthenticationBinding? binding)
+    {
+        if (_psbcRuntimeContext is null)
+        {
+            return true;
+        }
+
+        if (binding is null)
+        {
+            return false;
+        }
+
+        var snapshot = _psbcRuntimeContext.Current;
+        return snapshot.IsValid &&
+            snapshot.ContextRevision == binding.ContextRevision &&
+            snapshot.OwnerSessionId == binding.SessionId &&
+            snapshot.OwnerRevision == binding.Revision &&
+            snapshot.ReadyKey is { } readyKey &&
+            readyKey.VendorFamily == binding.VendorFamily &&
+            string.Equals(
+                readyKey.PhysicalInstanceId,
+                binding.PhysicalInstanceId,
+                StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                readyKey.TokenIdentity,
+                binding.TokenIdentity,
+                StringComparison.Ordinal);
+    }
+
+    private static bool TryCreatePsbcBinding(
+        PsbcAuthenticationRuntimeSnapshot snapshot,
+        out PsbcAuthenticationBinding? binding)
+    {
+        if (!snapshot.IsValid || snapshot.ReadyKey is not { } readyKey)
+        {
+            binding = null;
+            return false;
+        }
+
+        binding = new(
+            snapshot.ContextRevision,
+            snapshot.OwnerSessionId,
+            snapshot.OwnerRevision,
+            readyKey.VendorFamily!.Value,
+            readyKey.PhysicalInstanceId!,
+            readyKey.TokenIdentity!);
+        return true;
+    }
+
+    private static void Cancel(CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null)
+        {
+            return;
+        }
+
+        try
+        {
+            cancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
     private sealed record NavigationCycleBinding(long BrowserOperationId, long CycleId);
+
+    private sealed record PsbcAuthenticationBinding(
+        long ContextRevision,
+        long SessionId,
+        long Revision,
+        UsbKeyVendorFamily VendorFamily,
+        string PhysicalInstanceId,
+        string TokenIdentity);
 
     private void SetState(AuthenticationState state)
     {
         CurrentState = state;
+        RecordPsbcAuthenticationObservation(state);
         lock (_notificationSync)
         {
             _pendingStateChanges.Enqueue(state);
         }
     }
 
+    private void BeginPsbcObservationCycle()
+    {
+        if (_psbcRuntimeContext is null)
+        {
+            return;
+        }
+
+        _psbcCycleStartedTimestamp = Stopwatch.GetTimestamp();
+        _psbcCycleVendorFamily =
+            _psbcRuntimeContext.Current.ReadyKey?.VendorFamily;
+    }
+
+    private void RecordPsbcAuthenticationObservation(
+        AuthenticationState state)
+    {
+        if (_psbcRuntimeContext is null ||
+            _psbcAuthenticationObserver is null ||
+            _psbcCycleStartedTimestamp == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _psbcAuthenticationObserver.Record(new(
+                state.Stage,
+                "psbc",
+                _psbcCycleVendorFamily,
+                state.ErrorCategory,
+                Stopwatch.GetElapsedTime(_psbcCycleStartedTimestamp)));
+        }
+        catch
+        {
+            // Observability must never change authentication behavior.
+        }
+    }
+
     private bool IsCurrentAttempt(AuthenticationAttempt attempt) =>
         _devicePresent &&
         CurrentState.Stage == AuthenticationStage.Authenticating &&
-        Equals(_activeAttempt, attempt);
+        Equals(_activeAttempt, attempt) &&
+        (_psbcRuntimeContext is null || IsCurrentPsbcAttempt());
 
     private void PublishPendingStateChanges()
     {
@@ -1031,13 +1571,19 @@ public sealed class AuthenticationCoordinator :
         ClientCertificateNativePromptArmStatus status) => status switch
         {
             ClientCertificateNativePromptArmStatus.TimedOut => AuthenticationErrorCategory.TimedOut,
+            ClientCertificateNativePromptArmStatus.Cancelled => AuthenticationErrorCategory.Cancelled,
             _ => AuthenticationErrorCategory.UnknownFailure
         };
 
     private static AuthenticationErrorCategory MapNativePromptFailure(
         ClientCertificateNativePromptStatus status) => status switch
         {
+            ClientCertificateNativePromptStatus.PinRejected => AuthenticationErrorCategory.PinRejected,
+            ClientCertificateNativePromptStatus.TargetMismatch => AuthenticationErrorCategory.WindowConflict,
+            ClientCertificateNativePromptStatus.FocusLost => AuthenticationErrorCategory.WindowConflict,
+            ClientCertificateNativePromptStatus.InputFailed => AuthenticationErrorCategory.WindowConflict,
             ClientCertificateNativePromptStatus.TimedOut => AuthenticationErrorCategory.TimedOut,
+            ClientCertificateNativePromptStatus.Cancelled => AuthenticationErrorCategory.Cancelled,
             _ => AuthenticationErrorCategory.UnknownFailure
         };
 
@@ -1059,6 +1605,9 @@ public sealed class AuthenticationCoordinator :
         AuthenticationErrorCategory.UnauthorizedTarget => "The certificate request target is not authorized.",
         AuthenticationErrorCategory.CertificateMissing => "The configured client certificate is unavailable.",
         AuthenticationErrorCategory.CertificateConflict => "The client certificate match is ambiguous.",
+        AuthenticationErrorCategory.WindowConflict => "The secure PIN window could not be uniquely authorized.",
+        AuthenticationErrorCategory.Cancelled => "Client-certificate authentication was cancelled.",
+        AuthenticationErrorCategory.BankChanged => "Client-certificate authentication stopped because the selected bank changed.",
         AuthenticationErrorCategory.InvalidCertificateRequest => "The client certificate request is invalid.",
         _ => "Automatic authentication could not be completed."
     };

@@ -244,20 +244,24 @@ public sealed class LauncherViewModelTests
     }
 
     [Fact]
-    public void UpdateCurrentPin_FormatsVisibleValueAndRaisesPropertyChanged()
+    public void UpdateCurrentPinStatus_OnlyPublishesCredentialPresence()
     {
         var viewModel = new LauncherViewModel();
         var changedProperties = new List<string?>();
         viewModel.PropertyChanged += (_, args) => changedProperties.Add(args.PropertyName);
 
-        viewModel.UpdateCurrentPin("1234");
+        viewModel.UpdateCurrentPinStatus(PinCredentialStatus.Set);
 
-        Assert.Equal("当前 PIN：1234", viewModel.CurrentPinText);
+        Assert.Equal("当前 PIN：已设置", viewModel.CurrentPinText);
         Assert.Contains(nameof(LauncherViewModel.CurrentPinText), changedProperties);
 
-        viewModel.UpdateCurrentPin(null);
+        viewModel.UpdateCurrentPinStatus(PinCredentialStatus.NotSet);
 
         Assert.Equal("当前 PIN：未设置", viewModel.CurrentPinText);
+
+        viewModel.UpdateCurrentPinStatus(PinCredentialStatus.ReadFailed);
+
+        Assert.Equal("当前 PIN：读取失败", viewModel.CurrentPinText);
     }
 
     [Fact]

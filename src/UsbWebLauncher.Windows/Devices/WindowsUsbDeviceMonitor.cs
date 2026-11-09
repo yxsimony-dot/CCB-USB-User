@@ -9,7 +9,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
     private readonly IWindowsUsbDeviceEnumerator _enumerator;
     private readonly IDeviceChangeSource _changeSource;
     private readonly TimeSpan _debounceDelay;
-    private readonly bool _enableCcbMetadataRetry;
+    private readonly IUsbMetadataRetryPolicy _metadataRetryPolicy;
     private readonly TimeSpan _metadataRetryDelay;
     private readonly int _maxMetadataRetries;
     private readonly Action<string, Exception> _reportFault;
@@ -22,7 +22,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
     private bool _started;
     private bool _disposed;
     private bool _initialReadInProgress;
-    private HashSet<string> _lastReportedCcbInstanceIds = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _lastReportedReadyInstanceIds = new(StringComparer.OrdinalIgnoreCase);
     private Exception? _monitorFault;
     private UsbDevicesChangedEventHandler? _devicesChanged;
     private Task? _disposal;
@@ -31,7 +31,22 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         : this(
             new SetupApiUsbDeviceEnumerator(),
             new DeviceWatcherChangeSource(),
-            TimeSpan.FromMilliseconds(350), enableCcbMetadataRetry,
+            TimeSpan.FromMilliseconds(350),
+            enableCcbMetadataRetry
+                ? CcbUsbMetadataRetryPolicy.Instance
+                : DisabledUsbMetadataRetryPolicy.Instance,
+            metadataRetryDelay: null,
+            maxMetadataRetries: 5,
+            reportFault: ReportDefaultFault)
+    {
+    }
+
+    public WindowsUsbDeviceMonitor(IUsbMetadataRetryPolicy metadataRetryPolicy)
+        : this(
+            new SetupApiUsbDeviceEnumerator(),
+            new DeviceWatcherChangeSource(),
+            TimeSpan.FromMilliseconds(350),
+            metadataRetryPolicy,
             metadataRetryDelay: null,
             maxMetadataRetries: 5,
             reportFault: ReportDefaultFault)
@@ -49,7 +64,27 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             enumerator,
             changeSource,
             debounceDelay,
-            enableCcbMetadataRetry,
+            enableCcbMetadataRetry
+                ? CcbUsbMetadataRetryPolicy.Instance
+                : DisabledUsbMetadataRetryPolicy.Instance,
+            metadataRetryDelay,
+            maxMetadataRetries,
+            ReportDefaultFault)
+    {
+    }
+
+    public WindowsUsbDeviceMonitor(
+        IWindowsUsbDeviceEnumerator enumerator,
+        IDeviceChangeSource changeSource,
+        TimeSpan debounceDelay,
+        IUsbMetadataRetryPolicy metadataRetryPolicy,
+        TimeSpan? metadataRetryDelay = null,
+        int maxMetadataRetries = 5)
+        : this(
+            enumerator,
+            changeSource,
+            debounceDelay,
+            metadataRetryPolicy,
             metadataRetryDelay,
             maxMetadataRetries,
             ReportDefaultFault)
@@ -64,14 +99,36 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         TimeSpan? metadataRetryDelay,
         int maxMetadataRetries,
         Action<string, Exception> reportFault)
+        : this(
+            enumerator,
+            changeSource,
+            debounceDelay,
+            enableCcbMetadataRetry
+                ? CcbUsbMetadataRetryPolicy.Instance
+                : DisabledUsbMetadataRetryPolicy.Instance,
+            metadataRetryDelay,
+            maxMetadataRetries,
+            reportFault)
+    {
+    }
+
+    internal WindowsUsbDeviceMonitor(
+        IWindowsUsbDeviceEnumerator enumerator,
+        IDeviceChangeSource changeSource,
+        TimeSpan debounceDelay,
+        IUsbMetadataRetryPolicy metadataRetryPolicy,
+        TimeSpan? metadataRetryDelay,
+        int maxMetadataRetries,
+        Action<string, Exception> reportFault)
     {
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _changeSource = changeSource ?? throw new ArgumentNullException(nameof(changeSource));
+        _metadataRetryPolicy = metadataRetryPolicy ??
+            throw new ArgumentNullException(nameof(metadataRetryPolicy));
         _reportFault = reportFault ?? throw new ArgumentNullException(nameof(reportFault));
         _debounceDelay = debounceDelay >= TimeSpan.Zero
             ? debounceDelay
             : throw new ArgumentOutOfRangeException(nameof(debounceDelay));
-        _enableCcbMetadataRetry = enableCcbMetadataRetry;
         _metadataRetryDelay = metadataRetryDelay ?? TimeSpan.FromSeconds(1);
         if (_metadataRetryDelay < TimeSpan.Zero)
         {
@@ -124,12 +181,12 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             ObjectDisposedException.ThrowIf(_disposed, this);
         }
 
-        return _enableCcbMetadataRetry
-            ? GetCurrentCcbSnapshotAsync(cancellationToken)
+        return _metadataRetryPolicy.IsEnabled
+            ? GetCurrentRetryingSnapshotAsync(cancellationToken)
             : _enumerator.EnumerateAsync(cancellationToken);
     }
 
-    private async Task<IReadOnlyList<UsbDeviceDescriptor>> GetCurrentCcbSnapshotAsync(
+    private async Task<IReadOnlyList<UsbDeviceDescriptor>> GetCurrentRetryingSnapshotAsync(
         CancellationToken cancellationToken)
     {
         CancellationToken lifetimeToken;
@@ -211,7 +268,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         CancellationToken cancellationToken,
         Func<IReadOnlyList<UsbDeviceDescriptor>, Task>? onSnapshot = null)
     {
-        if (!_enableCcbMetadataRetry)
+        if (!_metadataRetryPolicy.IsEnabled)
         {
             return await _enumerator.EnumerateAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -230,10 +287,8 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             }
 
             if (retry >= _maxMetadataRetries ||
-                devices.Any(UsbDeviceMatcher.IsCcbUsbStorMatch) ||
-                !devices.Any(device =>
-                    device.InstanceId.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(device.Service, "USBSTOR", StringComparison.OrdinalIgnoreCase)))
+                devices.Any(_metadataRetryPolicy.IsMetadataReady) ||
+                !devices.Any(_metadataRetryPolicy.IsRetryCandidate))
             {
                 return devices;
             }
@@ -476,9 +531,9 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
                 lock (_sync)
                 {
                     if (IsCurrent(generation, cancellationToken) &&
-                        _lastReportedCcbInstanceIds.Count != 0 &&
-                        !snapshot.Any(device => _lastReportedCcbInstanceIds.Contains(device.InstanceId)) &&
-                        !snapshot.Any(UsbDeviceMatcher.IsCcbUsbStorMatch))
+                        _lastReportedReadyInstanceIds.Count != 0 &&
+                        !snapshot.Any(device => _lastReportedReadyInstanceIds.Contains(device.InstanceId)) &&
+                        !snapshot.Any(_metadataRetryPolicy.IsMetadataReady))
                     {
                         reportedAbsence = true;
                         shouldPublishAbsence = true;
@@ -505,7 +560,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
             return;
         }
 
-        if (!reportedAbsence || devices.Any(UsbDeviceMatcher.IsCcbUsbStorMatch))
+        if (!reportedAbsence || devices.Any(_metadataRetryPolicy.IsMetadataReady))
         {
             await PublishCurrentAsync(devices, null, generation, cancellationToken).ConfigureAwait(false);
         }
@@ -525,7 +580,7 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
                 return Task.CompletedTask;
             }
 
-            if (_enableCcbMetadataRetry && error is null)
+            if (_metadataRetryPolicy.IsEnabled && error is null)
             {
                 RememberMatchingInstanceIds(devices);
             }
@@ -541,9 +596,9 @@ public sealed class WindowsUsbDeviceMonitor : IUsbDeviceMonitor
         // Retain only previously matched nodes still physically present, even
         // after metadata retry exhaustion, so a later removal ends that cycle
         // promptly. This set never substitutes for current Service/CD evidence.
-        _lastReportedCcbInstanceIds.IntersectWith(devices.Select(device => device.InstanceId));
-        _lastReportedCcbInstanceIds.UnionWith(devices
-            .Where(UsbDeviceMatcher.IsCcbUsbStorMatch)
+        _lastReportedReadyInstanceIds.IntersectWith(devices.Select(device => device.InstanceId));
+        _lastReportedReadyInstanceIds.UnionWith(devices
+            .Where(_metadataRetryPolicy.IsMetadataReady)
             .Select(device => device.InstanceId));
     }
 

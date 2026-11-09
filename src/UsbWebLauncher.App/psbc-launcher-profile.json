@@ -1,0 +1,32 @@
+{
+  "usbDetectionStrategy": "psbcUsbKey",
+  "targetUrl": "https://corpebank.psbc.com/#/login",
+  "clientCertificateAuthentication": {
+    "enabled": true,
+    "id": "psbc-client-certificate",
+    "host": "corpebank.psbc.com",
+    "port": 443,
+    "credentialTargetName": "UsbWebLauncher/ClientCertificate/psbc-client-certificate",
+    "nativePromptContinuation": {
+      "enabled": true,
+      "brokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
+      "policyId": "psbc-uk-password-v1",
+      "processPath": "",
+      "processSha256": "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+      "publisherCertificateThumbprint": "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
+      "windowTitle": "校验UK密码",
+      "windowClass": "#32770",
+      "requiredChildWindowClasses": [],
+      "timeoutMilliseconds": 30000,
+      "windowScope": "TrustedClientStrictTopLevel",
+      "processFileName": "msedgewebview2.exe",
+      "trustedRootWindowTitle": "",
+      "trustedRootWindowClassPrefix": "",
+      "inputWindowClass": "Edit",
+      "inputControlId": 3005,
+      "submitWindowClass": "Button",
+      "submitControlId": 1
+    },
+    "authenticationMode": "BrowserNative"
+  }
+}

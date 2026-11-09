@@ -4,20 +4,24 @@ using UsbWebLauncher.Core.Configuration;
 using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.Core.Devices;
 using UsbWebLauncher.App.Presentation;
+using UsbWebLauncher.App.Configuration;
 
 namespace UsbWebLauncher.App.Composition;
 
 public interface IClientCertificateAuthenticationRuntimeFactory
 {
     IClientCertificateAuthenticationRuntime Create(
+        BankAuthenticationRuntimeKind runtimeKind,
         ClientCertificateAuthenticationOptions authentication,
         ICorrelatedBrowserHost browser,
-        Uri target);
+        Uri target,
+        IPsbcAuthenticationRuntimeContext? psbcRuntimeContext = null);
 }
 
 public interface IClientCertificateAuthenticationRuntime : IAsyncDisposable
 {
     event EventHandler<AuthenticationStateChangedEventArgs>? StateChanged;
+    BankAuthenticationRuntimeKind RuntimeKind { get; }
     AuthenticationState CurrentState { get; }
     IBrowserClientCertificateRequestHandler Handler { get; }
     IBrowserClientCertificateAuthenticationReporter Reporter { get; }
@@ -29,7 +33,8 @@ public interface IClientCertificateAuthenticationRuntime : IAsyncDisposable
 }
 
 public sealed class LauncherApplicationComposer(
-    IClientCertificateAuthenticationRuntimeFactory authenticationFactory)
+    IClientCertificateAuthenticationRuntimeFactory authenticationFactory,
+    IBankRuntimeCompositionObserver? compositionObserver = null)
 {
     private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromSeconds(30);
 
@@ -37,26 +42,49 @@ public sealed class LauncherApplicationComposer(
         LauncherProfile profile,
         IUsbDeviceMonitor deviceMonitor,
         IClientCertificateConfigurableBrowserHost browser,
-        CancellationToken cancellationToken = default)
+        BankFlowDefinition bankFlow,
+        CancellationToken cancellationToken = default,
+        Func<UsbDeviceDescriptor, bool>? deviceMatcher = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(deviceMonitor);
         ArgumentNullException.ThrowIfNull(browser);
+        ArgumentNullException.ThrowIfNull(bankFlow);
 
         IClientCertificateAuthenticationRuntime? authentication = null;
+        var bankComponents = new BankRuntimeComponentComposer(
+            bankFlow,
+            compositionObserver);
         try
         {
-            if (profile.ClientCertificateAuthentication is { } options)
+            if (profile.ClientCertificateAuthentication is { Enabled: true } options)
             {
-                authentication = authenticationFactory.Create(
-                    options,
-                    browser,
-                    new Uri(profile.TargetUrl));
+                authentication = bankComponents.CreateClientCertificateAuthentication(
+                    runtimeKind => authenticationFactory.Create(
+                        runtimeKind,
+                        options,
+                        browser,
+                        new Uri(profile.TargetUrl),
+                        runtimeKind ==
+                            BankAuthenticationRuntimeKind.PostalSavingsBank
+                            ? deviceMonitor as
+                                IPsbcAuthenticationRuntimeContext
+                            : null));
+                if (authentication.RuntimeKind !=
+                    bankComponents.Composition.AuthenticationRuntime)
+                {
+                    throw new InvalidOperationException(
+                        "The authentication runtime does not belong to the selected bank.");
+                }
                 await browser.ConfigureClientCertificateAuthenticationAsync(
                     authentication.Handler,
                     authentication.Reporter,
                     AuthenticationTimeout,
                     cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                bankComponents.RecordAuthenticationNotConfigured();
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -64,8 +92,9 @@ public sealed class LauncherApplicationComposer(
                 deviceMonitor,
                 browser,
                 profile,
-                authentication?.LaunchGate);
-            return new(launcher, authentication, browser);
+                authentication?.LaunchGate,
+                deviceMatcher);
+            return new(launcher, authentication, browser, bankComponents);
         }
         catch
         {
@@ -84,7 +113,8 @@ public sealed class LauncherApplicationComposer(
 public sealed class LauncherApplicationRuntime(
     LauncherCoordinator launcher,
     IClientCertificateAuthenticationRuntime? authentication,
-    IAsyncDisposable browser) : IAsyncDisposable
+    IAsyncDisposable browser,
+    BankRuntimeComponentComposer bankComponents) : IAsyncDisposable
 {
     private readonly object _disposeSync = new();
     private Task? _disposeTask;
@@ -92,6 +122,8 @@ public sealed class LauncherApplicationRuntime(
     public LauncherCoordinator Launcher { get; } = launcher;
 
     public IClientCertificateAuthenticationRuntime? Authentication { get; } = authentication;
+
+    public BankRuntimeComponentComposer BankComponents { get; } = bankComponents;
 
     public ValueTask DisposeAsync()
     {

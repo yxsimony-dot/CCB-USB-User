@@ -6,15 +6,18 @@ public sealed class BrowserSessionDirectory
 {
     public const string OwnershipFileName = ".usb-web-launcher-session";
     public const string RetiredFileName = ".usb-web-launcher-retired";
+    public static string DefaultRoot => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "UsbWebLauncher",
+        "browser-sessions");
+
     private readonly string _root;
     private readonly string _id = Guid.NewGuid().ToString("N");
     private bool _created;
 
     public BrowserSessionDirectory(string? root = null)
     {
-        _root = System.IO.Path.GetFullPath(root ?? System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "UsbWebLauncher", "browser-sessions"));
+        _root = System.IO.Path.GetFullPath(root ?? DefaultRoot);
         Path = System.IO.Path.Combine(_root, _id);
     }
 

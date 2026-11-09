@@ -9,10 +9,16 @@ internal sealed record ApplicationLaunchOptions(bool UseEmptyDeviceMonitor)
     public bool IsHeadless => InstallerCommand is not InstallerCommand.None;
     public bool IsLifecycleObservation => LifecycleObservationReportPath is not null;
     public string? LifecycleObservationReportPath { get; init; }
+    public string? PsbcCertificateDiagnosticsPath { get; init; }
+    public string? PsbcNativeWindowDiagnosticsPath { get; init; }
     public bool ShowDependencyPreparation { get; init; }
     internal const string SmokeTestNoDevicesArgument = "--smoke-test-no-devices";
     internal const string SmokeReadyWindowTitle = "USB Web Launcher [Smoke Ready]";
     internal const string LifecycleObservationArgumentPrefix = "--lifecycle-observation-report=";
+    internal const string PsbcCertificateDiagnosticsArgumentPrefix =
+        "--psbc-certificate-diagnostics=";
+    internal const string PsbcNativeWindowDiagnosticsArgumentPrefix =
+        "--psbc-native-window-diagnostics=";
     internal const string LifecycleObservationReadyWindowTitle =
         "USB Web Launcher [Lifecycle Observation Ready]";
 
@@ -23,17 +29,20 @@ internal sealed record ApplicationLaunchOptions(bool UseEmptyDeviceMonitor)
         {
             if (args.Length != 1) return new(false) { InstallerCommand = InstallerCommand.Invalid };
             if (args[0] == "--installer-first-run") return new(false) { ShowDependencyPreparation = true };
-            return new(false) { InstallerCommand = args[0] switch
+            return new(false)
             {
-                "--installer-health-check" => InstallerCommand.HealthCheck,
-                "--installer-register-broker" => InstallerCommand.RegisterBroker,
-                "--installer-uninstall-broker" => InstallerCommand.UninstallBroker,
-                "--installer-prepare" => InstallerCommand.Prepare,
-                "--installer-backup-broker" => InstallerCommand.BackupBroker,
-                "--installer-restore-broker" => InstallerCommand.RestoreBroker,
-                "--installer-commit-broker" => InstallerCommand.CommitBroker,
-                _ => InstallerCommand.Invalid
-            }};
+                InstallerCommand = args[0] switch
+                {
+                    "--installer-health-check" => InstallerCommand.HealthCheck,
+                    "--installer-register-broker" => InstallerCommand.RegisterBroker,
+                    "--installer-uninstall-broker" => InstallerCommand.UninstallBroker,
+                    "--installer-prepare" => InstallerCommand.Prepare,
+                    "--installer-backup-broker" => InstallerCommand.BackupBroker,
+                    "--installer-restore-broker" => InstallerCommand.RestoreBroker,
+                    "--installer-commit-broker" => InstallerCommand.CommitBroker,
+                    _ => InstallerCommand.Invalid
+                }
+            };
         }
 
         var lifecycleArguments = args
@@ -59,12 +68,64 @@ internal sealed record ApplicationLaunchOptions(bool UseEmptyDeviceMonitor)
             lifecycleReportPath = Path.GetFullPath(path);
         }
 
+        var psbcCertificateDiagnosticArguments = args
+            .Where(argument => argument.StartsWith(
+                PsbcCertificateDiagnosticsArgumentPrefix,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (psbcCertificateDiagnosticArguments.Length > 1)
+        {
+            throw new ArgumentException(
+                "Only one PSBC certificate diagnostics path may be supplied.");
+        }
+
+        string? psbcCertificateDiagnosticsPath = null;
+        if (psbcCertificateDiagnosticArguments.Length == 1)
+        {
+            var path = psbcCertificateDiagnosticArguments[0][
+                PsbcCertificateDiagnosticsArgumentPrefix.Length..];
+            if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+            {
+                throw new ArgumentException(
+                    "The PSBC certificate diagnostics path must be absolute.");
+            }
+
+            psbcCertificateDiagnosticsPath = Path.GetFullPath(path);
+        }
+
+        var psbcNativeWindowDiagnosticArguments = args
+            .Where(argument => argument.StartsWith(
+                PsbcNativeWindowDiagnosticsArgumentPrefix,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (psbcNativeWindowDiagnosticArguments.Length > 1)
+        {
+            throw new ArgumentException(
+                "Only one PSBC native window diagnostics path may be supplied.");
+        }
+
+        string? psbcNativeWindowDiagnosticsPath = null;
+        if (psbcNativeWindowDiagnosticArguments.Length == 1)
+        {
+            var path = psbcNativeWindowDiagnosticArguments[0][
+                PsbcNativeWindowDiagnosticsArgumentPrefix.Length..];
+            if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+            {
+                throw new ArgumentException(
+                    "The PSBC native window diagnostics path must be absolute.");
+            }
+
+            psbcNativeWindowDiagnosticsPath = Path.GetFullPath(path);
+        }
+
         return new(lifecycleReportPath is not null || args.Any(argument => string.Equals(
             argument,
             SmokeTestNoDevicesArgument,
             StringComparison.OrdinalIgnoreCase)))
         {
-            LifecycleObservationReportPath = lifecycleReportPath
+            LifecycleObservationReportPath = lifecycleReportPath,
+            PsbcCertificateDiagnosticsPath = psbcCertificateDiagnosticsPath,
+            PsbcNativeWindowDiagnosticsPath = psbcNativeWindowDiagnosticsPath
         };
     }
 }

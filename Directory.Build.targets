@@ -1,0 +1,28 @@
+<Project>
+  <PropertyGroup>
+    <ResolveLocalProductVersion Condition="'$(ResolveLocalProductVersion)' == ''">true</ResolveLocalProductVersion>
+  </PropertyGroup>
+
+  <Target Name="ResolveUsbWebLauncherLocalProductVersion"
+          BeforeTargets="GetAssemblyVersion;GenerateAssemblyInfo"
+          Condition="'$(MSBuildProjectName)' == 'UsbWebLauncher.App'
+            and '$(ReleaseVersion)' == ''
+            and '$(ResolveLocalProductVersion)' == 'true'
+            and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="&quot;$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)build\Resolve-LocalProductVersion.ps1&quot; -RepositoryRoot &quot;$(MSBuildThisFileDirectory).&quot;"
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="Low">
+      <Output TaskParameter="ConsoleOutput" ItemName="_ResolvedLocalProductVersionOutput" />
+    </Exec>
+    <PropertyGroup>
+      <ResolvedLocalProductVersion>@(_ResolvedLocalProductVersionOutput)</ResolvedLocalProductVersion>
+      <Version>$(ResolvedLocalProductVersion)</Version>
+      <AssemblyVersion>$(ResolvedLocalProductVersion).0</AssemblyVersion>
+      <FileVersion>$(ResolvedLocalProductVersion).0</FileVersion>
+      <InformationalVersion>$(ResolvedLocalProductVersion)</InformationalVersion>
+    </PropertyGroup>
+    <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(ResolvedLocalProductVersion)', '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')) != 'True'"
+           Text="Local product version resolution returned an invalid version: $(ResolvedLocalProductVersion)" />
+    <Message Importance="High" Text="Local product version: $(ResolvedLocalProductVersion)" />
+  </Target>
+</Project>

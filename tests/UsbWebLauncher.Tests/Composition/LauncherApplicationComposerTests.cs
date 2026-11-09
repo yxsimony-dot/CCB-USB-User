@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using UsbWebLauncher.App.Composition;
+using UsbWebLauncher.App.Configuration;
 using UsbWebLauncher.Core.Authentication;
 using UsbWebLauncher.Core.Browser;
 using UsbWebLauncher.Core.Configuration;
@@ -19,7 +20,12 @@ public sealed class LauncherApplicationComposerTests
         var browser = new RecordingConfigurableBrowser(order, configure: () => configured.Task);
         var composer = new LauncherApplicationComposer(new RecordingAuthenticationRuntimeFactory(order));
         using var cancellation = new CancellationTokenSource();
-        var pending = composer.ComposeAsync(Profile(Authentication()), new RecordingMonitor(order, []), browser, cancellation.Token);
+        var pending = composer.ComposeAsync(
+            Profile(Authentication()),
+            new RecordingMonitor(order, []),
+            browser,
+            BankFlowCatalog.ChinaConstructionBank,
+            cancellation.Token);
         cancellation.Cancel();
         configured.SetResult();
 
@@ -38,7 +44,11 @@ public sealed class LauncherApplicationComposerTests
         var browser = new RecordingConfigurableBrowser(order, () => { browserReleased.SetResult(); return ValueTask.CompletedTask; });
         var monitor = new RecordingMonitor(order, [], () => new ValueTask(browserReleased.Task));
         var composer = new LauncherApplicationComposer(new RecordingAuthenticationRuntimeFactory(order));
-        var runtime = await composer.ComposeAsync(Profile(Authentication()), monitor, browser);
+        var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            monitor,
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
 
         await runtime.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -53,7 +63,11 @@ public sealed class LauncherApplicationComposerTests
         var order = new ConcurrentQueue<string>();
         var browser = new RecordingConfigurableBrowser(order, () => throw new InvalidOperationException("test"));
         var composer = new LauncherApplicationComposer(new RecordingAuthenticationRuntimeFactory(order));
-        var runtime = await composer.ComposeAsync(Profile(Authentication()), new RecordingMonitor(order, []), browser);
+        var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            new RecordingMonitor(order, []),
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => runtime.DisposeAsync().AsTask());
 
@@ -68,7 +82,11 @@ public sealed class LauncherApplicationComposerTests
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var factory = new RecordingAuthenticationRuntimeFactory(order, () => new ValueTask(release.Task));
         var composer = new LauncherApplicationComposer(factory);
-        var runtime = await composer.ComposeAsync(Profile(Authentication()), new RecordingMonitor(order, []), new RecordingConfigurableBrowser(order));
+        var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            new RecordingMonitor(order, []),
+            new RecordingConfigurableBrowser(order),
+            BankFlowCatalog.ChinaConstructionBank);
         var first = runtime.DisposeAsync().AsTask();
         try
         {
@@ -86,17 +104,25 @@ public sealed class LauncherApplicationComposerTests
     }
 
     [Theory]
-    [InlineData(AuthenticationStage.AwaitingCertificate, true)]
-    [InlineData(AuthenticationStage.Authenticating, true)]
-    [InlineData(AuthenticationStage.Ready, true)]
-    [InlineData(AuthenticationStage.RequiresPinSetup, false)]
-    [InlineData(AuthenticationStage.Incompatible, false)]
-    [InlineData(AuthenticationStage.Failed, false)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.AwaitingCertificate, true)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.Authenticating, true)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.Ready, true)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.RequiresPinSetup, false)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.Incompatible, false)]
+    [InlineData(BankAuthenticationRuntimeKind.ChinaConstructionBank, AuthenticationStage.Failed, false)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.AwaitingCertificate, true)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.Authenticating, true)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.Ready, true)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.RequiresPinSetup, true)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.Incompatible, false)]
+    [InlineData(BankAuthenticationRuntimeKind.PostalSavingsBank, AuthenticationStage.Failed, false)]
     public void AuthenticationLaunchGate_OnlyBlocksStatesThatMustNotNavigate(
+        BankAuthenticationRuntimeKind runtimeKind,
         AuthenticationStage stage,
         bool expected)
     {
         Assert.Equal(expected, AuthenticationLauncherGate.AllowsNavigation(
+            runtimeKind,
             isTargetDevicePresent: true,
             stage));
     }
@@ -110,13 +136,49 @@ public sealed class LauncherApplicationComposerTests
         var factory = new RecordingAuthenticationRuntimeFactory(order);
         var composer = new LauncherApplicationComposer(factory);
 
-        await using var runtime = await composer.ComposeAsync(Profile(authentication: null), monitor, browser);
+        await using var runtime = await composer.ComposeAsync(
+            Profile(authentication: null),
+            monitor,
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
         await runtime.Launcher.StartAsync();
 
         Assert.Equal(0, factory.CreateCount);
         Assert.Equal(0, browser.ConfigureCount);
         Assert.DoesNotContain(order, item => item.StartsWith("auth-", StringComparison.Ordinal));
         Assert.Contains("navigate", order);
+    }
+
+    [Fact]
+    public async Task ComposeAsync_WithDisabledAuthentication_DoesNotCreateRuntimeOrReadPin()
+    {
+        var order = new ConcurrentQueue<string>();
+        var observer = new RecordingCompositionObserver();
+        var browser = new RecordingConfigurableBrowser(order);
+        var monitor = new RecordingMonitor(order, [MatchingDevice()]);
+        var factory = new RecordingAuthenticationRuntimeFactory(order);
+        var composer = new LauncherApplicationComposer(factory, observer);
+
+        await using var runtime = await composer.ComposeAsync(
+            Profile(Authentication() with { Enabled = false }),
+            monitor,
+            browser,
+            BankFlowCatalog.PostalSavingsBank);
+        await runtime.Launcher.StartAsync();
+
+        Assert.Null(runtime.Authentication);
+        Assert.Equal(0, factory.CreateCount);
+        Assert.Equal(0, browser.ConfigureCount);
+        Assert.DoesNotContain(order, item =>
+            item.StartsWith("auth-", StringComparison.Ordinal));
+        Assert.Contains("navigate", order);
+        Assert.Contains(
+            observer.Events,
+            item =>
+                item.Bank == BankFlowKind.PostalSavingsBank &&
+                item.Component ==
+                    BankRuntimeComponent.ClientCertificateAuthentication &&
+                item.State == BankRuntimeComponentState.Skipped);
     }
 
     [Fact]
@@ -128,15 +190,104 @@ public sealed class LauncherApplicationComposerTests
         var factory = new RecordingAuthenticationRuntimeFactory(order);
         var composer = new LauncherApplicationComposer(factory);
 
-        await using var runtime = await composer.ComposeAsync(Profile(Authentication()), monitor, browser);
+        await using var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            monitor,
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
         await runtime.Launcher.StartAsync();
 
         Assert.Equal(1, factory.CreateCount);
+        Assert.Equal(
+            BankAuthenticationRuntimeKind.ChinaConstructionBank,
+            factory.LastRuntimeKind);
         Assert.Equal(new[]
         {
             "auth-create", "configure-auth", "monitor-start", "monitor-read",
             "auth-present", "initialize", "navigate"
         }, order);
+    }
+
+    [Fact]
+    public async Task ComposeAsync_ForPostalSavingsBank_UsesOnlyPostalSavingsAuthenticationBranch()
+    {
+        var order = new ConcurrentQueue<string>();
+        var observer = new RecordingCompositionObserver();
+        var browser = new RecordingConfigurableBrowser(order);
+        var factory = new RecordingAuthenticationRuntimeFactory(order);
+        var composer = new LauncherApplicationComposer(factory, observer);
+
+        await using var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            new RecordingMonitor(order, []),
+            browser,
+            BankFlowCatalog.PostalSavingsBank);
+        var pageFactoryCalled = false;
+        var pageCoordinator = runtime.BankComponents.CreateCcbPageCoordinator(
+            () =>
+            {
+                pageFactoryCalled = true;
+                return new object();
+            });
+
+        Assert.Equal(
+            BankAuthenticationRuntimeKind.PostalSavingsBank,
+            factory.LastRuntimeKind);
+        Assert.Equal(
+            BankAuthenticationRuntimeKind.PostalSavingsBank,
+            runtime.Authentication?.RuntimeKind);
+        Assert.Null(pageCoordinator);
+        Assert.False(pageFactoryCalled);
+        Assert.Contains(
+            observer.Events,
+            item =>
+                item.Bank == BankFlowKind.PostalSavingsBank &&
+                item.AuthenticationRuntime ==
+                    BankAuthenticationRuntimeKind.PostalSavingsBank &&
+                item.Component ==
+                    BankRuntimeComponent.ClientCertificateAuthentication &&
+                item.State == BankRuntimeComponentState.Created);
+        Assert.DoesNotContain(
+            observer.Events,
+            item =>
+                item.Component == BankRuntimeComponent.CcbPageCoordination &&
+                item.State == BankRuntimeComponentState.Created);
+    }
+
+    [Fact]
+    public async Task ComposeAsync_ForPostalSavingsBank_ForwardsAuthenticationContext()
+    {
+        var order = new ConcurrentQueue<string>();
+        var browser = new RecordingConfigurableBrowser(order);
+        var monitor = new RecordingPsbcMonitor(order);
+        var factory = new RecordingAuthenticationRuntimeFactory(order);
+        var composer = new LauncherApplicationComposer(factory);
+
+        await using var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            monitor,
+            browser,
+            BankFlowCatalog.PostalSavingsBank);
+
+        Assert.Same(monitor, factory.LastPsbcRuntimeContext);
+    }
+
+    [Fact]
+    public async Task ComposeAsync_ForConstructionBank_DoesNotForwardPsbcContext()
+    {
+        var order = new ConcurrentQueue<string>();
+        var browser = new RecordingConfigurableBrowser(order);
+        var monitor = new RecordingPsbcMonitor(order);
+        var factory = new RecordingAuthenticationRuntimeFactory(order);
+        var composer = new LauncherApplicationComposer(factory);
+
+        await using var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            monitor,
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
+
+        Assert.Null(factory.LastPsbcRuntimeContext);
     }
 
     [Fact]
@@ -147,7 +298,11 @@ public sealed class LauncherApplicationComposerTests
         var monitor = new RecordingMonitor(order, []);
         var factory = new RecordingAuthenticationRuntimeFactory(order);
         var composer = new LauncherApplicationComposer(factory);
-        var runtime = await composer.ComposeAsync(Profile(Authentication()), monitor, browser);
+        var runtime = await composer.ComposeAsync(
+            Profile(Authentication()),
+            monitor,
+            browser,
+            BankFlowCatalog.ChinaConstructionBank);
         await runtime.Launcher.StartAsync();
         order.Clear();
 
@@ -177,23 +332,40 @@ public sealed class LauncherApplicationComposerTests
         : IClientCertificateAuthenticationRuntimeFactory
     {
         public int CreateCount { get; private set; }
+        public BankAuthenticationRuntimeKind? LastRuntimeKind { get; private set; }
+        public IPsbcAuthenticationRuntimeContext? LastPsbcRuntimeContext
+        {
+            get;
+            private set;
+        }
 
         public IClientCertificateAuthenticationRuntime Create(
+            BankAuthenticationRuntimeKind runtimeKind,
             ClientCertificateAuthenticationOptions authentication,
             ICorrelatedBrowserHost browser,
-            Uri target)
+            Uri target,
+            IPsbcAuthenticationRuntimeContext? psbcRuntimeContext = null)
         {
             CreateCount++;
+            LastRuntimeKind = runtimeKind;
+            LastPsbcRuntimeContext = psbcRuntimeContext;
             order.Enqueue("auth-create");
-            return new RecordingAuthenticationRuntime(order, dispose);
+            return new RecordingAuthenticationRuntime(
+                runtimeKind,
+                order,
+                dispose);
         }
     }
 
-    private sealed class RecordingAuthenticationRuntime(ConcurrentQueue<string> order, Func<ValueTask>? dispose = null)
+    private sealed class RecordingAuthenticationRuntime(
+        BankAuthenticationRuntimeKind runtimeKind,
+        ConcurrentQueue<string> order,
+        Func<ValueTask>? dispose = null)
         : IClientCertificateAuthenticationRuntime
     {
         private readonly RejectingBrowserAuthentication _browserAuthentication = new();
         public event EventHandler<AuthenticationStateChangedEventArgs>? StateChanged { add { } remove { } }
+        public BankAuthenticationRuntimeKind RuntimeKind { get; } = runtimeKind;
         public AuthenticationState CurrentState { get; } = new(AuthenticationStage.WaitingForDevice, null);
         public IBrowserClientCertificateRequestHandler Handler => _browserAuthentication;
         public IBrowserClientCertificateAuthenticationReporter Reporter => _browserAuthentication;
@@ -246,5 +418,61 @@ public sealed class LauncherApplicationComposerTests
         public Task<IReadOnlyList<UsbDeviceDescriptor>> GetConnectedDevicesAsync(CancellationToken cancellationToken = default) { order.Enqueue("monitor-read"); return Task.FromResult(devices); }
         public Task StartAsync(CancellationToken cancellationToken = default) { order.Enqueue("monitor-start"); return Task.CompletedTask; }
         public ValueTask DisposeAsync() { order.Enqueue("monitor-dispose"); return dispose?.Invoke() ?? ValueTask.CompletedTask; }
+    }
+
+    private sealed class RecordingPsbcMonitor(ConcurrentQueue<string> order)
+        : IUsbDeviceMonitor, IPsbcAuthenticationRuntimeContext
+    {
+        public event UsbDevicesChangedEventHandler? DevicesChanged
+        {
+            add { }
+            remove { }
+        }
+
+        public event EventHandler? Changed
+        {
+            add { }
+            remove { }
+        }
+
+        public PsbcAuthenticationRuntimeSnapshot Current { get; } = new(
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            UsbKeyDetectionStatus.Absent,
+            null,
+            0);
+
+        public Task<IReadOnlyList<UsbDeviceDescriptor>> GetConnectedDevicesAsync(
+            CancellationToken cancellationToken = default)
+        {
+            order.Enqueue("monitor-read");
+            return Task.FromResult<IReadOnlyList<UsbDeviceDescriptor>>([]);
+        }
+
+        public Task StartAsync(CancellationToken cancellationToken = default)
+        {
+            order.Enqueue("monitor-start");
+            return Task.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            order.Enqueue("monitor-dispose");
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingCompositionObserver :
+        IBankRuntimeCompositionObserver
+    {
+        public List<BankRuntimeCompositionEvent> Events { get; } = [];
+
+        public void Record(BankRuntimeCompositionEvent observation) =>
+            Events.Add(observation);
     }
 }

@@ -16,10 +16,12 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="设置固定本机 PIN"
+        <TextBlock x:Name="HeadingTextBlock"
+                   Text="设置固定本机 PIN"
                    FontSize="18"
                    FontWeight="SemiBold" />
-        <TextBlock Grid.Row="1"
+        <TextBlock x:Name="DescriptionTextBlock"
+                   Grid.Row="1"
                    Margin="0,8,0,12"
                    Text="PIN 将保存到当前 Windows 用户的凭据管理器；USB Key 出现后程序会自动读取并验证。"
                    TextWrapping="Wrap"

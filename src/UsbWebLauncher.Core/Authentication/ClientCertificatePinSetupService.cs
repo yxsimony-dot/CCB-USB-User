@@ -59,24 +59,18 @@ public sealed class ClientCertificatePinSetupService(
                 AuthenticationStage.RequiresPinSetup,
                 null,
                 Message: "正在保存固定本机凭据。"));
-            if (!authentication.UsesBrowserNativeAuthentication)
-            {
-                await stampStore.DeleteAsync(authentication.Id, cancellationToken).ConfigureAwait(false);
-            }
+            await stampStore.DeleteAsync(authentication.Id, cancellationToken).ConfigureAwait(false);
             await pinStore.SaveAsync(
                     authentication.CredentialTargetName,
                     pin,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!authentication.UsesBrowserNativeAuthentication)
-            {
-                await stampStore.SaveAsync(
-                    ClientCertificateValidationStamp.CreatePending(
-                        authentication.Id,
-                        authentication.GetNormalizedHash()),
-                    cancellationToken)
-                    .ConfigureAwait(false);
-            }
+            await stampStore.SaveAsync(
+                ClientCertificateValidationStamp.CreatePending(
+                    authentication.Id,
+                    authentication.GetNormalizedHash()),
+                cancellationToken)
+                .ConfigureAwait(false);
             SetState(new(
                 AuthenticationStage.RequiresPinSetup,
                 null,
@@ -230,10 +224,7 @@ public sealed class ClientCertificatePinSetupService(
 
     public async Task DeleteAsync(CancellationToken cancellationToken = default)
     {
-        if (!authentication.UsesBrowserNativeAuthentication)
-        {
-            await stampStore.DeleteAsync(authentication.Id, cancellationToken).ConfigureAwait(false);
-        }
+        await stampStore.DeleteAsync(authentication.Id, cancellationToken).ConfigureAwait(false);
         await pinStore.DeleteAsync(authentication.CredentialTargetName, cancellationToken).ConfigureAwait(false);
         if (lifecycleObserver is not null)
         {

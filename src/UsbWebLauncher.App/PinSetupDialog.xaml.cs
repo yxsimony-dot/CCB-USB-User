@@ -9,18 +9,36 @@ public partial class PinSetupDialog : Window, ILocalPinDialog
     private readonly Func<bool?> _showDialog;
 
     public PinSetupDialog(Window owner)
-        : this(owner, null)
+        : this(owner, "当前银行", null)
+    {
+    }
+
+    public PinSetupDialog(Window owner, string bankDisplayName)
+        : this(owner, bankDisplayName, null)
     {
     }
 
     internal PinSetupDialog(Window? owner, Func<bool?>? showDialog)
+        : this(owner, "当前银行", showDialog)
     {
+    }
+
+    internal PinSetupDialog(
+        Window? owner,
+        string bankDisplayName,
+        Func<bool?>? showDialog)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(bankDisplayName);
         InitializeComponent();
         if (owner is not null)
         {
             Owner = owner;
         }
 
+        HeadingTextBlock.Text = $"为{bankDisplayName}设置固定本机 PIN";
+        DescriptionTextBlock.Text =
+            $"PIN 只会保存到{bankDisplayName}专用的当前 Windows 用户凭据；" +
+            "USB Key 出现后程序会自动读取并验证。";
         _showDialog = showDialog ?? ShowDialog;
     }
 

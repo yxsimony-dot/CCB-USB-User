@@ -39,6 +39,16 @@ try {
     Set-Content "$dir/bank.pdf" 'synthetic'
     Reject { Assert-CleanPayload $dir -SkipRequiredFiles }
     Remove-Item "$dir/bank.pdf"
+    foreach ($name in @(
+        'certificate-requests.jsonl',
+        'psbc-certificate-diagnostics.json',
+        'psbc-native-window-diagnostics.txt',
+        'diagnostics-psbc-window.json'
+    )) {
+        Set-Content (Join-Path $dir $name) 'synthetic diagnostic identity'
+        Reject { Assert-CleanPayload $dir -SkipRequiredFiles }
+        Remove-Item (Join-Path $dir $name)
+    }
     Set-Content "$dir/metadata.json" '{"path":"F:\\USB-Web-Launcher\\secret"}'
     Reject { Assert-CleanPayload $dir -SkipRequiredFiles }
     Set-Content "$dir/metadata.json" '{"debug":"--remote-debugging-port=9222"}'

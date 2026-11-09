@@ -19,6 +19,46 @@ internal static class NativePromptWindowMatcher
     internal const int CaptionlessCcbKeyboardInputControlId = 10005;
     private const string CapsLockTitleSuffix = " - 大写锁定打开！";
 
+    internal static bool TryFindTrustedClientStrictTopLevelControls(
+        IReadOnlyList<NativePromptControlSnapshot> candidates,
+        int expectedProcessId,
+        ClientCertificateNativePromptOptions policy,
+        out NativePromptControlSnapshot? input,
+        out NativePromptControlSnapshot? submit)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(policy);
+
+        input = null;
+        submit = null;
+        if (policy.InputControlId is not > 0 ||
+            policy.SubmitControlId is not > 0 ||
+            string.IsNullOrEmpty(policy.InputWindowClass) ||
+            string.IsNullOrEmpty(policy.SubmitWindowClass) ||
+            !TryFindUniqueControl(
+                candidates,
+                expectedProcessId,
+                policy.InputWindowClass,
+                policy.InputControlId.Value,
+                requireEnabled: true,
+                out var inputHandle) ||
+            !TryFindUniqueControl(
+                candidates,
+                expectedProcessId,
+                policy.SubmitWindowClass,
+                policy.SubmitControlId.Value,
+                requireEnabled: false,
+                out var submitHandle) ||
+            inputHandle == submitHandle)
+        {
+            return false;
+        }
+
+        input = candidates.First(control => control.WindowHandle == inputHandle);
+        submit = candidates.First(control => control.WindowHandle == submitHandle);
+        return true;
+    }
+
     internal static bool TryFindTrustedClientTopLevelControls(
         IReadOnlyList<NativePromptControlSnapshot> candidates,
         int expectedProcessId,
@@ -193,6 +233,7 @@ internal static class NativePromptWindowMatcher
         ArgumentNullException.ThrowIfNull(candidate);
 
         var isTrustedClientTopLevel = IsTrustedClientTopLevel(policy);
+        var isTrustedClientStrictTopLevel = IsTrustedClientStrictTopLevel(policy);
         return policy.Enabled &&
                candidate.WindowHandle != IntPtr.Zero &&
                candidate.IsVisible &&
@@ -219,9 +260,17 @@ internal static class NativePromptWindowMatcher
                          candidate.SignerCertificateThumbprint,
                          policy.PublisherCertificateThumbprint,
                          StringComparison.Ordinal) &&
-                     (IsTrustedClientDescendant(policy)
-                         ? IsTrustedClientDescendantMatch(policy, candidate, trustedClientProcessId)
-                         : IsTopLevelProcessMatch(policy, candidate)));
+                     (isTrustedClientStrictTopLevel
+                         ? IsTrustedClientStrictTopLevelMatch(
+                             policy,
+                             candidate,
+                             trustedClientProcessId)
+                         : IsTrustedClientDescendant(policy)
+                             ? IsTrustedClientDescendantMatch(
+                                 policy,
+                                 candidate,
+                                 trustedClientProcessId)
+                             : IsTopLevelProcessMatch(policy, candidate)));
     }
 
     public static bool TryFindUniqueMatch(
@@ -448,6 +497,41 @@ internal static class NativePromptWindowMatcher
          (candidate.WindowTitle.Length == 0 &&
           (HasAlternativeControlPair(candidate) || HasCaptionlessCcbKeyboardControls(candidate))));
 
+    private static bool IsTrustedClientStrictTopLevelMatch(
+        ClientCertificateNativePromptOptions policy,
+        NativePromptWindowSnapshot candidate,
+        int trustedClientProcessId) =>
+        trustedClientProcessId > 0 &&
+        candidate.ProcessId != trustedClientProcessId &&
+        candidate.ParentProcessId == trustedClientProcessId &&
+        candidate.IsTopLevel &&
+        candidate.IntegrityRid == MediumIntegrityRid &&
+        candidate.RootWindowHandle == candidate.WindowHandle &&
+        candidate.RootProcessId == candidate.ProcessId &&
+        candidate.InputControlHandle != IntPtr.Zero &&
+        candidate.SubmitControlHandle != IntPtr.Zero &&
+        candidate.InputControlHandle != candidate.SubmitControlHandle &&
+        !candidate.HasVerifiedAlternativeControls &&
+        !candidate.UsesDialogEnterSubmit &&
+        candidate.DialogEnterLayout == NativePromptDialogEnterLayout.None &&
+        HasRequiredValue(policy.InputWindowClass) &&
+        string.Equals(candidate.InputWindowClass, policy.InputWindowClass, StringComparison.Ordinal) &&
+        policy.InputControlId is > 0 &&
+        candidate.InputControlId == policy.InputControlId &&
+        HasRequiredValue(policy.SubmitWindowClass) &&
+        string.Equals(candidate.SubmitWindowClass, policy.SubmitWindowClass, StringComparison.Ordinal) &&
+        policy.SubmitControlId is > 0 &&
+        candidate.SubmitControlId == policy.SubmitControlId &&
+        HasRequiredValue(policy.ProcessFileName) &&
+        string.Equals(
+            Path.GetFileName(candidate.ProcessPath),
+            policy.ProcessFileName,
+            StringComparison.OrdinalIgnoreCase) &&
+        IsUpperHex(policy.ProcessSha256, 64) &&
+        string.Equals(candidate.ProcessSha256, policy.ProcessSha256, StringComparison.Ordinal) &&
+        HasRequiredValue(policy.WindowTitle) &&
+        string.Equals(candidate.WindowTitle, policy.WindowTitle, StringComparison.Ordinal);
+
     private static bool HasAlternativeControlPair(NativePromptWindowSnapshot candidate) =>
         !candidate.UsesDialogEnterSubmit && candidate.HasVerifiedAlternativeControls &&
         candidate.InputWindowClass == "Edit" && candidate.InputControlId > 0 &&
@@ -495,6 +579,12 @@ internal static class NativePromptWindowMatcher
         string.Equals(
             policy.WindowScope,
             NativePromptWindowScopes.TrustedClientTopLevel,
+            StringComparison.Ordinal);
+
+    private static bool IsTrustedClientStrictTopLevel(ClientCertificateNativePromptOptions policy) =>
+        string.Equals(
+            policy.WindowScope,
+            NativePromptWindowScopes.TrustedClientStrictTopLevel,
             StringComparison.Ordinal);
 
     internal const int MediumIntegrityRid = 0x00002000;

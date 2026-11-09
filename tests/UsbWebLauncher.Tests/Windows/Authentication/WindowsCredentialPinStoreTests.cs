@@ -10,6 +10,82 @@ namespace UsbWebLauncher.Tests.Windows.Authentication;
 public sealed class WindowsCredentialPinStoreTests
 {
     [Fact]
+    public async Task BankStores_ReadReplaceAndDeleteIndependently()
+    {
+        using var native = new RecordingCredentialNativeApi();
+        var credentialManager = new WindowsCredentialManager(native);
+        var ccb = WindowsClientCertificateAuthenticationStores.Create(
+            "ccb-client-certificate",
+            credentialManager,
+            localApplicationDataRoot: null,
+            useValidationStamps: false);
+        var psbc = WindowsClientCertificateAuthenticationStores.Create(
+            "psbc-client-certificate",
+            credentialManager,
+            localApplicationDataRoot: null,
+            useValidationStamps: false);
+        var ccbSecret = CreateRandomSecret();
+        var psbcSecret = CreateRandomSecret();
+        var replacementPsbcSecret = CreateRandomSecret();
+
+        try
+        {
+            using (var ccbPin = ClientCertificatePin.CopyOf(
+                       ccbSecret.AsMemory()))
+            {
+                await ccb.PinStore.SaveAsync(ccb.CredentialTargetName, ccbPin);
+            }
+
+            using (var psbcPin = ClientCertificatePin.CopyOf(
+                       psbcSecret.AsMemory()))
+            {
+                await psbc.PinStore.SaveAsync(psbc.CredentialTargetName, psbcPin);
+            }
+
+            using (var replacement = ClientCertificatePin.CopyOf(
+                       replacementPsbcSecret.AsMemory()))
+            {
+                await psbc.PinStore.SaveAsync(
+                    psbc.CredentialTargetName,
+                    replacement);
+            }
+
+            using (var ccbRead = await ccb.PinStore.ReadAsync(
+                       ccb.CredentialTargetName))
+            using (var psbcRead = await psbc.PinStore.ReadAsync(
+                       psbc.CredentialTargetName))
+            {
+                Assert.NotNull(ccbRead);
+                Assert.NotNull(psbcRead);
+                Assert.Equal(ccbSecret, ccbRead.AsMemory().ToArray());
+                Assert.Equal(
+                    replacementPsbcSecret,
+                    psbcRead.AsMemory().ToArray());
+            }
+
+            await ccb.PinStore.DeleteAsync(ccb.CredentialTargetName);
+
+            Assert.Null(await ccb.PinStore.ReadAsync(ccb.CredentialTargetName));
+            using var remainingPsbc = await psbc.PinStore.ReadAsync(
+                psbc.CredentialTargetName);
+            Assert.NotNull(remainingPsbc);
+            Assert.Equal(
+                replacementPsbcSecret,
+                remainingPsbc.AsMemory().ToArray());
+
+            await psbc.PinStore.DeleteAsync(psbc.CredentialTargetName);
+            Assert.Null(await psbc.PinStore.ReadAsync(
+                psbc.CredentialTargetName));
+        }
+        finally
+        {
+            Array.Clear(ccbSecret);
+            Array.Clear(psbcSecret);
+            Array.Clear(replacementPsbcSecret);
+        }
+    }
+
+    [Fact]
     public async Task BrowserNativeStores_SaveReadDeleteIgnoreLockedValidationStampFile()
     {
         var authenticationId = $"test-{Guid.NewGuid():N}";

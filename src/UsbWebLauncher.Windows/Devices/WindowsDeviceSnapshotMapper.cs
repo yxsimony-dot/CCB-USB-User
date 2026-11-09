@@ -37,7 +37,10 @@ public static class WindowsDeviceSnapshotMapper
     {
         var relatedCdRoms = records
             .Where(IsCdRom)
-            .Where(record => IsDescendantOf(record, usbDevice.InstanceId, recordsByInstanceId))
+            .Where(record => IsOwnedByUsbDevice(
+                record,
+                usbDevice.InstanceId,
+                recordsByInstanceId))
             .ToArray();
         var cdRomNames = NonEmptyDistinct(relatedCdRoms.SelectMany(record =>
             new[] { record.FriendlyName, record.BusReportedDescription }));
@@ -60,23 +63,31 @@ public static class WindowsDeviceSnapshotMapper
             usbDevice.Service);
     }
 
-    private static bool IsDescendantOf(
+    private static bool IsOwnedByUsbDevice(
         WindowsDeviceRecord record,
-        string ancestorInstanceId,
+        string usbDeviceInstanceId,
         IReadOnlyDictionary<string, WindowsDeviceRecord> recordsByInstanceId)
     {
         var parentId = record.ParentInstanceId;
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while (!string.IsNullOrWhiteSpace(parentId) && visited.Add(parentId))
         {
-            if (string.Equals(parentId, ancestorInstanceId, StringComparison.OrdinalIgnoreCase))
+            if (!recordsByInstanceId.TryGetValue(parentId, out var parent))
             {
-                return true;
+                return false;
             }
 
-            parentId = recordsByInstanceId.TryGetValue(parentId, out var parent)
-                ? parent.ParentInstanceId
-                : null;
+            if (parent.InstanceId.StartsWith(
+                    "USB\\",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Equals(
+                    parent.InstanceId,
+                    usbDeviceInstanceId,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+
+            parentId = parent.ParentInstanceId;
         }
 
         return false;

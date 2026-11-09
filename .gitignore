@@ -16,6 +16,10 @@ coverage/
 *.bak
 *.tmp
 *.log
+*.jsonl
+.dotnet-home/
+psbc-*diagnostic*.json
+psbc-*diagnostic*.txt
 
 # Local handoff notes and runtime / bank data
 handoff/

@@ -605,6 +605,8 @@ public sealed class ClientCertificateAuthenticationFlowRouter :
         private static ClientCertificateSetupValidationResult MapCompletionFailure(
             ClientCertificateNativePromptResult result) => result.Status switch
             {
+                ClientCertificateNativePromptStatus.PinRejected =>
+                    new(ClientCertificateSetupValidationStatus.PinRejected, result.PublicErrorCode),
                 ClientCertificateNativePromptStatus.TimedOut =>
                     new(ClientCertificateSetupValidationStatus.TimedOut, result.PublicErrorCode),
                 ClientCertificateNativePromptStatus.Cancelled =>

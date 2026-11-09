@@ -309,7 +309,7 @@ public sealed class WindowsNativePromptBrokerServerTests
     }
 
     [Fact]
-    public void PolicyFile_BindsAValidatedTrustedClientForInstalledRuntime()
+    public async Task PolicyFile_BindsAValidatedTrustedClientForInstalledRuntime()
     {
         var packageJson = JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyDocument(
             NativePromptProtocol.ProtocolVersion,
@@ -329,8 +329,52 @@ public sealed class WindowsNativePromptBrokerServerTests
 
         Assert.True(installed.IsValid);
         Assert.Equal(trustedClient, installed.TrustedClient);
+        using (var document = JsonDocument.Parse(installedJson))
+        {
+            Assert.True(document.RootElement.TryGetProperty("PolicyHash", out _));
+            Assert.False(document.RootElement.TryGetProperty("Policies", out _));
+        }
+
+        var executor = new RecordingExecutor();
+        await using var server = new WindowsNativePromptBrokerServer(
+            installed,
+            "S-1-5-21-123",
+            4,
+            executor);
+        await using var arm = await server.ArmAsync(ValidIdentity(), Request());
+        Assert.Equal(ClientCertificateNativePromptArmStatus.Armed, arm.Response.Status);
+        Assert.Equal(ClientCertificateNativePromptStatus.Success, (await arm.Attempt!.ExecuteAsync()).Status);
+        Assert.Equal(["policy-v1"], executor.ObservedPolicyIds);
         Assert.Throws<InvalidDataException>(() =>
             NativePromptBrokerPolicyFile.BindTrustedClient(installedJson, trustedClient));
+    }
+
+    [Fact]
+    public void PolicyFile_BindsAndLoadsMultiPolicyPackage()
+    {
+        var secondPrompt = Policy() with
+        {
+            PolicyId = "policy-v2",
+            WindowTitle = "Second vendor prompt"
+        };
+        var packageJson = JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyPackageDocument(
+            NativePromptProtocol.ProtocolVersion,
+            [
+                new(ValidHash, Policy()),
+                new(OtherHash, secondPrompt)
+            ]));
+        var trustedClient = TrustedClient();
+
+        var installedJson = NativePromptBrokerPolicyFile.BindTrustedClient(packageJson, trustedClient);
+        var installed = NativePromptBrokerPolicyFile.Parse(installedJson);
+
+        Assert.True(installed.IsValid);
+        Assert.Equal(2, installed.Policies.Count);
+        Assert.Equal(trustedClient, installed.TrustedClient);
+        using var document = JsonDocument.Parse(installedJson);
+        Assert.True(document.RootElement.TryGetProperty("Policies", out var policies));
+        Assert.Equal(2, policies.GetArrayLength());
+        Assert.False(document.RootElement.TryGetProperty("PolicyHash", out _));
     }
 
     [Fact]
@@ -441,6 +485,53 @@ public sealed class WindowsNativePromptBrokerServerTests
     {
         Assert.Throws<InvalidDataException>(() =>
             NativePromptBrokerPolicyFile.Parse(System.Text.Encoding.UTF8.GetBytes(json)));
+    }
+
+    [Fact]
+    public void PolicyFile_RejectsMixedLegacyAndMultiPolicyFields()
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            ProtocolVersion = NativePromptProtocol.ProtocolVersion,
+            Policies = new[]
+            {
+                new { PolicyHash = ValidHash, Prompt = Policy() }
+            },
+            PolicyHash = OtherHash,
+            Prompt = Policy() with { PolicyId = "policy-v2" }
+        });
+
+        Assert.Throws<InvalidDataException>(() => NativePromptBrokerPolicyFile.Parse(json));
+    }
+
+    [Fact]
+    public void PolicyFile_RejectsDuplicatePolicyIds()
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyPackageDocument(
+            NativePromptProtocol.ProtocolVersion,
+            [
+                new(ValidHash, Policy()),
+                new(OtherHash, Policy() with { WindowTitle = "Second vendor prompt" })
+            ]));
+
+        Assert.Throws<InvalidDataException>(() => NativePromptBrokerPolicyFile.Parse(json));
+    }
+
+    [Fact]
+    public void PolicyFile_RejectsPoliciesUsingDifferentBrokerPipes()
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(new NativePromptBrokerPolicyPackageDocument(
+            NativePromptProtocol.ProtocolVersion,
+            [
+                new(ValidHash, Policy()),
+                new(OtherHash, Policy() with
+                {
+                    PolicyId = "policy-v2",
+                    BrokerPipeName = "UsbWebLauncher.OtherBroker.v1"
+                })
+            ]));
+
+        Assert.Throws<InvalidDataException>(() => NativePromptBrokerPolicyFile.Parse(json));
     }
 
     [Fact]
@@ -659,6 +750,70 @@ public sealed class WindowsNativePromptBrokerServerTests
     }
 
     [Fact]
+    public async Task ArmAsync_MultiPolicyPackageRoutesEachRequestToItsExactPrompt()
+    {
+        var executor = new RecordingExecutor();
+        var secondPrompt = Policy() with
+        {
+            PolicyId = "policy-v2",
+            WindowTitle = "Second vendor prompt"
+        };
+        await using var server = CreateServer(
+            executor,
+            [
+                new(ValidHash, Policy()),
+                new(OtherHash, secondPrompt)
+            ]);
+
+        await using (var first = await server.ArmAsync(ValidIdentity(), Request()))
+        {
+            Assert.Equal(ClientCertificateNativePromptArmStatus.Armed, first.Response.Status);
+            Assert.Equal(ClientCertificateNativePromptStatus.Success, (await first.Attempt!.ExecuteAsync()).Status);
+        }
+
+        await using (var second = await server.ArmAsync(
+                         ValidIdentity(),
+                         Request(
+                             new NativePromptAttemptId(8, 2, null),
+                             policyId: "policy-v2",
+                             policyHash: OtherHash)))
+        {
+            Assert.Equal(ClientCertificateNativePromptArmStatus.Armed, second.Response.Status);
+            Assert.Equal(ClientCertificateNativePromptStatus.Success, (await second.Attempt!.ExecuteAsync()).Status);
+        }
+
+        Assert.Equal(["policy-v1", "policy-v2"], executor.ObservedPolicyIds);
+    }
+
+    [Theory]
+    [InlineData("policy-v1", OtherHash)]
+    [InlineData("policy-v2", ValidHash)]
+    public async Task ArmAsync_MultiPolicyPackageRejectsCrossedPolicyIdAndHash(
+        string policyId,
+        string policyHash)
+    {
+        var executor = new RecordingExecutor();
+        await using var server = CreateServer(
+            executor,
+            [
+                new(ValidHash, Policy()),
+                new(OtherHash, Policy() with
+                {
+                    PolicyId = "policy-v2",
+                    WindowTitle = "Second vendor prompt"
+                })
+            ]);
+
+        await using var result = await server.ArmAsync(
+            ValidIdentity(),
+            Request(policyId: policyId, policyHash: policyHash));
+
+        Assert.Equal(ClientCertificateNativePromptArmStatus.PolicyMismatch, result.Response.Status);
+        Assert.Null(result.Attempt);
+        Assert.Equal(0, executor.CallCount);
+    }
+
+    [Fact]
     public async Task StopRejectsNewAttemptsAndCancelsActiveAttempt()
     {
         var executor = new RecordingExecutor();
@@ -738,15 +893,27 @@ public sealed class WindowsNativePromptBrokerServerTests
             new NativePromptBrokerPolicy(
                 ValidHash,
                 Policy(),
-                new NativePromptBrokerTrustedClient(
-                    ClientProcessPath,
-                    ClientProcessHash,
-                    ClientApplicationHash,
-                    ClientCoreHash,
-                    ClientWindowsHash)),
+                TrustedClient()),
             "S-1-5-21-123",
             4,
             executor);
+
+    private static WindowsNativePromptBrokerServer CreateServer(
+        INativePromptExecutor executor,
+        IReadOnlyList<NativePromptBrokerPolicyEntry> policies) =>
+        new(
+            new NativePromptBrokerPolicy(policies, TrustedClient()),
+            "S-1-5-21-123",
+            4,
+            executor);
+
+    private static NativePromptBrokerTrustedClient TrustedClient() =>
+        new(
+            ClientProcessPath,
+            ClientProcessHash,
+            ClientApplicationHash,
+            ClientCoreHash,
+            ClientWindowsHash);
 
     private static NativePromptBrokerClientIdentity ValidIdentity() =>
         new(
@@ -816,6 +983,8 @@ public sealed class WindowsNativePromptBrokerServerTests
 
         public int ObservedTrustedClientProcessId { get; private set; }
 
+        public List<string> ObservedPolicyIds { get; } = [];
+
         public ValueTask<ClientCertificateNativePromptResult> ExecuteAsync(
             ClientCertificateNativePromptOptions policy,
             ClearableSecretBuffer ownedPin,
@@ -832,6 +1001,7 @@ public sealed class WindowsNativePromptBrokerServerTests
 
                 CallCount++;
                 ObservedTrustedClientProcessId = trustedClientProcessId;
+                ObservedPolicyIds.Add(policy.PolicyId);
                 return ValueTask.FromResult(
                     new ClientCertificateNativePromptResult(ClientCertificateNativePromptStatus.Success));
             }

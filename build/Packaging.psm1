@@ -106,6 +106,7 @@ function Assert-CleanPayload([string]$Directory, [switch]$SkipRequiredFiles) {
     foreach ($file in $files) {
         $relative = $file.FullName.Substring($root.Length).TrimStart('\','/')
         if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Payload contains reparse point: $relative" }
+        if ($relative -match '(?i)\.jsonl$|(?:^|[\\/])[^\\/]*psbc[^\\/]*(?:diagnostic|diagnostics)[^\\/]*(?:[\\/]|$)|(?:^|[\\/])[^\\/]*(?:diagnostic|diagnostics)[^\\/]*psbc[^\\/]*(?:[\\/]|$)') { throw "Payload contains PSBC diagnostic artifact: $relative" }
         if ($relative -match '(?i)(^|[\\/])(browser-sessions|logs?|cache|testdata|node_modules|\.git|backups?)([\\/]|$)|\.WebView2([\\/]|$)|download-settings\.json|\.env($|\.)|\.(pdf|pfx|p12|pem|key|log|bak|tmp|pdb|zip)$') { throw "Forbidden payload file: $relative" }
         if ($file.PSIsContainer) { continue }
         if ($file.Extension -notin @('.exe','.dll','.json','.js','.png','.txt','.xml','.config','.dat','.bin','.ps1','.psm1')) { throw "Unapproved payload file type: $relative" }
@@ -140,7 +141,10 @@ function Assert-CleanPayload([string]$Directory, [switch]$SkipRequiredFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Required payload file missing: $required" }
         }
         $policy = [IO.File]::ReadAllText((Join-Path $root 'broker/native-prompt-policy.json')) | ConvertFrom-Json
-        if ($policy.Prompt.ProcessPath -or $policy.Prompt.ProcessSha256) { throw 'Broker policy must be unbound in release payload' }
+        $brokerPolicies = if ($policy.Policies) { @($policy.Policies) } else { @($policy) }
+        foreach ($brokerPolicy in $brokerPolicies) {
+            if ($brokerPolicy.Prompt.ProcessPath) { throw 'Broker policy must not bind an absolute process path in release payload' }
+        }
     }
     Write-Host "Payload validation passed ($(@($files | Where-Object { -not $_.PSIsContainer }).Count) files)."
 }

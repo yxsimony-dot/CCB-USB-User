@@ -7,6 +7,33 @@ namespace UsbWebLauncher.Tests.Presentation;
 
 public sealed class PinSetupDialogTests
 {
+    [Theory]
+    [InlineData("建设银行")]
+    [InlineData("邮储银行")]
+    public async Task DialogLabelsTheSelectedBank(string bankDisplayName)
+    {
+        var result = await RunStaAsync(() =>
+        {
+            PinSetupDialog? dialog = null;
+            dialog = new PinSetupDialog(null, bankDisplayName, () =>
+            {
+                var heading = Assert.IsType<TextBlock>(
+                    dialog!.FindName("HeadingTextBlock"));
+                var description = Assert.IsType<TextBlock>(
+                    dialog.FindName("DescriptionTextBlock"));
+                return heading.Text.Contains(bankDisplayName) &&
+                    description.Text.Contains(bankDisplayName)
+                    ? false
+                    : throw new Xunit.Sdk.XunitException(
+                        "The PIN dialog was not bound to the selected bank.");
+            });
+
+            return dialog.ShowAsync();
+        });
+
+        Assert.Null(result);
+    }
+
     [Fact]
     public async Task SuccessfulConfirmationUsesMaskedInputAndClearsTheControl()
     {

@@ -105,7 +105,7 @@ public sealed class BusinessSessionViewModelTests
         var starts = 0;
         model.ConfigureBusinessCommand(_ => { starts++; return Task.CompletedTask; });
         model.SelectedExportNumber = 9;
-        model.UpdateCurrentPin("ExampleOnly");
+        model.UpdateCurrentPinStatus(PinCredentialStatus.Set);
         model.UpdateSessionState(BusinessSessionState.Active);
         model.UpdateState(new(LauncherStage.Ready, true, "旧轮页面", "旧轮错误"));
         model.UpdateBusinessState(true, true, true, true, "旧轮登录");
@@ -123,7 +123,7 @@ public sealed class BusinessSessionViewModelTests
         Assert.Null(model.ErrorDetail);
         Assert.Equal(string.Empty, model.ExportStatusText);
         Assert.DoesNotContain("旧轮", model.StatusText + model.AuthenticationStatusText + model.CurrentCompanyText);
-        Assert.Equal("当前 PIN：ExampleOnly", model.CurrentPinText);
+        Assert.Equal("当前 PIN：已设置", model.CurrentPinText);
         Assert.Equal(9, model.SelectedExportNumber);
         Assert.True(model.CanResetPin);
         Assert.False(model.CanExportDocuments);

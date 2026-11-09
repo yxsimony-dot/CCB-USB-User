@@ -244,7 +244,11 @@ public sealed class ManualAuthenticationGateTests
             ValidStamp = new(options.Id, options.GetNormalizedHash());
             Stamps = new(ValidStamp);
             Coordinator = new(options, Pins, Stamps, Unlocker);
-            Gate = new(new AuthenticationLauncherGate(Coordinator), Coordinator);
+            Gate = new(
+                new AuthenticationLauncherGate(
+                    BankAuthenticationRuntimeKind.ChinaConstructionBank,
+                    Coordinator),
+                Coordinator);
         }
 
         public MemoryPinStore Pins { get; } = new();

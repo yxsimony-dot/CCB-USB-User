@@ -1,3 +1,4 @@
+using UsbWebLauncher.Core.Devices;
 using UsbWebLauncher.Windows.Devices;
 
 namespace UsbWebLauncher.Tests.Windows;
@@ -132,5 +133,149 @@ public sealed class WindowsDeviceSnapshotMapperTests
         Assert.Empty(target.VolumeLabels);
         Assert.Contains("OTHER U-DISK", other.CdRomNames);
         Assert.Contains("UNRELATED", other.VolumeLabels);
+    }
+
+    [Fact]
+    public void Map_KeepsTendyronPsbcMediaOnItsPhysicalUsbAncestry()
+    {
+        WindowsDeviceRecord[] records =
+        [
+            new(
+                "USB\\VID_1780&PID_0401\\PSBC-KEY",
+                ["USB\\VID_1780&PID_0401"],
+                "Tendyron Token",
+                "PSBC Token",
+                "USB"),
+            new(
+                "USBSTOR\\CDROM\\PSBC-CHILD",
+                ["USBSTOR\\CDROM"],
+                "TENDYRON U-DISK",
+                "TENDYRON U-DISK",
+                "CDROM",
+                "USB\\VID_1780&PID_0401\\PSBC-KEY"),
+            new(
+                "USB\\VID_9999&PID_0001\\UNRELATED",
+                ["USB\\VID_9999&PID_0001"],
+                "Unrelated Token",
+                "Unrelated Token",
+                "USB"),
+            new(
+                "USBSTOR\\CDROM\\UNRELATED-CHILD",
+                ["USBSTOR\\CDROM"],
+                "Unrelated U-DISK",
+                "Unrelated U-DISK",
+                "CDROM",
+                "USB\\VID_9999&PID_0001\\UNRELATED")
+        ];
+        WindowsVolumeRecord[] volumes =
+        [
+            new("PSBC", "CDFS", "USBSTOR\\CDROM\\PSBC-CHILD"),
+            new("PSBC", "CDFS", "USBSTOR\\CDROM\\UNRELATED-CHILD")
+        ];
+
+        var result = WindowsDeviceSnapshotMapper.Map(records, volumes);
+
+        var tendyron = Assert.Single(result, device =>
+            device.InstanceId.EndsWith("PSBC-KEY", StringComparison.Ordinal));
+        Assert.Contains("TENDYRON U-DISK", tendyron.CdRomNames);
+        Assert.Contains("PSBC", tendyron.VolumeLabels);
+
+        var unrelated = Assert.Single(result, device =>
+            device.InstanceId.EndsWith("UNRELATED", StringComparison.Ordinal));
+        Assert.DoesNotContain("TENDYRON U-DISK", unrelated.CdRomNames);
+        Assert.Contains("PSBC", unrelated.VolumeLabels);
+    }
+
+    [Fact]
+    public void Map_DoesNotCopyTendyronMediaOntoAncestorUsbHubs()
+    {
+        WindowsDeviceRecord[] records =
+        [
+            new(
+                "USB\\ROOT_HUB30\\ROOT",
+                ["USB\\ROOT_HUB30"],
+                "USB Root Hub",
+                "USB Root Hub",
+                "USB"),
+            new(
+                "USB\\VID_05E3&PID_0608\\HUB",
+                ["USB\\VID_05E3&PID_0608"],
+                "USB2.0 Hub",
+                "Generic USB Hub",
+                "USB",
+                "USB\\ROOT_HUB30\\ROOT"),
+            new(
+                "USB\\VID_1780&PID_0401\\PSBC-KEY",
+                ["USB\\VID_1780&PID_0401"],
+                "Tendyron Token",
+                "USB Mass Storage Device",
+                "USB",
+                "USB\\VID_05E3&PID_0608\\HUB"),
+            new(
+                "USBSTOR\\CDROM\\PSBC-CHILD",
+                ["USBSTOR\\CDROM"],
+                "TENDYRON U-DISK",
+                "TENDYRON U-DISK",
+                "CDROM",
+                "USB\\VID_1780&PID_0401\\PSBC-KEY")
+        ];
+
+        var result = WindowsDeviceSnapshotMapper.Map(
+            records,
+            [new("PSBC", "CDFS", "USBSTOR\\CDROM\\PSBC-CHILD")]);
+
+        var key = Assert.Single(result, device =>
+            device.InstanceId.EndsWith("PSBC-KEY", StringComparison.Ordinal));
+        Assert.Contains("TENDYRON U-DISK", key.CdRomNames);
+        Assert.Contains("PSBC", key.VolumeLabels);
+
+        foreach (var hub in result.Where(device =>
+                     !device.InstanceId.EndsWith(
+                         "PSBC-KEY",
+                         StringComparison.Ordinal)))
+        {
+            Assert.Empty(hub.CdRomNames);
+            Assert.Empty(hub.VolumeLabels);
+            Assert.False(PsbcUsbKeyMatcher.IsCandidate(
+                UsbKeyVendorFamily.Tendyron,
+                hub));
+        }
+    }
+
+    [Fact]
+    public void Map_DoesNotCopyUnrelatedPsbcMarkersOntoTendyronCandidate()
+    {
+        WindowsDeviceRecord[] records =
+        [
+            new(
+                "USB\\VID_1780&PID_0401\\PSBC-CANDIDATE",
+                ["USB\\VID_1780&PID_0401"],
+                "Tendyron Token",
+                "PSBC Token",
+                "USB"),
+            new(
+                "USB\\VID_9999&PID_0001\\UNRELATED",
+                ["USB\\VID_9999&PID_0001"],
+                "Unrelated Token",
+                "Unrelated Token",
+                "USB"),
+            new(
+                "USBSTOR\\CDROM\\UNRELATED-PSBC",
+                ["USBSTOR\\CDROM"],
+                "TENDYRON U-DISK",
+                "TENDYRON U-DISK",
+                "CDROM",
+                "USB\\VID_9999&PID_0001\\UNRELATED")
+        ];
+
+        var result = WindowsDeviceSnapshotMapper.Map(
+            records,
+            [new("PSBC", "CDFS", "USBSTOR\\CDROM\\UNRELATED-PSBC")]);
+
+        var candidate = Assert.Single(result, device =>
+            device.InstanceId.EndsWith("PSBC-CANDIDATE", StringComparison.Ordinal));
+        Assert.Empty(candidate.CdRomNames);
+        Assert.Empty(candidate.VolumeLabels);
+        Assert.Empty(candidate.FileSystems);
     }
 }

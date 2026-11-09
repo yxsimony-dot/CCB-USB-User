@@ -9,12 +9,10 @@ public delegate ValueTask<WebClientCertificateSelection> WebClientCertificateReq
 public sealed class WebClientCertificate
 {
     internal WebClientCertificate(
-        string sha1Fingerprint,
-        string subject,
-        string issuer,
+        ClientCertificateCandidate candidate,
         object nativeCertificate)
-        : this(sha1Fingerprint, subject, issuer)
     {
+        Candidate = candidate ?? throw new ArgumentNullException(nameof(candidate));
         NativeCertificate = nativeCertificate;
     }
 

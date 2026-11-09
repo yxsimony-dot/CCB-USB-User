@@ -2,6 +2,7 @@ using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using UsbWebLauncher.App.Configuration;
 using UsbWebLauncher.Core.Lifecycle;
+using UsbWebLauncher.Windows.Authentication;
 
 namespace UsbWebLauncher.App.Browser;
 
@@ -10,11 +11,13 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
     private readonly WebView2 _control;
     private readonly Func<string, Task<CoreWebView2Environment>> _createEnvironment;
     private readonly UiThreadResourceDisposer _disposer;
-    private readonly CcbUKeyBrowserExtensionInstaller _extensionInstaller = new();
+    private readonly BankBrowserExtensionInitializer _extensionInitializer = new();
+    private readonly BankBrowserCapabilities _browserCapabilities;
     private readonly WebView2NavigationSessionTracker _navigationSessions = new();
     private readonly WebView2ControlLifetime _lifetime = new();
     private WebClientCertificateRequestHandler? _clientCertificateHandler;
     private bool _clientCertificateHandlerRegistered;
+    private bool _diagnosticOnlyClientCertificateHandler;
     private TaskCompletionSource<long>? _pendingNavigationStart;
     private bool _disposed;
     private WpfKnownPopupHandler? _popupHandler;
@@ -25,21 +28,25 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
     private readonly BrowserSessionDirectoryOwnership _sessionDirectoryOwnership;
     private readonly CancellationToken _sessionToken;
     private readonly Action<string>? _initializationPhase;
+    private readonly PsbcClientCertificateDiagnostics? _psbcCertificateDiagnostics;
     private readonly TaskCompletionSource<uint> _browserProcessExited =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CoreWebView2Environment? _environment;
 
     public WpfWebView2Control(WebView2 control, DownloadDirectorySettings? downloadSettings = null,
         Action<string>? downloadError = null, BrowserSessionDirectory? sessionDirectory = null,
-        CancellationToken sessionToken = default)
+        CancellationToken sessionToken = default,
+        BankBrowserCapabilities? browserCapabilities = null)
         : this(
             control,
             downloadSettings,
             downloadError,
             sessionDirectory,
             sessionToken,
-            CreateEnvironmentAsync,
-            initializationPhase: null)
+            createEnvironment: null,
+            initializationPhase: null,
+            psbcCertificateDiagnostics: null,
+            browserCapabilities)
     {
     }
 
@@ -49,15 +56,18 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         Action<string>? downloadError,
         BrowserSessionDirectory? sessionDirectory,
         CancellationToken sessionToken,
-        Action<string> initializationPhase)
+        Action<string> initializationPhase,
+        BankBrowserCapabilities? browserCapabilities = null)
         : this(
             control,
             downloadSettings,
             downloadError,
             sessionDirectory,
             sessionToken,
-            CreateEnvironmentAsync,
-            initializationPhase)
+            createEnvironment: null,
+            initializationPhase,
+            psbcCertificateDiagnostics: null,
+            browserCapabilities)
     {
     }
 
@@ -67,14 +77,45 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         Action<string>? downloadError,
         BrowserSessionDirectory? sessionDirectory,
         CancellationToken sessionToken,
-        Func<string, Task<CoreWebView2Environment>> createEnvironment,
-        Action<string>? initializationPhase = null)
+        Action<string>? initializationPhase,
+        PsbcClientCertificateDiagnostics? psbcCertificateDiagnostics,
+        BankBrowserCapabilities? browserCapabilities = null)
+        : this(
+            control,
+            downloadSettings,
+            downloadError,
+            sessionDirectory,
+            sessionToken,
+            createEnvironment: null,
+            initializationPhase,
+            psbcCertificateDiagnostics,
+            browserCapabilities)
+    {
+    }
+
+    internal WpfWebView2Control(
+        WebView2 control,
+        DownloadDirectorySettings? downloadSettings,
+        Action<string>? downloadError,
+        BrowserSessionDirectory? sessionDirectory,
+        CancellationToken sessionToken,
+        Func<string, Task<CoreWebView2Environment>>? createEnvironment,
+        Action<string>? initializationPhase = null,
+        PsbcClientCertificateDiagnostics? psbcCertificateDiagnostics = null,
+        BankBrowserCapabilities? browserCapabilities = null)
     {
         _sessionToken = sessionToken;
         _initializationPhase = initializationPhase;
-        _sessionDirectory = sessionDirectory ?? new BrowserSessionDirectory();
+        _psbcCertificateDiagnostics = psbcCertificateDiagnostics;
+        _browserCapabilities =
+            browserCapabilities ?? BankBrowserCapabilities.ChinaConstructionBank;
+        _sessionDirectory = sessionDirectory ??
+            BankBrowserSessionDirectory.Create(_browserCapabilities);
         _sessionDirectoryOwnership = new(_sessionDirectory, RetireSessionDirectory);
-        _createEnvironment = createEnvironment ?? throw new ArgumentNullException(nameof(createEnvironment));
+        _createEnvironment = createEnvironment ??
+            (sessionPath => CreateEnvironmentAsync(
+                sessionPath,
+                _browserCapabilities));
         _downloadSettings = downloadSettings;
         _downloadError = downloadError ?? (_ => { });
         _control = control ?? throw new ArgumentNullException(nameof(control));
@@ -171,35 +212,55 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         _lifetime.ThrowIfDisposed();
         var coreWebView2 = _control.CoreWebView2 ??
             throw new InvalidOperationException("WebView2 initialization did not produce a browser profile.");
+        if (_browserCapabilities.EnablePsbcClientCertificateHandling &&
+            _psbcCertificateDiagnostics is not null &&
+            !_clientCertificateHandlerRegistered)
+        {
+            _clientCertificateHandler = static (_, _) =>
+                ValueTask.FromResult(WebClientCertificateSelection.Deny());
+            coreWebView2.ClientCertificateRequested += OnClientCertificateRequested;
+            _clientCertificateHandlerRegistered = true;
+            _diagnosticOnlyClientCertificateHandler = true;
+        }
         if (_downloadSettings is not null)
             _downloadDirectory ??= new WpfDownloadDirectory(coreWebView2, _downloadSettings, _downloadError);
-        var package = CcbUKeyBrowserExtensionPackage.ResolveFromBaseDirectory(
-            AppContext.BaseDirectory);
-        try
+        if (_browserCapabilities.InstallCcbUKeyExtension)
         {
-            ReportInitializationPhase("extension-installation-started");
-            await _extensionInstaller.EnsureInstalledAsync(
-                new WebView2BrowserExtensionProfile(coreWebView2.Profile),
-                package,
-                cancellationToken);
-            ReportInitializationPhase("extension-installation-completed");
+            try
+            {
+                ReportInitializationPhase("extension-installation-started");
+                await _extensionInitializer.EnsureConfiguredAsync(
+                    _browserCapabilities,
+                    () => new WebView2BrowserExtensionProfile(coreWebView2.Profile),
+                    () => CcbUKeyBrowserExtensionPackage.ResolveFromBaseDirectory(
+                        AppContext.BaseDirectory),
+                    cancellationToken);
+                ReportInitializationPhase("extension-installation-completed");
+            }
+            catch
+            {
+                ReportInitializationPhase("extension-installation-failed");
+                throw;
+            }
         }
-        catch
+        else
         {
-            ReportInitializationPhase("extension-installation-failed");
-            throw;
+            ReportInitializationPhase("extension-installation-skipped");
         }
         _lifetime.ThrowIfDisposed();
-        try
+        if (_browserCapabilities.EnableCcbPageCoordination)
         {
-            _popupHandler ??= new WpfKnownPopupHandler(coreWebView2);
-            await _popupHandler.EnsureInitializedAsync();
-        }
-        catch
-        {
-            _popupHandler?.Dispose();
-            _popupHandler = null;
-            CertificateLoginDiagnostics.Write("popup-handler-unavailable");
+            try
+            {
+                _popupHandler ??= new WpfKnownPopupHandler(coreWebView2);
+                await _popupHandler.EnsureInitializedAsync();
+            }
+            catch
+            {
+                _popupHandler?.Dispose();
+                _popupHandler = null;
+                CertificateLoginDiagnostics.Write("popup-handler-unavailable");
+            }
         }
         _lifetime.ThrowIfDisposed();
         ReportInitializationPhase("initialization-completed");
@@ -339,6 +400,7 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         });
 
         _clientCertificateHandlerRegistered = false;
+        _diagnosticOnlyClientCertificateHandler = false;
         _clientCertificateHandler = null;
         Release("directory-disposal-request", _sessionDirectoryOwnership.DisposeRequested);
         Release("native-controller", _control.Dispose);
@@ -363,11 +425,13 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             "browser-session-directory-retire");
     }
 
-    private static Task<CoreWebView2Environment> CreateEnvironmentAsync(string sessionPath) =>
+    private static Task<CoreWebView2Environment> CreateEnvironmentAsync(
+        string sessionPath,
+        BankBrowserCapabilities capabilities) =>
         CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
             userDataFolder: sessionPath,
-            CcbUKeyWebView2Environment.CreateOptions());
+            BankWebView2Environment.CreateOptions(capabilities));
 
     private static void ObserveDirectoryCleanup(Task task, string operation) =>
         BackgroundTaskObserver.Observe(
@@ -446,6 +510,13 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
 
         if (_clientCertificateHandlerRegistered)
         {
+            if (_diagnosticOnlyClientCertificateHandler)
+            {
+                _clientCertificateHandler = handler;
+                _diagnosticOnlyClientCertificateHandler = false;
+                return;
+            }
+
             if (!ReferenceEquals(_clientCertificateHandler, handler))
             {
                 throw new InvalidOperationException("Client-certificate handler is already registered.");
@@ -490,6 +561,12 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         object? sender,
         CoreWebView2ClientCertificateRequestedEventArgs eventArgs)
     {
+        if (_diagnosticOnlyClientCertificateHandler)
+        {
+            await ObserveDiagnosticOnlyClientCertificateRequestAsync(eventArgs);
+            return;
+        }
+
         CoreWebView2Deferral? deferral = null;
         IDisposable? certificateRequestLease = null;
         var deferralCompleted = false;
@@ -555,7 +632,53 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         }
     }
 
-    private static WebClientCertificateRequest MapClientCertificateRequest(
+    private async Task ObserveDiagnosticOnlyClientCertificateRequestAsync(
+        CoreWebView2ClientCertificateRequestedEventArgs eventArgs)
+    {
+        CoreWebView2Deferral? deferral = null;
+        IDisposable? certificateRequestLease = null;
+        var allowBrowserSelection = false;
+        try
+        {
+            deferral = eventArgs.GetDeferral();
+            if (!_navigationSessions.TryEnterCertificateRequest(
+                    out certificateRequestLease,
+                    out var authenticationBindingTask))
+            {
+                return;
+            }
+
+            await authenticationBindingTask.WaitAsync(_sessionToken);
+            _ = MapClientCertificateRequest(eventArgs);
+            allowBrowserSelection = true;
+        }
+        catch
+        {
+            // A revoked or unbound request remains denied.
+        }
+        finally
+        {
+            certificateRequestLease?.Dispose();
+            try
+            {
+                eventArgs.SelectedCertificate = null;
+                eventArgs.Handled = !allowBrowserSelection;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                deferral?.Complete();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private WebClientCertificateRequest MapClientCertificateRequest(
         CoreWebView2ClientCertificateRequestedEventArgs eventArgs)
     {
         var port = eventArgs.Port is > 0 and <= 65535 ? eventArgs.Port : 443;
@@ -563,13 +686,20 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         var certificates = eventArgs.MutuallyTrustedCertificates.Select(certificate =>
         {
             using var x509 = certificate.ToX509Certificate2();
-            var identity = WebClientCertificateIdentity.FromCertificate(x509);
+            var providerMetadata =
+                WindowsCertificateProviderMetadataResolver.Instance.Read(x509);
+            var identity = WebClientCertificateIdentity.FromCertificate(
+                x509,
+                providerMetadata);
             return new WebClientCertificate(
-                identity.Sha1Fingerprint,
-                identity.Subject,
-                identity.Issuer,
+                identity.ToCandidate(),
                 certificate);
-        });
-        return new WebClientCertificateRequest(requestUri, eventArgs.IsProxy, certificates);
+        }).ToArray();
+        var request = new WebClientCertificateRequest(
+            requestUri,
+            eventArgs.IsProxy,
+            certificates);
+        _psbcCertificateDiagnostics?.Write(request);
+        return request;
     }
 }

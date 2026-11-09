@@ -456,7 +456,9 @@ public sealed class ClientCertificateAuthenticationEndToEndTests
                 router,
                 router,
                 TimeSpan.FromSeconds(30));
-            var authenticationGate = new AuthenticationLauncherGate(authentication);
+            var authenticationGate = new AuthenticationLauncherGate(
+                BankAuthenticationRuntimeKind.ChinaConstructionBank,
+                authentication);
             ManualAuthenticationGate? manualGate = null;
             if (ccbMode)
             {

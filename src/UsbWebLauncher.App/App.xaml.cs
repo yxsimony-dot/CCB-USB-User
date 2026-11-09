@@ -11,6 +11,7 @@ using UsbWebLauncher.Core.Coordination;
 using UsbWebLauncher.Core.Devices;
 using UsbWebLauncher.Core.Lifecycle;
 using UsbWebLauncher.Windows.Devices;
+using UsbWebLauncher.Windows.Authentication.NativePrompt;
 using UsbWebLauncher.App.Updates;
 
 namespace UsbWebLauncher.App;
@@ -30,22 +31,31 @@ public partial class App : Application
     private WpfDocumentsExporter? _documentsExporter;
     private WpfCurrentCompanyDisplay? _currentCompanyDisplay;
     private ApplicationLaunchOptions _launchOptions = new(false);
-    private string? _pinCredentialTargetName;
+    private BankPinCredentialBinding? _pinCredentialBinding;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
     private bool _initializing;
     private bool _retryInProgress;
     private BusinessSessionScope? _session;
+    private BankRuntimeOwner? _runtimeOwner;
+    private BankRuntimeCallbackGuard? _runtimeCallbackGuard;
+    private long _runtimeRevision;
+    private EventHandler<LauncherStateChangedEventArgs>? _coordinatorStateChangedHandler;
+    private EventHandler<AuthenticationStateChangedEventArgs>? _authenticationStateChangedHandler;
+    private EventHandler? _actionsStateChangedHandler;
+    private EventHandler? _exportStateChangedHandler;
     private readonly ApplicationRuntimeCleanup _runtimeCleanup = new();
     private Task? _stopTask;
     private Task? _startTask;
-    private UsbKeyPresenceObserver? _keyPresenceObserver;
+    private IUsbKeyPresenceObserver? _keyPresenceObserver;
     private long _keyPresenceRevision;
     private readonly ApplicationExitWatchdog _exitWatchdog = new();
     private UpdatePresentationController? _updates;
     private LifecycleObservationReport? _lifecycleObservationReport;
     private string? _lifecycleObservationReportPath;
     private int _lifecycleObservationCycle;
+    private PsbcClientCertificateDiagnostics? _psbcCertificateDiagnostics;
+    private PsbcNativeWindowDiagnostics? _psbcNativeWindowDiagnostics;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -68,11 +78,24 @@ public partial class App : Application
             }
 
             CertificateLoginDiagnostics.BeginRun();
+            if (_launchOptions.PsbcCertificateDiagnosticsPath is { } diagnosticsPath)
+            {
+                _psbcCertificateDiagnostics =
+                    new PsbcClientCertificateDiagnostics(diagnosticsPath);
+                _psbcCertificateDiagnostics.BeginRun();
+            }
+            if (_launchOptions.PsbcNativeWindowDiagnosticsPath is { } windowDiagnosticsPath)
+            {
+                _psbcNativeWindowDiagnostics =
+                    new PsbcNativeWindowDiagnostics(windowDiagnosticsPath);
+                _psbcNativeWindowDiagnostics.BeginRun();
+            }
 
             _window = new MainWindow();
             MainWindow = _window;
             _window.Closing += OnMainWindowClosing;
             _window.RetryRequested += OnRetryRequested;
+            _window.ViewModel.BankFlowChangeRequested += OnBankFlowChangeRequested;
             _updates = new UpdatePresentationController(GitHubApplicationUpdateService.CreateDefault(ProductVersion.Display),
                 _window.ViewModel, ProductVersion.Display, UpdatePresentationController.LaunchInteractiveInstaller,
                 () => _window.Close());
@@ -158,6 +181,7 @@ public partial class App : Application
         }
 
         _initializing = true;
+        BankRuntimeCallbackGuard? initializationGuard = null;
         _window.ViewModel.UpdateBusinessState(false, false, true, true);
         try
         {
@@ -170,33 +194,66 @@ public partial class App : Application
                 _runtimeCleanup.Reset();
             }
             if (_shutdownStarted) return;
+            var bankFlow = _window.ViewModel.SelectedBankFlow;
+            if (!bankFlow.IsConfigured)
+            {
+                return;
+            }
             var session = new BusinessSessionScope(_lifetime.Token);
+            var runtimeOwner = new BankRuntimeOwner(
+                session,
+                Interlocked.Increment(ref _runtimeRevision),
+                bankFlow.Kind);
+            var callbackGuard = new BankRuntimeCallbackGuard(
+                runtimeOwner,
+                () => _runtimeOwner,
+                () => Volatile.Read(ref _runtimeRevision),
+                () => _window?.ViewModel.SelectedBankFlow.Kind);
             var sessionToken = session.Token;
             _session = session;
+            _runtimeOwner = runtimeOwner;
+            _runtimeCallbackGuard = callbackGuard;
+            initializationGuard = callbackGuard;
+            if (bankFlow.Kind == BankFlowKind.PostalSavingsBank &&
+                _psbcNativeWindowDiagnostics is { } nativeWindowDiagnostics)
+            {
+                ObserveBackground(
+                    nativeWindowDiagnostics.ObserveAsync(sessionToken),
+                    "psbc-native-window-diagnostics");
+            }
             _presenter = new LauncherUiPresenter(_window.ViewModel, new WpfUiDispatcher(Dispatcher),
-                _window.ActivateForBrowser, () => session.IsCurrent);
+                _window.ActivateForBrowser, () => callbackGuard.IsCurrent);
             var browser = _window.CreateBrowserControl();
 
-            var profilePath = Path.Combine(AppContext.BaseDirectory, "launcher-profile.json");
+            var profilePath = Path.Combine(AppContext.BaseDirectory, bankFlow.ProfileFileName!);
             var profile = LauncherProfileJson.Parse(await File.ReadAllTextAsync(
                 profilePath,
                 sessionToken));
             sessionToken.ThrowIfCancellationRequested();
-            _pinCredentialTargetName = profile.ClientCertificateAuthentication?.CredentialTargetName;
+            var usbKeyFlowFactory = BankUsbKeyFlowFactory.CreateDefault(
+                policy => _launchOptions.UseEmptyDeviceMonitor
+                    ? new EmptyUsbDeviceMonitor()
+                    : new WindowsUsbDeviceMonitor(policy),
+                () => new PsbcUsbKeyProbeAggregator(
+                    new WindowsPsbcUsbKeyEnvironmentQuery()));
+            var usbKeyFlow = usbKeyFlowFactory.Create(bankFlow.Kind, profile);
             if (_keyPresenceObserver is null)
             {
-                IUsbDeviceMonitor presenceMonitor = _launchOptions.UseEmptyDeviceMonitor
-                    ? new EmptyUsbDeviceMonitor()
-                    : new WindowsUsbDeviceMonitor(enableCcbMetadataRetry: profile.UsbDetectionStrategy == "ccbUsbStor");
-                var observer = new UsbKeyPresenceObserver(presenceMonitor,
-                    device => UsbDeviceMatcher.IsMatch(device, profile),
-                    present =>
+                var presenceRevision = Interlocked.Increment(
+                    ref _keyPresenceRevision);
+                var observer = usbKeyFlow.CreatePresenceObserver(
+                    status =>
                     {
-                        var revision = Interlocked.Increment(ref _keyPresenceRevision);
                         Dispatcher.BeginInvoke(new Action(() =>
                         {
-                            if (_shutdownStarted || revision != Volatile.Read(ref _keyPresenceRevision)) return;
-                            _window?.ViewModel.UpdateUsbKeyPresence(present);
+                            if (_shutdownStarted ||
+                                presenceRevision != Volatile.Read(
+                                    ref _keyPresenceRevision) ||
+                                _window?.ViewModel.SelectedBankFlow.Kind != bankFlow.Kind)
+                            {
+                                return;
+                            }
+                            _window?.ViewModel.UpdateUsbKeyDetectionStatus(status);
                         }));
                     });
                 _keyPresenceObserver = observer;
@@ -208,96 +265,149 @@ public partial class App : Application
             }
 
             var observationSessionDirectory = _launchOptions.LifecycleObservationReportPath is { } reportPath
-                ? new BrowserSessionDirectory(LifecycleObservation.GetBrowserSessionRoot(reportPath))
+                ? BankBrowserSessionDirectory.Create(
+                    bankFlow.BrowserCapabilities,
+                    LifecycleObservation.GetBrowserSessionRoot(reportPath))
                 : null;
-            _browserControl = _launchOptions.IsLifecycleObservation
-                ? new WpfWebView2Control(
-                    browser,
-                    _window.DownloadSettings,
-                    _window.ShowDownloadDirectoryError,
-                    observationSessionDirectory,
-                    sessionToken,
-                    RecordLifecycleObservationPhase)
-                : new WpfWebView2Control(
-                    browser,
-                    _window.DownloadSettings,
-                    _window.ShowDownloadDirectoryError,
-                    observationSessionDirectory,
-                    sessionToken);
+            _browserControl = new WpfWebView2Control(
+                browser,
+                _window.DownloadSettings,
+                _window.ShowDownloadDirectoryError,
+                observationSessionDirectory,
+                sessionToken,
+                _launchOptions.IsLifecycleObservation
+                    ? RecordLifecycleObservationPhase
+                    : null,
+                bankFlow.BrowserCapabilities.EnablePsbcClientCertificateHandling
+                    ? _psbcCertificateDiagnostics
+                    : null,
+                bankFlow.BrowserCapabilities);
             _browserHost = new WebView2BrowserHost(_browserControl);
             var composer = new LauncherApplicationComposer(
                 new WindowsClientCertificateAuthenticationRuntimeFactory());
-            IUsbDeviceMonitor deviceMonitor = _launchOptions.UseEmptyDeviceMonitor
-                ? new EmptyUsbDeviceMonitor()
-                : new WindowsUsbDeviceMonitor(
-                    enableCcbMetadataRetry: profile.UsbDetectionStrategy == "ccbUsbStor");
-            deviceMonitor = new SessionUsbDeviceMonitor(deviceMonitor,
-                device => UsbDeviceMatcher.IsMatch(device, profile),
-                () => OnSessionDeviceRemoved(session));
+            var deviceMonitor = usbKeyFlow.CreateSessionMonitor(
+                () => OnSessionDeviceRemoved(callbackGuard),
+                callbackGuard);
             var composedRuntime = await composer.ComposeAsync(
                 profile,
                 deviceMonitor,
                 _browserHost,
-                sessionToken);
+                bankFlow,
+                sessionToken,
+                usbKeyFlow.CoordinatorMatcher);
             // Shutdown can finish its ownership snapshot while composition is
             // awaiting an external dependency. Never publish a late runtime into
             // the already-cleared fields; release that local owner instead.
-            if (_shutdownStarted || !session.IsCurrent || !ReferenceEquals(session, _session))
+            if (_shutdownStarted || !callbackGuard.IsCurrent)
             {
                 await composedRuntime.DisposeAsync();
                 return;
             }
             _runtime = composedRuntime;
             _coordinator = _runtime.Launcher;
-            _coordinator.StateChanged += OnCoordinatorStateChanged;
+            var coordinator = _coordinator;
+            _coordinatorStateChangedHandler = (sender, eventArgs) =>
+                OnCoordinatorStateChanged(
+                    callbackGuard,
+                    coordinator,
+                    sender,
+                    eventArgs);
+            coordinator.StateChanged += _coordinatorStateChangedHandler;
 
             _authenticationRuntime = _runtime.Authentication;
             if (_authenticationRuntime is not null)
             {
-                _authenticationRuntime.StateChanged += OnAuthenticationStateChanged;
+                var authenticationRuntime = _authenticationRuntime;
+                var pinAuthenticationOptions =
+                    profile.ClientCertificateAuthentication ??
+                    throw new InvalidOperationException(
+                        "认证运行时缺少客户端证书配置。");
+                _pinCredentialBinding = BankPinCredentialBinding.Create(
+                    authenticationRuntime.RuntimeKind,
+                    pinAuthenticationOptions);
+                _authenticationStateChangedHandler = (sender, eventArgs) =>
+                    OnAuthenticationStateChanged(
+                        callbackGuard,
+                        authenticationRuntime,
+                        sender,
+                        eventArgs);
+                authenticationRuntime.StateChanged +=
+                    _authenticationStateChangedHandler;
                 var localPinCommands = new LocalPinCommands(
-                    () => new PinSetupDialog(_window),
-                    _authenticationRuntime.PinSetupService,
-                    _authenticationRuntime.BrokerPrerequisites);
-                var pageLogin = _authenticationRuntime.PinStore is { } pinStore &&
+                    () => new PinSetupDialog(_window, bankFlow.DisplayName),
+                    authenticationRuntime.PinSetupService,
+                    authenticationRuntime.BrokerPrerequisites);
+                var pageLogin = authenticationRuntime.PinStore is { } pinStore &&
                     profile.ClientCertificateAuthentication is { } authenticationOptions
-                    ? new CertificatePageLoginCoordinator(pinStore,
-                        authenticationOptions.CredentialTargetName,
-                        new WpfCertificateLoginPage(browser, new Uri(profile.TargetUrl), authenticationOptions, sessionToken),
-                        sessionToken: sessionToken)
+                    ? _runtime.BankComponents.CreateCcbPageCoordinator(
+                        () => new CertificatePageLoginCoordinator(
+                            pinStore,
+                            authenticationOptions.CredentialTargetName,
+                            new WpfCertificateLoginPage(
+                                browser,
+                                new Uri(profile.TargetUrl),
+                                authenticationOptions,
+                                sessionToken),
+                            sessionToken: sessionToken))
                     : null;
                 _actions = new ManualLauncherActions(_coordinator, localPinCommands,
-                    _authenticationRuntime.BrokerPrerequisites, IsAuthenticationBusy,
-                    _authenticationRuntime.ManualControl, pageLogin,
-                    () => _authenticationRuntime?.CurrentState.Stage ?? AuthenticationStage.WaitingForDevice,
+                    authenticationRuntime.BrokerPrerequisites,
+                    () => IsAuthenticationBusy(callbackGuard, authenticationRuntime),
+                    authenticationRuntime.ManualControl, pageLogin,
+                    () => callbackGuard.IsCurrent
+                        ? authenticationRuntime.CurrentState.Stage
+                        : AuthenticationStage.WaitingForDevice,
                     new WpfUiDispatcher(Dispatcher));
                 _window.ViewModel.ConfigureLocalPinCommands(_actions);
-                _ = await _authenticationRuntime.BrokerPrerequisites.RefreshHealthAsync(
+                _ = await authenticationRuntime.BrokerPrerequisites.RefreshHealthAsync(
                     sessionToken);
                 sessionToken.ThrowIfCancellationRequested();
-                _presenter.PresentAuthentication(_authenticationRuntime.CurrentState);
-                await RefreshCurrentPinAsync();
+                _presenter.PresentAuthentication(authenticationRuntime.CurrentState);
+                await RefreshCurrentPinAsync(
+                    callbackGuard,
+                    authenticationRuntime,
+                    _pinCredentialBinding);
                 sessionToken.ThrowIfCancellationRequested();
             }
 
             _actions ??= new ManualLauncherActions(_coordinator, NullLocalPinCommands.Instance);
-            _actions.StateChanged += OnActionsStateChanged;
-            _window.ViewModel.ConfigureBusinessCommand(StartBusinessSessionAsync);
-            _window.ViewModel.ConfigureStopBusinessCommand(_ => StopBusinessSessionAsync());
+            var actions = _actions;
+            _actionsStateChangedHandler = (sender, eventArgs) =>
+                OnActionsStateChanged(
+                    callbackGuard,
+                    actions,
+                    sender,
+                    eventArgs);
+            actions.StateChanged += _actionsStateChangedHandler;
+            _window.ViewModel.ConfigureBusinessCommand(
+                token => StartBusinessSessionAsync(
+                    callbackGuard,
+                    actions,
+                    token));
+            _window.ViewModel.ConfigureStopBusinessCommand(
+                _ => StopBusinessSessionAsync(callbackGuard));
             _documentsExporter = new WpfDocumentsExporter(browser, _window.DownloadSettings);
             _currentCompanyDisplay = new WpfCurrentCompanyDisplay(browser,
-                text => { if (session.IsCurrent) _window.ViewModel.UpdateCurrentCompany(text); });
-            _documentsExporter.StateChanged += OnExportStateChanged;
+                text => Dispatcher.BeginInvoke(new Action(() =>
+                    callbackGuard.TryPublish(
+                        () => _window.ViewModel.UpdateCurrentCompany(text)))));
             var exporter = _documentsExporter;
+            _exportStateChangedHandler = (sender, eventArgs) =>
+                OnExportStateChanged(
+                    callbackGuard,
+                    exporter,
+                    sender,
+                    eventArgs);
+            exporter.StateChanged += _exportStateChangedHandler;
             _window.ViewModel.ConfigureDocumentsExportCommand(async (month, token) =>
             {
-                if (!session.IsCurrent) return;
+                if (!callbackGuard.IsCurrent) return;
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, sessionToken);
                 await exporter.ExportAsync(month, linked.Token);
             });
 
             _presenter.Present(_coordinator.CurrentState);
-            PresentBusinessState();
+            PresentBusinessState(callbackGuard);
         }
         catch (OperationCanceledException) when (_shutdownStarted || _lifetime.IsCancellationRequested || _session?.IsCurrent != true)
         {
@@ -313,14 +423,84 @@ public partial class App : Application
         finally
         {
             _initializing = false;
-            PresentBusinessState();
+            PresentBusinessState(initializationGuard);
+        }
+    }
+
+    private async void OnBankFlowChangeRequested(object? sender, BankFlowChangedEventArgs eventArgs)
+    {
+        var window = _window;
+        if (window is null || _shutdownStarted)
+        {
+            return;
+        }
+
+        var viewModel = window.ViewModel;
+        viewModel.BeginBankFlowSwitch();
+        var selectedFlow = eventArgs.Current;
+        var runtimeOwner = _runtimeOwner;
+        Interlocked.Increment(ref _runtimeRevision);
+        var revocation = runtimeOwner?.Session.RevokeAsync() ??
+            _session?.RevokeAsync() ??
+            Task.CompletedTask;
+        Interlocked.Increment(ref _keyPresenceRevision);
+
+        try
+        {
+            await RunSerializedAsync(async () =>
+            {
+                await revocation;
+                await DisposeKeyPresenceObserverAsync();
+                if (_shutdownStarted || viewModel.SelectedBankFlow != selectedFlow)
+                {
+                    return;
+                }
+
+                await InitializeLauncherCoreAsync();
+            });
+        }
+        catch (OperationCanceledException) when (_shutdownStarted || _lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            CertificateLoginDiagnostics.Write(
+                "bank-flow-switch-error",
+                new
+                {
+                    bank = selectedFlow.Kind.ToString(),
+                    exceptionType = exception.GetType().Name
+                });
+            ShowStartupError(exception);
+        }
+        finally
+        {
+            if (!_shutdownStarted && viewModel.SelectedBankFlow == selectedFlow)
+            {
+                viewModel.CompleteBankFlowSwitch(
+                    selectedFlow.IsConfigured ? null : selectedFlow.UnavailableStatusText);
+            }
+        }
+    }
+
+    private async Task DisposeKeyPresenceObserverAsync()
+    {
+        Interlocked.Increment(ref _keyPresenceRevision);
+        var observer = _keyPresenceObserver;
+        _keyPresenceObserver = null;
+        if (observer is not null)
+        {
+            await Task.Run(async () => await observer.DisposeAsync());
         }
     }
 
     private async Task RunLifecycleObservationAsync(string reportPath)
     {
         var tolerances = new LifecycleObservationTolerances();
-        var browserSessionRoot = LifecycleObservation.GetBrowserSessionRoot(reportPath);
+        var browserSessionRoot = BankBrowserSessionDirectory.ResolveRoot(
+            _window?.ViewModel.SelectedBankFlow.BrowserCapabilities ??
+                BankBrowserCapabilities.ChinaConstructionBank,
+            LifecycleObservation.GetBrowserSessionRoot(reportPath));
         var report = new LifecycleObservationReport
         {
             Tolerances = tolerances,
@@ -456,9 +636,10 @@ public partial class App : Application
         LifecycleObservation.WriteReport(reportPath, report);
     }
 
-    private void OnSessionDeviceRemoved(BusinessSessionScope session)
+    private void OnSessionDeviceRemoved(BankRuntimeCallbackGuard callbackGuard)
     {
-        if (!session.IsCurrent) return;
+        if (!callbackGuard.IsCurrent) return;
+        var session = callbackGuard.Owner.Session;
         // Revoke on the notification thread before the old coordinator can see a
         // replacement Key. Never await cleanup here: it owns this device monitor.
         ObserveBackground(session.RevokeAsync(), "session-device-removal-revocation");
@@ -466,111 +647,214 @@ public partial class App : Application
         ObserveBackground(
             Dispatcher.InvokeAsync(async () =>
             {
-                if (_shutdownStarted || !ReferenceEquals(session, _session)) return;
-                await StopBusinessSessionAsync();
+                if (_shutdownStarted || !callbackGuard.OwnsCurrentRuntime) return;
+                await StopBusinessSessionAsync(callbackGuard);
             }).Task.Unwrap(),
             "session-device-removal-stop");
     }
 
     private void OnCoordinatorStateChanged(
+        BankRuntimeCallbackGuard callbackGuard,
+        LauncherCoordinator coordinator,
         object? sender,
         LauncherStateChangedEventArgs eventArgs)
     {
-        var session = _session;
-        if (session?.IsCurrent != true || !ReferenceEquals(sender, _coordinator)) return;
+        if (!callbackGuard.IsCurrent ||
+            !ReferenceEquals(sender, coordinator))
+        {
+            return;
+        }
+
         _ = Dispatcher.InvokeAsync(() =>
         {
-            if (!session.IsCurrent || !ReferenceEquals(session, _session)) return;
-            _presenter?.Present(eventArgs.State);
-            _currentCompanyDisplay?.SetDevicePresent(eventArgs.State.IsUsbPresent);
+            callbackGuard.TryPublish(() =>
+            {
+                if (!ReferenceEquals(coordinator, _coordinator)) return;
+                _presenter?.Present(eventArgs.State);
+                _currentCompanyDisplay?.SetDevicePresent(eventArgs.State.IsUsbPresent);
+            });
         });
     }
 
     private void OnAuthenticationStateChanged(
+        BankRuntimeCallbackGuard callbackGuard,
+        IClientCertificateAuthenticationRuntime authenticationRuntime,
         object? sender,
         AuthenticationStateChangedEventArgs eventArgs)
     {
-        var session = _session;
-        if (session?.IsCurrent != true || !ReferenceEquals(sender, _authenticationRuntime)) return;
+        if (!callbackGuard.IsCurrent ||
+            !ReferenceEquals(sender, authenticationRuntime))
+        {
+            return;
+        }
+
         _ = Dispatcher.InvokeAsync(() =>
         {
-            if (!session.IsCurrent || !ReferenceEquals(session, _session)) return;
-            _presenter?.PresentAuthentication(eventArgs.State);
-            _actions?.RefreshPageLogin();
-            _ = RefreshCurrentPinAsync();
+            callbackGuard.TryPublish(() =>
+            {
+                if (!ReferenceEquals(
+                        authenticationRuntime,
+                        _authenticationRuntime))
+                {
+                    return;
+                }
+
+                _presenter?.PresentAuthentication(eventArgs.State);
+                _actions?.RefreshPageLogin();
+                _ = RefreshCurrentPinAsync(
+                    callbackGuard,
+                    authenticationRuntime,
+                    _pinCredentialBinding);
+            });
         });
     }
 
-    private bool IsAuthenticationBusy() => _authenticationRuntime?.CurrentState.Stage is
-        AuthenticationStage.ValidatingCompatibility or AuthenticationStage.UnlockingToken or
-        AuthenticationStage.AwaitingCertificate or AuthenticationStage.Authenticating;
+    private static bool IsAuthenticationBusy(
+        BankRuntimeCallbackGuard callbackGuard,
+        IClientCertificateAuthenticationRuntime authenticationRuntime) =>
+        callbackGuard.IsCurrent &&
+        authenticationRuntime.CurrentState.Stage is
+            AuthenticationStage.ValidatingCompatibility or
+            AuthenticationStage.UnlockingToken or
+            AuthenticationStage.AwaitingCertificate or
+            AuthenticationStage.Authenticating;
 
-    private void OnActionsStateChanged(object? sender, EventArgs e)
+    private void OnActionsStateChanged(
+        BankRuntimeCallbackGuard callbackGuard,
+        ManualLauncherActions actions,
+        object? sender,
+        EventArgs eventArgs)
     {
-        var session = _session;
-        if (session?.IsCurrent != true || !ReferenceEquals(sender, _actions)) return;
+        if (!callbackGuard.IsCurrent ||
+            !ReferenceEquals(sender, actions))
+        {
+            return;
+        }
+
         _ = Dispatcher.InvokeAsync(() =>
         {
-            if (!session.IsCurrent || !ReferenceEquals(session, _session)) return;
-            PresentBusinessState();
-            _ = RefreshCurrentPinAsync();
+            callbackGuard.TryPublish(() =>
+            {
+                if (!ReferenceEquals(actions, _actions)) return;
+                PresentBusinessState(callbackGuard);
+                if (_authenticationRuntime is { } authenticationRuntime)
+                {
+                    _ = RefreshCurrentPinAsync(
+                        callbackGuard,
+                        authenticationRuntime,
+                        _pinCredentialBinding);
+                }
+            });
         });
     }
 
-    private async Task RefreshCurrentPinAsync()
+    private async Task RefreshCurrentPinAsync(
+        BankRuntimeCallbackGuard callbackGuard,
+        IClientCertificateAuthenticationRuntime authenticationRuntime,
+        BankPinCredentialBinding? credentialBinding)
     {
         var window = _window;
-        var pinStore = _authenticationRuntime?.PinStore;
-        var targetName = _pinCredentialTargetName;
-        var session = _session;
-        if (window is null || pinStore is null || string.IsNullOrWhiteSpace(targetName))
+        var pinStore = authenticationRuntime.PinStore;
+        if (window is null ||
+            pinStore is null ||
+            credentialBinding is null ||
+            credentialBinding.RuntimeKind != authenticationRuntime.RuntimeKind ||
+            !callbackGuard.IsCurrent ||
+            !ReferenceEquals(authenticationRuntime, _authenticationRuntime))
         {
             return;
         }
 
         try
         {
-            using var pin = await pinStore.ReadAsync(targetName, _lifetime.Token)
+            var status = await credentialBinding.ReadStatusAsync(
+                    pinStore,
+                    callbackGuard.Owner.Session.Token)
                 .ConfigureAwait(false);
-            var pinText = pin is null ? null : new string(pin.AsMemory().Span);
-            await Dispatcher.InvokeAsync(() => { if (session?.IsCurrent == true) window.ViewModel.UpdateCurrentPin(pinText); });
+            await Dispatcher.InvokeAsync(() =>
+                callbackGuard.TryPublish(() =>
+                {
+                    if (ReferenceEquals(
+                            authenticationRuntime,
+                            _authenticationRuntime))
+                    {
+                        window.ViewModel.UpdateCurrentPinStatus(status);
+                    }
+                }));
         }
-        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        catch (OperationCanceledException) when (
+            _lifetime.IsCancellationRequested ||
+            !callbackGuard.IsCurrent)
         {
         }
         catch
         {
-            await Dispatcher.InvokeAsync(() => { if (session?.IsCurrent == true) window.ViewModel.UpdateCurrentPin("读取失败"); });
+            await Dispatcher.InvokeAsync(() =>
+                callbackGuard.TryPublish(() =>
+                {
+                    if (ReferenceEquals(
+                            authenticationRuntime,
+                            _authenticationRuntime))
+                    {
+                        window.ViewModel.UpdateCurrentPinStatus(
+                            PinCredentialStatus.ReadFailed);
+                    }
+                }));
         }
     }
 
-    private void OnExportStateChanged(object? sender, EventArgs e)
+    private void OnExportStateChanged(
+        BankRuntimeCallbackGuard callbackGuard,
+        WpfDocumentsExporter exporter,
+        object? sender,
+        EventArgs eventArgs)
     {
-        if (_session?.IsCurrent != true || _documentsExporter is null || !ReferenceEquals(sender, _documentsExporter)) return;
-        _window?.ViewModel.UpdateExportState(_documentsExporter.IsBusy, _documentsExporter.Message);
+        if (!callbackGuard.IsCurrent ||
+            !ReferenceEquals(sender, exporter))
+        {
+            return;
+        }
+
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            callbackGuard.TryPublish(() =>
+            {
+                if (!ReferenceEquals(exporter, _documentsExporter)) return;
+                _window?.ViewModel.UpdateExportState(
+                    exporter.IsBusy,
+                    exporter.Message);
+            });
+        });
     }
 
-    private void PresentBusinessState()
+    private void PresentBusinessState(
+        BankRuntimeCallbackGuard? callbackGuard = null)
     {
-        var session = _session;
         Dispatcher.BeginInvoke(new Action(() =>
         {
-        if (session is not null && !session.IsCurrent) return;
-        _window?.ViewModel.UpdateBusinessState(
-            initialized: _actions is not null && !_initializing && !_shutdownStarted,
-            started: _actions?.HasStarted == true,
-            awaitingExplicitStart: _actions?.RequiresExplicitStart != false,
-            operationBusy: _initializing || _shutdownStarted || _actions?.IsBusy == true,
-            message: _actions?.Message);
+            if (callbackGuard is not null && !callbackGuard.IsCurrent) return;
+            _window?.ViewModel.UpdateBusinessState(
+                initialized: _actions is not null && !_initializing && !_shutdownStarted,
+                started: _actions?.HasStarted == true,
+                awaitingExplicitStart: _actions?.RequiresExplicitStart != false,
+                operationBusy: _initializing || _shutdownStarted || _actions?.IsBusy == true,
+                message: _actions?.Message);
         }));
     }
 
-    private async Task StartBusinessSessionAsync(CancellationToken token)
+    private async Task StartBusinessSessionAsync(
+        BankRuntimeCallbackGuard callbackGuard,
+        ManualLauncherActions actions,
+        CancellationToken token)
     {
-        var session = _session;
-        var actions = _actions;
         if (_shutdownStarted || _window?.ViewModel.UpdateInstallInProgress == true ||
-            session?.IsCurrent != true || actions is null) return;
+            !callbackGuard.IsCurrent ||
+            !ReferenceEquals(actions, _actions))
+        {
+            return;
+        }
+
+        var session = callbackGuard.Owner.Session;
         _stopTask = null;
         _window!.ViewModel.UpdateSessionState(BusinessSessionState.Active);
         CertificateLoginDiagnostics.Write("session-start", new { session.Id });
@@ -579,26 +863,41 @@ public partial class App : Application
         {
             _startTask = actions.StartBusinessAsync(linked.Token);
             await _startTask;
-            if (session.IsCurrent && !actions.HasStarted)
+            if (callbackGuard.IsCurrent &&
+                ReferenceEquals(actions, _actions) &&
+                !actions.HasStarted)
+            {
                 _window.ViewModel.UpdateSessionState(BusinessSessionState.Idle);
+            }
         }
-        catch (OperationCanceledException) when (!session.IsCurrent) { }
+        catch (OperationCanceledException) when (!callbackGuard.IsCurrent) { }
     }
 
-    private Task StopBusinessSessionAsync() => _stopTask ??= StopBusinessSessionCoreAsync();
-
-    private async Task StopBusinessSessionCoreAsync()
+    private Task StopBusinessSessionAsync(
+        BankRuntimeCallbackGuard callbackGuard)
     {
-        if (_shutdownStarted) return;
+        if (!callbackGuard.OwnsCurrentRuntime)
+        {
+            return Task.CompletedTask;
+        }
+
+        return _stopTask ??= StopBusinessSessionCoreAsync(callbackGuard);
+    }
+
+    private async Task StopBusinessSessionCoreAsync(
+        BankRuntimeCallbackGuard callbackGuard)
+    {
+        if (_shutdownStarted || !callbackGuard.OwnsCurrentRuntime) return;
         // Arm before UI notifications, cancellation callbacks, or native cleanup.
         // Its finally disposal affects only this stop, never the close watchdog.
         using var budget = new BusinessSessionStopDeadline();
         var elapsed = System.Diagnostics.Stopwatch.StartNew();
-        var session = _session;
+        var session = callbackGuard.Owner.Session;
+        Interlocked.Increment(ref _runtimeRevision);
         _window!.ViewModel.UpdateSessionState(BusinessSessionState.Stopping);
-        CertificateLoginDiagnostics.Write("session-stop", new { Id = session?.Id });
+        CertificateLoginDiagnostics.Write("session-stop", new { session.Id });
         // CancelAsync invalidates the token immediately without running callbacks on this UI stack.
-        var cancellation = session?.RevokeAsync() ?? Task.CompletedTask;
+        var cancellation = session.RevokeAsync();
         try
         {
             await Task.Yield();
@@ -615,20 +914,21 @@ public partial class App : Application
             if (_shutdownStarted) return;
             if (_actions is null) throw new InvalidOperationException("Idle session initialization failed.");
             _window.ViewModel.UpdateSessionState(BusinessSessionState.Idle);
-            CertificateLoginDiagnostics.Write("session-stopped", new { Id = session?.Id, elapsedMs = elapsed.ElapsedMilliseconds });
+            CertificateLoginDiagnostics.Write("session-stopped", new
+            {
+                session.Id,
+                elapsedMs = elapsed.ElapsedMilliseconds
+            });
         }
         catch
         {
-            if (_session is { } currentSession)
-            {
-                ObserveBackground(
-                    currentSession.RevokeAsync(),
-                    "session-stop-failure-revocation");
-            }
+            ObserveBackground(
+                session.RevokeAsync(),
+                "session-stop-failure-revocation");
             if (!_shutdownStarted) _window.ViewModel.UpdateSessionState(BusinessSessionState.StopFailed);
             CertificateLoginDiagnostics.Write("session-stop-failed", new
             {
-                Id = session?.Id,
+                session.Id,
                 elapsedMs = elapsed.ElapsedMilliseconds,
                 timedOut = budget.Token.IsCancellationRequested
             });
@@ -641,8 +941,14 @@ public partial class App : Application
             _window?.ViewModel.UpdateInstallInProgress == true ||
             _window?.ViewModel.SessionState is BusinessSessionState.Stopping or BusinessSessionState.StopFailed) return;
         var retryInitialization = _actions is null;
-        var retrySession = _session;
-        if (!retryInitialization && retrySession?.IsCurrent != true) return;
+        var retryGuard = _runtimeCallbackGuard;
+        var retryActions = _actions;
+        if (!retryInitialization &&
+            (retryGuard?.IsCurrent != true || retryActions is null))
+        {
+            return;
+        }
+
         _retryInProgress = true;
         try
         {
@@ -651,12 +957,20 @@ public partial class App : Application
                 if (_shutdownStarted || _window?.ViewModel.UpdateInstallInProgress == true) return;
                 if (retryInitialization)
                     await InitializeLauncherCoreAsync();
-                else if (_actions is not null && retrySession?.IsCurrent == true &&
-                    ReferenceEquals(retrySession, _session))
-                    await StartBusinessSessionAsync(retrySession.Token);
+                else if (retryGuard?.IsCurrent == true &&
+                    retryActions is not null &&
+                    ReferenceEquals(retryActions, _actions))
+                    await StartBusinessSessionAsync(
+                        retryGuard,
+                        retryActions,
+                        retryGuard.Owner.Session.Token);
             });
         }
-        catch (OperationCanceledException) when (retrySession?.IsCurrent != true) { }
+        catch (OperationCanceledException) when (
+            retryGuard?.IsCurrent != true ||
+            _lifetime.IsCancellationRequested)
+        {
+        }
         catch (Exception exception)
         {
             CertificateLoginDiagnostics.Write(
@@ -683,7 +997,9 @@ public partial class App : Application
         _shutdownStarted = true;
         _exitWatchdog.Arm();
         _window?.ViewModel.UpdateSessionState(BusinessSessionState.Closing);
-        if (_session is { } session)
+        Interlocked.Increment(ref _runtimeRevision);
+        var session = _runtimeOwner?.Session ?? _session;
+        if (session is not null)
         {
             ObserveBackground(
                 session.RevokeAsync(),
@@ -710,9 +1026,14 @@ public partial class App : Application
 
     private async Task CleanupRuntimeForShutdownAsync()
     {
-        if (_window is not null) _window.RetryRequested -= OnRetryRequested;
+        if (_window is not null)
+        {
+            _window.RetryRequested -= OnRetryRequested;
+            _window.ViewModel.BankFlowChangeRequested -= OnBankFlowChangeRequested;
+        }
         var presence = _keyPresenceObserver;
         _keyPresenceObserver = null;
+        Interlocked.Increment(ref _keyPresenceRevision);
         var updates = _updates;
         _updates = null;
         var runtimeCleanup = CaptureTask(DisposeRuntimeAsync);
@@ -760,6 +1081,7 @@ public partial class App : Application
     private ApplicationRuntimeCleanupSnapshot CaptureRuntimeCleanup()
     {
         var session = _session;
+        var runtimeOwner = _runtimeOwner;
         var runtime = _runtime;
         var browser = _browserControl;
         var host = _browserHost;
@@ -767,13 +1089,37 @@ public partial class App : Application
         var exporter = _documentsExporter;
         var start = _startTask;
         var display = _currentCompanyDisplay;
+        var coordinator = _coordinator;
+        var authenticationRuntime = _authenticationRuntime;
+        var coordinatorStateChangedHandler = _coordinatorStateChangedHandler;
+        var authenticationStateChangedHandler = _authenticationStateChangedHandler;
+        var actionsStateChangedHandler = _actionsStateChangedHandler;
+        var exportStateChangedHandler = _exportStateChangedHandler;
+        if (runtimeOwner is not null || session is not null)
+        {
+            Interlocked.Increment(ref _runtimeRevision);
+        }
+
+        _runtimeOwner = null;
+        _runtimeCallbackGuard = null;
         _currentCompanyDisplay = null;
-        if (exporter is not null) exporter.StateChanged -= OnExportStateChanged;
-        if (actions is not null) actions.StateChanged -= OnActionsStateChanged;
-        if (_coordinator is not null)
-            _coordinator.StateChanged -= OnCoordinatorStateChanged;
-        if (_authenticationRuntime is not null)
-            _authenticationRuntime.StateChanged -= OnAuthenticationStateChanged;
+        if (exporter is not null && exportStateChangedHandler is not null)
+            exporter.StateChanged -= exportStateChangedHandler;
+        if (actions is not null && actionsStateChangedHandler is not null)
+            actions.StateChanged -= actionsStateChangedHandler;
+        if (coordinator is not null && coordinatorStateChangedHandler is not null)
+            coordinator.StateChanged -= coordinatorStateChangedHandler;
+        if (authenticationRuntime is not null &&
+            authenticationStateChangedHandler is not null)
+        {
+            authenticationRuntime.StateChanged -=
+                authenticationStateChangedHandler;
+        }
+
+        _coordinatorStateChangedHandler = null;
+        _authenticationStateChangedHandler = null;
+        _actionsStateChangedHandler = null;
+        _exportStateChangedHandler = null;
         _documentsExporter = null;
         _actions = null;
         _authenticationRuntime = null;
@@ -782,7 +1128,7 @@ public partial class App : Application
         _browserHost = null;
         _browserControl = null;
         _startTask = null;
-        _pinCredentialTargetName = null;
+        _pinCredentialBinding = null;
 
         // Start independent release work before awaiting any owner so a blocked or
         // failing stage cannot prevent later captured owners from beginning cleanup.

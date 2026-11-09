@@ -5,6 +5,11 @@ namespace UsbWebLauncher.Core.Configuration;
 
 public static partial class LauncherProfileValidator
 {
+    private const string PsbcAuthenticationId = "psbc-client-certificate";
+    private const string PsbcCredentialTarget =
+        "UsbWebLauncher/ClientCertificate/psbc-client-certificate";
+    private const string PsbcNativePromptPolicyId = "psbc-uk-password-v1";
+
     public static ProfileValidationResult Validate(LauncherProfile? profile)
     {
         var errors = new List<ProfileValidationError>();
@@ -25,7 +30,7 @@ public static partial class LauncherProfileValidator
             targetUri = null;
         }
 
-        if (profile.UsbDetectionStrategy is not ("legacyAllowlist" or "ccbUsbStor"))
+        if (profile.UsbDetectionStrategy is not ("legacyAllowlist" or "ccbUsbStor" or "psbcUsbKey"))
         {
             errors.Add(new("usbDetectionStrategy", "USB 检测策略不受支持。"));
         }
@@ -45,7 +50,15 @@ public static partial class LauncherProfileValidator
             }
         }
 
-        ValidateClientCertificateAuthentication(profile.ClientCertificateAuthentication, errors);
+        ValidateClientCertificateAuthentication(
+            profile.ClientCertificateAuthentication,
+            errors);
+        if (profile.UsbDetectionStrategy == "psbcUsbKey")
+        {
+            ValidatePsbcClientCertificateAuthentication(
+                profile.ClientCertificateAuthentication,
+                errors);
+        }
 
         return new(errors);
     }
@@ -91,6 +104,18 @@ public static partial class LauncherProfileValidator
             if (string.IsNullOrWhiteSpace(authentication.CredentialTargetName))
             {
                 errors.Add(new("clientCertificateAuthentication.credentialTargetName", "凭据目标名称不能为空。"));
+            }
+
+            if (!authentication.Enabled)
+            {
+                if (authentication.NativePromptContinuation is { Enabled: true })
+                {
+                    errors.Add(new(
+                        "clientCertificateAuthentication.nativePromptContinuation.enabled",
+                        "禁用的认证配置不能启用原生密码提示续接。"));
+                }
+
+                return;
             }
 
             if (authentication.NativePromptContinuation is not { Enabled: true })
@@ -214,7 +239,151 @@ public static partial class LauncherProfileValidator
     private static bool IsValidCertificateHost(string normalizedHost) =>
         !string.IsNullOrWhiteSpace(normalizedHost) &&
         !normalizedHost.Contains("://", StringComparison.Ordinal) &&
+        normalizedHost.IndexOfAny(['*', '/', '\\', '?', '#', '@']) < 0 &&
         Uri.CheckHostName(normalizedHost) != UriHostNameType.Unknown;
+
+    private static void ValidatePsbcClientCertificateAuthentication(
+        ClientCertificateAuthenticationOptions? authentication,
+        ICollection<ProfileValidationError> errors)
+    {
+        if (authentication is null)
+        {
+            return;
+        }
+
+        if (!string.Equals(
+                authentication.Id,
+                PsbcAuthenticationId,
+                StringComparison.Ordinal))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.id",
+                "邮储认证必须使用独立的 psbc-client-certificate 配置 ID。"));
+        }
+
+        if (!authentication.UsesBrowserNativeAuthentication)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.authenticationMode",
+                "邮储认证必须使用 BrowserNative 模式。"));
+        }
+
+        if (!string.Equals(
+                authentication.CredentialTargetName,
+                PsbcCredentialTarget,
+                StringComparison.Ordinal))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.credentialTargetName",
+                "邮储认证必须使用独立的邮储凭据目标。"));
+        }
+
+        ValidatePsbcCertificateHost(
+            authentication.Host,
+            "clientCertificateAuthentication.host",
+            errors);
+        if (authentication.AdditionalEndpoints is not null)
+        {
+            for (var index = 0; index < authentication.AdditionalEndpoints.Count; index++)
+            {
+                var endpoint = authentication.AdditionalEndpoints[index];
+                if (endpoint is not null)
+                {
+                    ValidatePsbcCertificateHost(
+                        endpoint.Host,
+                        $"clientCertificateAuthentication.additionalEndpoints[{index}].host",
+                        errors);
+                }
+            }
+        }
+
+        if (authentication.Certificate is not null)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.certificate",
+                "邮储 BrowserNative 认证不能复用建行固定证书身份。"));
+        }
+
+        if (authentication.CryptographicProvider is not null)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.cryptographicProvider",
+                "邮储 BrowserNative 认证不能复用建行固定加密提供程序。"));
+        }
+
+        if (authentication.TokenUnlock is not null)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.tokenUnlock",
+                "邮储 BrowserNative 认证不能复用建行令牌解锁配置。"));
+        }
+
+        var prompt = authentication.NativePromptContinuation;
+        if (prompt is null)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation",
+                "邮储认证必须保留独立的原生密码提示策略配置。"));
+            return;
+        }
+
+        if (!string.Equals(
+                prompt.PolicyId,
+                PsbcNativePromptPolicyId,
+                StringComparison.Ordinal))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.policyId",
+                "邮储认证必须使用独立的 psbc-uk-password-v1 策略。"));
+        }
+
+        if (authentication.Enabled &&
+            !string.Equals(
+                prompt.WindowScope,
+                NativePromptWindowScopes.TrustedClientStrictTopLevel,
+                StringComparison.Ordinal))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.windowScope",
+                "启用的邮储认证必须使用严格的受信客户端顶层窗口作用域。"));
+        }
+
+        if (!authentication.Enabled && prompt.Enabled)
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.enabled",
+                "未取得实机证据前，禁用的邮储认证不能启用原生密码提示续接。"));
+        }
+
+        if (string.IsNullOrWhiteSpace(prompt.BrokerPipeName))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.brokerPipeName",
+                "邮储原生密码提示策略必须声明 broker 管道。"));
+        }
+    }
+
+    private static void ValidatePsbcCertificateHost(
+        string? host,
+        string field,
+        ICollection<ProfileValidationError> errors)
+    {
+        var normalizedHost = host is null
+            ? string.Empty
+            : ClientCertificateAuthenticationOptions.NormalizeHost(host);
+        if (!IsValidCertificateHost(normalizedHost))
+        {
+            return;
+        }
+
+        if (!string.Equals(normalizedHost, "psbc.com", StringComparison.Ordinal) &&
+            !normalizedHost.EndsWith(".psbc.com", StringComparison.Ordinal))
+        {
+            errors.Add(new(
+                field,
+                "邮储认证端点必须是 psbc.com 下的精确主机名。"));
+        }
+    }
 
     private static string CreateEndpointKey(string normalizedHost, int port) =>
         $"{normalizedHost}\n{port.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
@@ -302,7 +471,14 @@ public static partial class LauncherProfileValidator
             nativePromptContinuation.WindowScope,
             NativePromptWindowScopes.TrustedClientTopLevel,
             StringComparison.Ordinal);
-        if (!isTopLevelProcess && !isTrustedClientDescendant && !isTrustedClientTopLevel)
+        var isTrustedClientStrictTopLevel = string.Equals(
+            nativePromptContinuation.WindowScope,
+            NativePromptWindowScopes.TrustedClientStrictTopLevel,
+            StringComparison.Ordinal);
+        if (!isTopLevelProcess &&
+            !isTrustedClientDescendant &&
+            !isTrustedClientTopLevel &&
+            !isTrustedClientStrictTopLevel)
         {
             errors.Add(new(
                 "clientCertificateAuthentication.nativePromptContinuation.windowScope",
@@ -326,7 +502,9 @@ public static partial class LauncherProfileValidator
                     "顶层原生续接进程 SHA-256 必须是 64 位十六进制文本。"));
             }
         }
-        else if (isTrustedClientDescendant || isTrustedClientTopLevel)
+        else if (isTrustedClientDescendant ||
+                 isTrustedClientTopLevel ||
+                 isTrustedClientStrictTopLevel)
         {
             if (!string.IsNullOrEmpty(nativePromptContinuation.ProcessPath))
             {
@@ -342,8 +520,17 @@ public static partial class LauncherProfileValidator
                     "子对话框进程文件名必须是不含路径的 .exe 文件名。"));
             }
 
-            if (!string.IsNullOrEmpty(nativePromptContinuation.ProcessSha256) &&
-                !NativePromptSha256Pattern().IsMatch(nativePromptContinuation.ProcessSha256))
+            if (isTrustedClientStrictTopLevel &&
+                (string.IsNullOrWhiteSpace(nativePromptContinuation.ProcessSha256) ||
+                 !NativePromptSha256Pattern().IsMatch(nativePromptContinuation.ProcessSha256)))
+            {
+                errors.Add(new(
+                    "clientCertificateAuthentication.nativePromptContinuation.processSha256",
+                    "Strict trusted-client prompt process SHA-256 must be 64 hexadecimal characters."));
+            }
+            else if (!isTrustedClientStrictTopLevel &&
+                     !string.IsNullOrEmpty(nativePromptContinuation.ProcessSha256) &&
+                     !NativePromptSha256Pattern().IsMatch(nativePromptContinuation.ProcessSha256))
             {
                 errors.Add(new(
                     "clientCertificateAuthentication.nativePromptContinuation.processSha256",
@@ -361,9 +548,13 @@ public static partial class LauncherProfileValidator
             {
                 ValidateTrustedClientDescendantPrompt(nativePromptContinuation, errors);
             }
-            else
+            else if (isTrustedClientTopLevel)
             {
                 ValidateTrustedClientTopLevelPrompt(nativePromptContinuation, errors);
+            }
+            else
+            {
+                ValidateTrustedClientStrictTopLevelPrompt(nativePromptContinuation, errors);
             }
         }
 
@@ -384,7 +575,7 @@ public static partial class LauncherProfileValidator
                 "Trusted-client top-level prompt publisher thumbprint must be empty."));
         }
 
-        if ((isTopLevelProcess || isTrustedClientTopLevel) &&
+        if ((isTopLevelProcess || isTrustedClientTopLevel || isTrustedClientStrictTopLevel) &&
             string.IsNullOrWhiteSpace(nativePromptContinuation.WindowTitle))
         {
             errors.Add(new(
@@ -512,6 +703,27 @@ public static partial class LauncherProfileValidator
             errors.Add(new(
                 "clientCertificateAuthentication.nativePromptContinuation.submitControlId",
                 "Trusted-client prompt input and submit control IDs must differ."));
+        }
+    }
+
+    private static void ValidateTrustedClientStrictTopLevelPrompt(
+        ClientCertificateNativePromptOptions prompt,
+        ICollection<ProfileValidationError> errors)
+    {
+        ValidateTrustedClientTopLevelPrompt(prompt, errors);
+
+        if (!string.IsNullOrEmpty(prompt.TrustedRootWindowTitle))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.trustedRootWindowTitle",
+                "Strict trusted-client top-level prompt root title must be empty."));
+        }
+
+        if (!string.IsNullOrEmpty(prompt.TrustedRootWindowClassPrefix))
+        {
+            errors.Add(new(
+                "clientCertificateAuthentication.nativePromptContinuation.trustedRootWindowClassPrefix",
+                "Strict trusted-client top-level prompt root class prefix must be empty."));
         }
     }
 
