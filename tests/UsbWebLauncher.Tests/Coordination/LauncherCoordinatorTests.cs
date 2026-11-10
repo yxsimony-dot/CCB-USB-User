@@ -7,6 +7,42 @@ namespace UsbWebLauncher.Tests.Coordination;
 
 public sealed class LauncherCoordinatorTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task BrowserFailureReleasesAuthenticationWithoutPublishingPhysicalRemoval(bool duringInitialization)
+    {
+        var monitor = new FakeUsbDeviceMonitor([CreateMatchingDevice()]);
+        var browser = new FaultOnceBrowserHost(
+            failInitialization: duringInitialization, failNavigation: !duringInitialization);
+        var gate = new BrowserFailureAuthenticationGate();
+        await using var coordinator = CreateCoordinator(monitor, browser, gate);
+
+        await coordinator.StartAsync();
+
+        Assert.Equal(1, gate.BrowserFailureCount);
+        Assert.Equal(0, gate.RemovalCount);
+        Assert.Equal(LauncherStage.Error, coordinator.CurrentState.Stage);
+        Assert.True(coordinator.CurrentState.IsUsbPresent);
+    }
+
+    private sealed class BrowserFailureAuthenticationGate :
+        ILauncherAuthenticationGate, ILauncherAuthenticationBrowserFailureGate
+    {
+        public int RemovalCount { get; private set; }
+        public int BrowserFailureCount { get; private set; }
+        public Task<bool> HandleDevicePresenceAsync(bool present, CancellationToken cancellationToken = default)
+        {
+            if (!present) RemovalCount++;
+            return Task.FromResult(present);
+        }
+        public Task ReleaseAfterBrowserFailureAsync(CancellationToken cancellationToken = default)
+        {
+            BrowserFailureCount++;
+            return Task.CompletedTask;
+        }
+    }
+
     [Fact]
     public async Task InjectedMatcherEnablesPsbcWithoutChangingDefaultMatcher()
     {

@@ -6,6 +6,23 @@ namespace UsbWebLauncher.Tests.Browser;
 public sealed class CertificatePageLoginCoordinatorTests
 {
     [Fact]
+    public async Task ManualObservationDoesNotReadPinSubmitOrRetry()
+    {
+        var store = new PinStore();
+        var page = new Page { Inspect = _ => Task.FromResult(CertificateLoginPageState.ManualObservation) };
+        await using var coordinator = Create(store, page);
+        coordinator.BeginAttempt();
+        await coordinator.ObserveAsync();
+        page.Inspect = _ => Task.FromResult(CertificateLoginPageState.Ready);
+        await coordinator.ObserveAsync();
+        Assert.Equal(1, page.Inspections);
+        Assert.Equal(0, store.ReadCount);
+        Assert.Equal(0, page.Submissions);
+        Assert.Contains("已暂停", coordinator.Message);
+        Assert.DoesNotContain("不支持", coordinator.Message);
+    }
+
+    [Fact]
     public async Task RevokedSessionRejectsLateInspectionBeforeCredentialReadOrSubmission()
     {
         using var session = new CancellationTokenSource();

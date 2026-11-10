@@ -35,7 +35,7 @@ public sealed class PinSetupDialogTests
     }
 
     [Fact]
-    public async Task SuccessfulConfirmationUsesMaskedInputAndClearsTheControl()
+    public async Task SuccessfulConfirmationUsesVisibleInputWithoutUndoAndClearsTheControl()
     {
         var secret = RandomSecret();
         try
@@ -43,27 +43,28 @@ public sealed class PinSetupDialogTests
             var result = await RunStaAsync(async () =>
             {
                 PinSetupDialog? dialog = null;
-                PasswordBox? passwordBox = null;
+                TextBox? textBox = null;
                 dialog = new PinSetupDialog(null, () =>
                 {
-                    passwordBox = Assert.IsType<PasswordBox>(
-                        dialog!.FindName("PinPasswordBox"));
-                    passwordBox.Password = new string(secret);
+                    textBox = Assert.IsType<TextBox>(
+                        dialog!.FindName("PinTextBox"));
+                    textBox.Text = new string(secret);
+                    Assert.True(textBox.Text.AsSpan().SequenceEqual(secret));
+                    Assert.False(textBox.IsUndoEnabled);
                     return true;
                 });
 
                 var pin = await dialog.ShowAsync();
-                using var clearedPassword = passwordBox!.SecurePassword;
                 return (
                     Pin: pin,
-                    PasswordLength: clearedPassword.Length,
-                    PasswordChar: passwordBox.PasswordChar);
+                    PasswordLength: textBox!.Text.Length,
+                    CanUndo: textBox.CanUndo);
             });
 
             using var pin = Assert.IsType<ClientCertificatePin>(result.Pin);
             Assert.True(pin.AsMemory().Span.SequenceEqual(secret));
             Assert.Equal(0, result.PasswordLength);
-            Assert.Equal('*', result.PasswordChar);
+            Assert.False(result.CanUndo);
         }
         finally
         {
@@ -77,18 +78,17 @@ public sealed class PinSetupDialogTests
         var result = await RunStaAsync(async () =>
         {
             PinSetupDialog? dialog = null;
-            PasswordBox? passwordBox = null;
+            TextBox? textBox = null;
             dialog = new PinSetupDialog(null, () =>
             {
-                passwordBox = Assert.IsType<PasswordBox>(
-                    dialog!.FindName("PinPasswordBox"));
-                passwordBox.Password = Guid.NewGuid().ToString("N");
+                textBox = Assert.IsType<TextBox>(
+                    dialog!.FindName("PinTextBox"));
+                textBox.Text = Guid.NewGuid().ToString("N");
                 return null;
             });
 
             var pin = await dialog.ShowAsync();
-            using var clearedPassword = passwordBox!.SecurePassword;
-            return (Pin: pin, PasswordLength: clearedPassword.Length);
+            return (Pin: pin, PasswordLength: textBox!.Text.Length);
         });
 
         Assert.Null(result.Pin);
@@ -102,20 +102,19 @@ public sealed class PinSetupDialogTests
         {
             using var source = new CancellationTokenSource();
             PinSetupDialog? dialog = null;
-            PasswordBox? passwordBox = null;
+            TextBox? textBox = null;
             dialog = new PinSetupDialog(null, () =>
             {
-                passwordBox = Assert.IsType<PasswordBox>(
-                    dialog!.FindName("PinPasswordBox"));
-                passwordBox.Password = Guid.NewGuid().ToString("N");
+                textBox = Assert.IsType<TextBox>(
+                    dialog!.FindName("PinTextBox"));
+                textBox.Text = Guid.NewGuid().ToString("N");
                 source.Cancel();
                 return true;
             });
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(
                 () => dialog.ShowAsync(source.Token));
-            using var clearedPassword = passwordBox!.SecurePassword;
-            return clearedPassword.Length;
+            return textBox!.Text.Length;
         });
 
         Assert.Equal(0, result);
@@ -127,19 +126,18 @@ public sealed class PinSetupDialogTests
         var result = await RunStaAsync(async () =>
         {
             PinSetupDialog? dialog = null;
-            PasswordBox? passwordBox = null;
+            TextBox? textBox = null;
             dialog = new PinSetupDialog(null, () =>
             {
-                passwordBox = Assert.IsType<PasswordBox>(
-                    dialog!.FindName("PinPasswordBox"));
-                passwordBox.Password = Guid.NewGuid().ToString("N");
+                textBox = Assert.IsType<TextBox>(
+                    dialog!.FindName("PinTextBox"));
+                textBox.Text = Guid.NewGuid().ToString("N");
                 throw new InvalidOperationException("synthetic dialog failure");
             });
 
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => dialog.ShowAsync());
-            using var clearedPassword = passwordBox!.SecurePassword;
-            return clearedPassword.Length;
+            return textBox!.Text.Length;
         });
 
         Assert.Equal(0, result);

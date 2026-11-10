@@ -93,10 +93,13 @@ public static class PsbcClientCertificateCorrelationPolicy
             return Result(PsbcClientCertificateCorrelationStatus.KeySpecMismatch);
         }
 
-        if (!string.Equals(
-                NormalizeContainerIdentity(provider.ContainerOrKeyName),
-                tokenIdentity,
-                StringComparison.Ordinal))
+        var containerIdentity = NormalizeContainerIdentity(provider.ContainerOrKeyName);
+        var knownContainers = key.ContainerIdentities ?? [tokenIdentity];
+        if (containerIdentity.Length == 0 ||
+            !knownContainers.Any(identity => string.Equals(
+                NormalizeContainerIdentity(identity),
+                containerIdentity,
+                StringComparison.Ordinal)))
         {
             return Result(PsbcClientCertificateCorrelationStatus.ContainerMismatch);
         }

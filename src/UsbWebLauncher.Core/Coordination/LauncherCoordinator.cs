@@ -703,9 +703,13 @@ public sealed class LauncherCoordinator : IAsyncDisposable
 
         try
         {
-            await _authenticationGate
-                .HandleDevicePresenceAsync(false, CancellationToken.None)
-                .ConfigureAwait(false);
+            if (_authenticationGate is ILauncherAuthenticationBrowserFailureGate failureGate)
+                await failureGate.ReleaseAfterBrowserFailureAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            else
+                await _authenticationGate
+                    .HandleDevicePresenceAsync(false, CancellationToken.None)
+                    .ConfigureAwait(false);
         }
         catch
         {
@@ -801,6 +805,11 @@ public interface ILauncherAuthenticationGate
 public interface ILauncherAuthenticationMetadataInvalidationGate
 {
     Task InvalidateDeviceMetadataAsync(CancellationToken cancellationToken = default);
+}
+
+public interface ILauncherAuthenticationBrowserFailureGate
+{
+    Task ReleaseAfterBrowserFailureAsync(CancellationToken cancellationToken = default);
 }
 
 public sealed class LauncherStateChangedEventArgs(LauncherState state) : EventArgs

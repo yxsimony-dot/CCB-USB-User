@@ -35,7 +35,8 @@ public sealed record UsbKeyDetectionResult(
     UsbKeyVendorFamily? VendorFamily,
     UsbKeyDiagnosticCode DiagnosticCode,
     string? PhysicalInstanceId,
-    string? TokenIdentity = null)
+    string? TokenIdentity = null,
+    IReadOnlyList<string>? ContainerIdentities = null)
 {
     public static UsbKeyDetectionResult Absent(
         UsbKeyVendorFamily? vendorFamily = null,
@@ -59,11 +60,15 @@ public sealed record UsbKeyDetectionResult(
     public static UsbKeyDetectionResult Ready(
         UsbKeyVendorFamily vendorFamily,
         string physicalInstanceId,
-        string? tokenIdentity = null) =>
+        string? tokenIdentity = null,
+        IReadOnlyList<string>? containerIdentities = null) =>
         new(
             UsbKeyDetectionStatus.Ready,
             vendorFamily,
             UsbKeyDiagnosticCode.None,
             physicalInstanceId,
-            tokenIdentity);
+            tokenIdentity,
+            containerIdentities is null
+                ? null
+                : Array.AsReadOnly(containerIdentities.ToArray()));
 }

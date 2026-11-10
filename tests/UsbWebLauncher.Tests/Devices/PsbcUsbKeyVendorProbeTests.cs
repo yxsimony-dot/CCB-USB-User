@@ -107,6 +107,54 @@ public sealed class PsbcUsbKeyVendorProbeTests
     }
 
     [Fact]
+    public async Task Tendyron_PreservesAllContainerEvidenceAsASnapshot()
+    {
+        var containers = new List<string> { "EXCHANGE", "SIGNING", @"\\.\Reader\SIGNING" };
+        var environment = ProbeEnvironment.Ready() with
+        {
+            TokenEvidence = new(true, "container-set-binding", containers)
+        };
+
+        var result = await new TendyronPsbcUsbKeyProbe().ProbeAsync(
+            [Device(@"USB\VID_1780&PID_0401\SYNTHETIC", "Tendyron Token")],
+            environment);
+        containers.Clear();
+
+        Assert.Equal("container-set-binding", result.TokenIdentity);
+        Assert.Equal(
+            ["EXCHANGE", "SIGNING", @"\\.\Reader\SIGNING"],
+            result.ContainerIdentities);
+    }
+
+    [Fact]
+    public async Task Tendyron_RejectsAmbiguousPhysicalKeysBeforeProviderEnumeration()
+    {
+        var environment = ProbeEnvironment.Ready("container");
+
+        var result = await new TendyronPsbcUsbKeyProbe().ProbeAsync(
+            [
+                Device(@"USB\VID_1780&PID_0401\FIRST", "Tendyron Token"),
+                Device(@"USB\VID_1780&PID_0401\SECOND", "Tendyron Token")
+            ],
+            environment);
+
+        Assert.Equal(UsbKeyDetectionStatus.PresentButEnvironmentUnavailable, result.Status);
+        Assert.Equal(UsbKeyDiagnosticCode.TokenUnavailable, result.DiagnosticCode);
+        Assert.Equal(0, environment.TokenReadCount);
+    }
+
+    [Fact]
+    public async Task Tendyron_DuplicateDescriptorsOfSameDeviceAreNotAmbiguous()
+    {
+        var device = Device(@"USB\VID_1780&PID_0401\SYNTHETIC", "Tendyron Token");
+
+        var result = await new TendyronPsbcUsbKeyProbe().ProbeAsync(
+            [device, device], ProbeEnvironment.Ready("container"));
+
+        Assert.Equal(UsbKeyDetectionStatus.Ready, result.Status);
+    }
+
+    [Fact]
     public async Task Tendyron_CurrentCapturedFixtureReturnsReady()
     {
         var fixture = Device(

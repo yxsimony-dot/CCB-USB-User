@@ -25,13 +25,13 @@
       }
     },
     {
-      "PolicyHash": "86E57F7B1CFDED775AF02BAD09E02DE1A09C09782FEA88FF09B94D5461E24562",
+      "PolicyHash": "C5550D9D5FA92685679D9F389EE397AC7532454917FE3448AFCB0086C2276144",
       "Prompt": {
         "Enabled": true,
         "BrokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
         "PolicyId": "psbc-uk-password-v1",
         "ProcessPath": "",
-        "ProcessSha256": "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+        "ProcessSha256": "51B4CD503D669D8F7F6FF6E9E22EFFEEBD28CCE11262DDEC815972A424474533",
         "PublisherCertificateThumbprint": "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
         "WindowTitle": "校验UK密码",
         "WindowClass": "#32770",

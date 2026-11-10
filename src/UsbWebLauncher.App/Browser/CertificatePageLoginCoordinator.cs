@@ -2,7 +2,7 @@ using UsbWebLauncher.Core.Authentication;
 
 namespace UsbWebLauncher.App.Browser;
 
-public enum CertificateLoginPageState { WaitingForPage, Ready, Unsupported }
+public enum CertificateLoginPageState { WaitingForPage, Ready, Unsupported, ManualObservation }
 public enum CertificateLoginResult { Submitted, Unsupported, Failed }
 
 public interface ICertificateLoginPage
@@ -95,6 +95,11 @@ public sealed class CertificatePageLoginCoordinator : IAsyncDisposable
                 var state = await _page.InspectAsync(readiness.Token);
                 _sessionToken.ThrowIfCancellationRequested();
                 readiness.Token.ThrowIfCancellationRequested();
+                if (state == CertificateLoginPageState.ManualObservation)
+                {
+                    Publish(attempt, "邮储手动输入诊断已启用，网页自动填写和自动登录已暂停。");
+                    return;
+                }
                 if (state == CertificateLoginPageState.Unsupported)
                 {
                     Publish(attempt, "当前登录控件不支持自动填写，请手动登录。");

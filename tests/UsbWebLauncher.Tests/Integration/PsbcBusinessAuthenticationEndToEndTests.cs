@@ -11,6 +11,53 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
 {
     private static readonly Uri Target = new("https://corpebank.psbc.com/#/login");
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Http412ThenAutomatic200_ShowsPageWithoutRepeatingPin(bool storedPin)
+    {
+        await using var harness = await Harness.CreateAsync(
+            keyInitiallyPresent: true, hasStoredCredential: storedPin);
+        harness.Control.Use412Continuation = true;
+        await harness.Launcher.StartAsync();
+        await harness.ManualGate.AllowBusinessAsync();
+        var opening = harness.Launcher.ResumeNavigationAfterAuthenticationSetupAsync();
+        await harness.Control.Response412Published.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(opening.IsCompleted);
+        Assert.Equal(LauncherStage.OpeningBrowser, harness.Launcher.CurrentState.Stage);
+        Assert.Equal(AuthenticationStage.Authenticating, harness.Authentication.CurrentState.Stage);
+        harness.Control.ContinueAfter412.TrySetResult();
+        await opening.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(LauncherStage.Ready, harness.Launcher.CurrentState.Stage);
+        Assert.Equal(AuthenticationStage.Ready, harness.Authentication.CurrentState.Stage);
+        Assert.Equal(1, harness.Control.NavigateCount);
+        Assert.Single(harness.Control.AppliedCertificates);
+        Assert.Equal(1, harness.PinStore.ReadCount);
+        Assert.Equal(storedPin ? 1 : 0, harness.NativePrompt.PinSubmissionCount);
+        Assert.Equal(storedPin ? 1 : 0, harness.NativePrompt.ArmCount);
+    }
+
+    [Fact]
+    public async Task DeviceRemovalDuring412Continuation_DoesNotShowReady()
+    {
+        await using var harness = await Harness.CreateAsync(keyInitiallyPresent: true);
+        harness.Control.Use412Continuation = true;
+        await harness.Launcher.StartAsync();
+        await harness.ManualGate.AllowBusinessAsync();
+        var opening = harness.Launcher.ResumeNavigationAfterAuthenticationSetupAsync();
+        await harness.Control.Response412Published.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await harness.Monitor.PublishAsync([]);
+        await opening.WaitAsync(TimeSpan.FromSeconds(2));
+        harness.Control.ContinueAfter412.TrySetResult();
+
+        Assert.Equal(LauncherStage.WaitingForUsb, harness.Launcher.CurrentState.Stage);
+        Assert.Equal(AuthenticationStage.WaitingForDevice, harness.Authentication.CurrentState.Stage);
+        Assert.False(harness.Browser.IsAvailable);
+        Assert.Equal(1, harness.NativePrompt.PinSubmissionCount);
+    }
+
     [Fact]
     public async Task KeyInsertedBeforeBusinessStart_NavigatesAndSubmitsPinExactlyOnce()
     {
@@ -48,12 +95,16 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
         AssertSuccessfulAuthentication(harness);
     }
 
-    [Fact]
-    public async Task MissingPinSetup_StillNavigatesWithoutAuthorizingAutomaticAuthentication()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingPinSetup_AutomaticallySelectsCertificateWithoutSubmittingPin(
+        bool multipleContainers)
     {
         await using var harness = await Harness.CreateAsync(
             keyInitiallyPresent: true,
-            hasStoredCredential: false);
+            hasStoredCredential: false,
+            multipleContainers: multipleContainers);
 
         await harness.Launcher.StartAsync();
         await harness.ManualGate.AllowBusinessAsync();
@@ -63,21 +114,38 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
         Assert.Equal(1, harness.Control.NavigateCount);
         Assert.Equal(2, harness.Control.CertificateRequestCount);
         Assert.Equal(2, harness.Control.Selections.Count);
-        Assert.All(harness.Control.Selections, selection =>
-        {
-            Assert.False(selection.Handled);
-            Assert.Null(selection.SelectedCertificate);
-            Assert.NotNull(selection.Authorization);
-        });
-        Assert.Empty(harness.Control.AppliedCertificates);
-        Assert.Equal(0, harness.Control.SelectionCommitCount);
-        Assert.Equal(0, harness.PinStore.ReadCount);
+        var selected = harness.Control.Selections[0];
+        Assert.True(selected.Handled);
+        Assert.Same(harness.Control.ExpectedCertificate, selected.SelectedCertificate);
+        Assert.NotNull(selected.Authorization);
+        var duplicate = harness.Control.Selections[1];
+        Assert.True(duplicate.Handled);
+        Assert.Null(duplicate.SelectedCertificate);
+        Assert.Single(harness.Control.AppliedCertificates);
+        Assert.Same(harness.Control.ExpectedCertificate, harness.Control.AppliedCertificates[0]);
+        Assert.Equal(1, harness.Control.SelectionCommitCount);
+        Assert.Equal(1, harness.PinStore.ReadCount);
         Assert.Equal(0, harness.NativePrompt.ArmCount);
         Assert.Equal(0, harness.NativePrompt.PinSubmissionCount);
         Assert.Equal(
-            AuthenticationStage.RequiresPinSetup,
+            AuthenticationStage.Ready,
             harness.Authentication.CurrentState.Stage);
+        Assert.Null(harness.StampStore.StoredStamp);
+        Assert.Equal(0, harness.Unlocker.AttemptCount);
         Assert.Equal(LauncherStage.Ready, harness.Launcher.CurrentState.Stage);
+    }
+
+    [Fact]
+    public async Task MultipleContainers_UsesDriverVerifiedQualifiedCertificate()
+    {
+        await using var harness = await Harness.CreateAsync(
+            keyInitiallyPresent: true, multipleContainers: true);
+
+        await harness.Launcher.StartAsync();
+        await harness.ManualGate.AllowBusinessAsync();
+        await harness.Launcher.ResumeNavigationAfterAuthenticationSetupAsync();
+
+        AssertSuccessfulAuthentication(harness);
     }
 
     private static void AssertSuccessfulAuthentication(Harness harness)
@@ -95,9 +163,7 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
         Assert.Equal(0, harness.Unlocker.AttemptCount);
         Assert.Equal(AuthenticationStage.Ready, harness.Authentication.CurrentState.Stage);
         Assert.Equal(LauncherStage.Ready, harness.Launcher.CurrentState.Stage);
-        Assert.Equal(
-            Authentication().GetNormalizedHash(),
-            harness.StampStore.StoredStamp?.AuthenticationHash);
+        Assert.Null(harness.StampStore.StoredStamp);
         Assert.Equal(1, harness.NativePrompt.Attempt.DisposeCount);
     }
 
@@ -141,7 +207,7 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
     private static bool IsPsbcDevice(UsbDeviceDescriptor device) =>
         UsbDeviceMatcher.IsMatch(device, Profile().UsbDevice!);
 
-    private static PsbcAuthenticationRuntimeSnapshot RuntimeSnapshot() =>
+    private static PsbcAuthenticationRuntimeSnapshot RuntimeSnapshot(bool multipleContainers = false) =>
         new(
             OwnerSessionId: 10,
             OwnerRevision: 2,
@@ -154,10 +220,13 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
             ReadyKey: UsbKeyDetectionResult.Ready(
                 UsbKeyVendorFamily.Tendyron,
                 PsbcDevice().InstanceId,
-                "SYNTHETIC_PSBC_CONTAINER"),
+                multipleContainers ? "container-set-binding" : "SYNTHETIC_PSBC_CONTAINER",
+                multipleContainers
+                    ? ["EXCHANGE", "SIGNING", @"\\.\Synthetic Reader\SIGNING"]
+                    : null),
             ContextRevision: 1);
 
-    private static ClientCertificateCandidate PsbcCandidate()
+    private static ClientCertificateCandidate PsbcCandidate(bool multipleContainers = false)
     {
         var now = DateTimeOffset.UtcNow;
         return new(
@@ -174,7 +243,7 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
                 ClientCertificateProviderKind.Csp,
                 "Tendyron OnKey193 CSP PSBC v1.0",
                 1,
-                "SYNTHETIC_PSBC_CONTAINER",
+                multipleContainers ? @"\\.\Synthetic Reader\SIGNING" : "SYNTHETIC_PSBC_CONTAINER",
                 "AT_SIGNATURE",
                 ClientCertificateProviderMetadataSource.WindowsCertificateKeyProviderInfoProperty,
                 ClientCertificateProviderMetadataFailure.None));
@@ -222,7 +291,8 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
 
         public static async Task<Harness> CreateAsync(
             bool keyInitiallyPresent,
-            bool hasStoredCredential = true)
+            bool hasStoredCredential = true,
+            bool multipleContainers = false)
         {
             var authenticationOptions = Authentication();
             var monitor = new RecordingUsbMonitor(
@@ -231,16 +301,12 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
                 hasStoredCredential
                     ? "integration-psbc-pin".ToCharArray()
                     : null);
-            var stampStore = new RecordingStampStore(
-                hasStoredCredential
-                    ? ClientCertificateValidationStamp.CreatePending(
-                        authenticationOptions.Id,
-                        authenticationOptions.GetNormalizedHash())
-                    : null);
+            // Match production BrowserNative composition: credentials exist without stamps.
+            var stampStore = new RecordingStampStore(null);
             var unlocker = new RecordingUnlocker();
             var nativePrompt = new TestNativePromptContinuation();
-            var context = new FixedPsbcRuntimeContext(RuntimeSnapshot());
-            var certificate = new WebClientCertificate(PsbcCandidate(), new object());
+            var context = new FixedPsbcRuntimeContext(RuntimeSnapshot(multipleContainers));
+            var certificate = new WebClientCertificate(PsbcCandidate(multipleContainers), new object());
             var control = new PsbcWebViewControl(certificate);
             var browser = new WebView2BrowserHost(control);
             var authentication = new AuthenticationCoordinator(
@@ -475,6 +541,12 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
         public int NavigateCount { get; private set; }
         public int CertificateRequestCount { get; private set; }
         public int SelectionCommitCount { get; private set; }
+        public bool Use412Continuation { get; set; }
+        public bool IsDisposed { get; private set; }
+        public TaskCompletionSource Response412Published { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ContinueAfter412 { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task EnsureInitializedAsync(CancellationToken cancellationToken) =>
             Task.CompletedTask;
@@ -501,13 +573,33 @@ public sealed class PsbcBusinessAuthenticationEndToEndTests
         public Task StopNavigationAsync(CancellationToken cancellationToken) =>
             Task.CompletedTask;
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            IsDisposed = true;
+            ContinueAfter412.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
 
         private async Task RunNavigationAsync(long navigationId)
         {
             await Task.Yield();
             await DispatchCertificateRequestAsync();
             await DispatchCertificateRequestAsync();
+            if (Use412Continuation)
+            {
+                NavigationCompleted?.Invoke(this,
+                    new(navigationId, false, "Unknown (HTTP 412)", 412, Target));
+                Response412Published.TrySetResult();
+                await ContinueAfter412.Task;
+                if (IsDisposed) return;
+                var nextId = Interlocked.Increment(ref _nextNavigationId);
+                var start = new WebNavigationStartingEventArgs(nextId, false, Target);
+                NavigationStarting?.Invoke(this, start);
+                start.CompleteWithoutAuthenticationBinding();
+                await start.AuthenticationBindingTask;
+                NavigationCompleted?.Invoke(this, new(nextId, true, "Unknown", 200, Target));
+                return;
+            }
             NavigationCompleted?.Invoke(this, new(navigationId, true));
         }
 

@@ -25,6 +25,48 @@ public sealed class PsbcClientCertificateSelectorTests
     }
 
     [Fact]
+    public void Select_SelectsQualifiedCertificateFromSecondVerifiedContainer()
+    {
+        const string qualified = @"\\.\Synthetic Reader\SIGNING";
+        var candidate = Candidate(container: qualified);
+        var context = Context() with
+        {
+            Key = UsbKeyDetectionResult.Ready(
+                UsbKeyVendorFamily.Tendyron,
+                @"USB\VID_1780&PID_0401\SYNTHETIC",
+                "container-set-binding",
+                ["EXCHANGE", "SIGNING", qualified])
+        };
+
+        var result = Select(
+            [Candidate(container: @"\\.\Other Reader\SIGNING"), candidate],
+            context: context);
+
+        Assert.True(result.IsSelected);
+        Assert.Same(candidate, result.SelectedCertificate);
+    }
+
+    [Fact]
+    public void Select_StillRejectsMultipleCertificatesAcrossVerifiedContainers()
+    {
+        var context = Context() with
+        {
+            Key = UsbKeyDetectionResult.Ready(
+                UsbKeyVendorFamily.Tendyron,
+                @"USB\VID_1780&PID_0401\SYNTHETIC",
+                "container-set-binding",
+                ["FIRST", "SECOND"])
+        };
+
+        var result = Select(
+            [Candidate(container: "FIRST"), Candidate(container: "SECOND")],
+            context: context);
+
+        Assert.Equal(PsbcClientCertificateSelectionStatus.CertificateConflict, result.Status);
+        Assert.Null(result.SelectedCertificate);
+    }
+
+    [Fact]
     public void Select_RejectsWhenNoCertificateMatchesCurrentKey()
     {
         var result = Select(

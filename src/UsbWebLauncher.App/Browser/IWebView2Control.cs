@@ -50,11 +50,20 @@ public sealed class WebNavigationStartingEventArgs(
 public sealed class WebNavigationCompletedEventArgs(
     long navigationId,
     bool isSuccess,
-    string? errorStatus = null) : EventArgs
+    string? errorStatus = null,
+    int httpStatusCode = 0,
+    Uri? targetUri = null,
+    string? networkError = null) : EventArgs
 {
     public long NavigationId { get; } = navigationId;
 
     public bool IsSuccess { get; } = isSuccess;
 
     public string? ErrorStatus { get; } = errorStatus;
+
+    public int HttpStatusCode { get; } = httpStatusCode;
+
+    public Uri? TargetUri { get; } = targetUri;
+
+    public string? NetworkError { get; } = networkError;
 }

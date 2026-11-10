@@ -8,6 +8,8 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Browser\CcbCertificateLogin.js" />
+    <EmbeddedResource Include="Browser\PsbcCertificateLogin.js" />
+    <EmbeddedResource Include="Browser\PsbcInputTrace.js" />
     <EmbeddedResource Include="Browser\CcbStatementExport.js" />
     <EmbeddedResource Include="Browser\CcbReceiptExport.js" />
     <EmbeddedResource Include="Browser\CcbCurrentCompany.js" />

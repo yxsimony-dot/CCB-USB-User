@@ -18,7 +18,8 @@ public sealed record PsbcTokenQuery(
 
 public sealed record PsbcTokenEvidence(
     bool IsPresent,
-    string? TokenIdentity = null);
+    string? TokenIdentity = null,
+    IReadOnlyList<string>? ContainerIdentities = null);
 
 public interface IPsbcUsbKeyEnvironmentQuery
 {

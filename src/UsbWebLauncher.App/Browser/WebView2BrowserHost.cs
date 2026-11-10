@@ -18,12 +18,14 @@ public sealed class WebView2BrowserHost :
     private readonly WebClientCertificateRequestHandler _certificateHandlerDelegate;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly TimeSpan _cancelledNavigationStopTimeout;
+    private readonly TimeSpan _psbcContinuationTimeout;
     private AuthenticationConfiguration? _authentication;
     private NavigationOperation? _activeOperation;
     private bool _initialized;
     private bool _certificateHandlerRegistered;
     private bool _navigationStarted;
     private bool _disposed;
+    private bool _quarantined;
 
     public bool IsAvailable
     {
@@ -31,7 +33,7 @@ public sealed class WebView2BrowserHost :
         {
             lock (_sync)
             {
-                return !_disposed;
+                return !_disposed && !_quarantined;
             }
         }
     }
@@ -51,13 +53,17 @@ public sealed class WebView2BrowserHost :
     internal WebView2BrowserHost(
         IWebView2Control control,
         IBrowserTimeoutScheduler timeoutScheduler,
-        TimeSpan cancelledNavigationStopTimeout)
+        TimeSpan cancelledNavigationStopTimeout,
+        TimeSpan? psbcContinuationTimeout = null)
     {
         _control = control ?? throw new ArgumentNullException(nameof(control));
         _timeoutScheduler = timeoutScheduler ?? throw new ArgumentNullException(nameof(timeoutScheduler));
         if (cancelledNavigationStopTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(cancelledNavigationStopTimeout));
         _cancelledNavigationStopTimeout = cancelledNavigationStopTimeout;
+        _psbcContinuationTimeout = psbcContinuationTimeout ?? TimeSpan.FromSeconds(15);
+        if (_psbcContinuationTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(psbcContinuationTimeout));
         _certificateHandlerDelegate = HandleClientCertificateRequestAsync;
         _control.NavigationStarting += OnNavigationStarting;
         _control.NavigationCompleted += OnNavigationCompleted;
@@ -136,7 +142,7 @@ public sealed class WebView2BrowserHost :
                 ThrowIfDisposed();
                 await InitializeAndRegisterAsync(linkedCancellation.Token).ConfigureAwait(false);
                 _navigationStarted = true;
-                operation = new NavigationOperation(browserOperationId);
+                operation = new NavigationOperation(browserOperationId, target, linkedCancellation.Token);
                 lock (_sync)
                 {
                     if (_activeOperation is not null)
@@ -198,7 +204,10 @@ public sealed class WebView2BrowserHost :
         {
             Observe(operation.Completion.Task);
             await TerminateAuthenticationAsync(operation, isSuccess: false).ConfigureAwait(false);
-            await StopCancelledNavigationAsync(operation).ConfigureAwait(false);
+            if (operation.HasPsbcContinuation)
+                await DisposeAsync().ConfigureAwait(false);
+            else
+                await StopCancelledNavigationAsync(operation).ConfigureAwait(false);
             throw;
         }
         finally
@@ -368,9 +377,30 @@ public sealed class WebView2BrowserHost :
         WebNavigationStartingEventArgs eventArgs)
     {
         AuthenticationConfiguration? authentication;
+        NavigationOperation? active;
         lock (_sync)
         {
             authentication = _authentication;
+            active = _activeOperation;
+        }
+
+        if (active?.HasPsbcContinuation == true)
+        {
+            if (active.TryBindPsbcContinuation(eventArgs))
+            {
+                // Preserve the original attempt and its one-shot certificate/PIN budget.
+                eventArgs.BindAuthentication(Task.CompletedTask);
+                CertificateLoginDiagnostics.Write("psbc-continuation-started",
+                    new { navigationId = eventArgs.NavigationId });
+            }
+            else
+            {
+                eventArgs.BindAuthentication(Task.FromException(
+                    new InvalidOperationException("The PSBC continuation was not allowed.")));
+                Observe(FailPsbcContinuationAsync(active,
+                    "邮储页面返回 HTTP 412，后续跳转不符合本轮自动跳转条件。"));
+            }
+            return;
         }
 
         if (authentication is null)
@@ -390,7 +420,7 @@ public sealed class WebView2BrowserHost :
         NavigationOperation operation;
         lock (_sync)
         {
-            if (_disposed || _activeOperation is not null)
+            if (_disposed || _quarantined || _activeOperation is not null)
             {
                 _physicalNavigationGate.Release();
                 eventArgs.BindAuthentication(Task.FromException(
@@ -400,7 +430,8 @@ public sealed class WebView2BrowserHost :
             }
 
             _navigationStarted = true;
-            operation = new NavigationOperation(BrowserOperationIdentity.Create());
+            operation = new NavigationOperation(
+                BrowserOperationIdentity.Create(), eventArgs.TargetUri, _lifetimeCancellation.Token);
             operation.TryBindNavigationId(eventArgs.NavigationId, out _);
             operation.StartTask = Task.FromResult(eventArgs.NavigationId);
             _activeOperation = operation;
@@ -435,19 +466,66 @@ public sealed class WebView2BrowserHost :
         NavigationOperation operation,
         WebNavigationCompletedEventArgs eventArgs)
     {
+        if (operation.TryBeginPsbcContinuation(eventArgs))
+        {
+            CertificateLoginDiagnostics.Write("psbc-continuation-waiting",
+                new { navigationId = eventArgs.NavigationId });
+            Observe(ExpirePsbcContinuationAsync(operation));
+            return;
+        }
+
+        var isSuccess = eventArgs.IsSuccess;
+        if (operation.HasPsbcContinuation)
+        {
+            if (!operation.TryEndPsbcContinuation()) return;
+            isSuccess = PsbcNavigationContinuation.IsSuccessful(eventArgs) &&
+                !operation.IsAuthenticationTerminal && !operation.Cancellation.IsCancellationRequested;
+            CertificateLoginDiagnostics.Write("psbc-continuation-completed",
+                new { navigationId = eventArgs.NavigationId, isSuccess });
+        }
+
         try
         {
-            if (eventArgs.IsSuccess)
+            await TerminateAuthenticationAsync(operation, isSuccess).ConfigureAwait(false);
+
+            if (isSuccess)
                 operation.Completion.TrySetResult();
             else
-                operation.Completion.TrySetException(new BrowserNavigationException(eventArgs.ErrorStatus ?? "Unknown"));
-
-            await TerminateAuthenticationAsync(operation, eventArgs.IsSuccess).ConfigureAwait(false);
+                operation.Completion.TrySetException(new BrowserNavigationException(
+                    operation.HasPsbcContinuation
+                        ? $"邮储页面返回 HTTP 412，后续页面未正常加载（{eventArgs.ErrorStatus ?? "Unknown"}）。"
+                        : eventArgs.ErrorStatus ?? "Unknown"));
         }
         finally
         {
             ReleasePhysicalNavigation(operation);
         }
+    }
+
+    private async Task ExpirePsbcContinuationAsync(NavigationOperation operation)
+    {
+        try
+        {
+            await operation.PhysicalReleased.Task.WaitAsync(
+                _psbcContinuationTimeout, _lifetimeCancellation.Token).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            await FailPsbcContinuationAsync(operation,
+                "邮储页面返回 HTTP 412，等待后续自动跳转超时。").ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested) { }
+    }
+
+    private async Task FailPsbcContinuationAsync(NavigationOperation operation, string error)
+    {
+        if (!operation.TryEndPsbcContinuation()) return;
+        // An unfinished physical navigation must not be reused by a later attempt.
+        lock (_sync) _quarantined = true;
+        CertificateLoginDiagnostics.Write("psbc-continuation-stopped");
+        await TerminateAuthenticationAsync(operation, isSuccess: false).ConfigureAwait(false);
+        operation.Completion.TrySetException(new BrowserNavigationException(error));
+        await DisposeAsync().ConfigureAwait(false);
     }
 
     private void ReleasePhysicalNavigation(NavigationOperation operation)
@@ -462,7 +540,11 @@ public sealed class WebView2BrowserHost :
             }
         }
 
-        if (release) _physicalNavigationGate.Release();
+        if (release)
+        {
+            operation.PhysicalReleased.TrySetResult();
+            _physicalNavigationGate.Release();
+        }
     }
 
     private async ValueTask<WebClientCertificateSelection> HandleClientCertificateRequestAsync(
@@ -481,6 +563,13 @@ public sealed class WebView2BrowserHost :
             cancellationToken.IsCancellationRequested)
             return WebClientCertificateSelection.Deny();
 
+        if (operation.HasPsbcContinuation)
+        {
+            Observe(FailPsbcContinuationAsync(operation,
+                "邮储页面再次请求证书，本轮已停止，不会重复提交 PIN。"));
+            return WebClientCertificateSelection.Deny();
+        }
+
         ClientCertificateRequestMatchResult result;
         try
         {
@@ -492,6 +581,11 @@ public sealed class WebView2BrowserHost :
         {
             return WebClientCertificateSelection.Deny();
         }
+
+        if (request.RequestUri.Host.Equals("corpebank.psbc.com", StringComparison.OrdinalIgnoreCase))
+            CertificateLoginDiagnostics.Write("psbc-certificate-decision",
+                new { status = result.Status.ToString(),
+                    candidateCount = request.AvailableCertificates.Count });
 
         if (result.Status ==
             ClientCertificateRequestMatchStatus.BrowserSelectionRequired)
@@ -649,14 +743,15 @@ public sealed class WebView2BrowserHost :
             TaskScheduler.Default);
 
     private void ThrowIfDisposed() =>
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed || _quarantined, this);
 
     private sealed record AuthenticationConfiguration(
         IBrowserClientCertificateRequestHandler Handler,
         IBrowserClientCertificateAuthenticationReporter Reporter,
         TimeSpan Timeout);
 
-    private sealed class NavigationOperation(long operationId)
+    private sealed class NavigationOperation(
+        long operationId, Uri? initialTarget, CancellationToken cancellation)
     {
         private readonly object _sync = new();
         private readonly Dictionary<long, WebNavigationCompletedEventArgs> _earlyCompletions = [];
@@ -664,8 +759,14 @@ public sealed class WebView2BrowserHost :
         private long? _navigationId;
         private bool _navigationTerminal;
         private bool _authenticationTerminal;
+        private bool _psbcContinuation;
+        private bool _awaitingContinuationStart;
+        private bool _continuationEnded;
 
         public TaskCompletionSource Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource PhysicalReleased { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task<long>? StartTask { get; set; }
@@ -673,9 +774,52 @@ public sealed class WebView2BrowserHost :
         public Task? BindingTask { get; set; }
 
         public long OperationId { get; } = operationId;
+        public CancellationToken Cancellation { get; } = cancellation;
 
         public long? NavigationId { get { lock (_sync) return _navigationId; } }
         public bool IsAuthenticationTerminal { get { lock (_sync) return _authenticationTerminal; } }
+        public bool HasPsbcContinuation { get { lock (_sync) return _psbcContinuation; } }
+
+        public bool TryBeginPsbcContinuation(WebNavigationCompletedEventArgs response)
+        {
+            lock (_sync)
+            {
+                if (_psbcContinuation || _authenticationTerminal || _pending is null ||
+                    Cancellation.IsCancellationRequested ||
+                    !PsbcNavigationContinuation.CanWait(initialTarget, response))
+                    return false;
+                _psbcContinuation = true;
+                _awaitingContinuationStart = true;
+                return true;
+            }
+        }
+
+        public bool TryBindPsbcContinuation(WebNavigationStartingEventArgs start)
+        {
+            lock (_sync)
+            {
+                if (!_awaitingContinuationStart || _continuationEnded ||
+                    _authenticationTerminal || Cancellation.IsCancellationRequested || start.IsUserInitiated ||
+                    start.NavigationId <= 0 || start.NavigationId == _navigationId ||
+                    !PsbcNavigationContinuation.IsBankOrigin(start.TargetUri))
+                    return false;
+                _awaitingContinuationStart = false;
+                _navigationId = start.NavigationId;
+                _navigationTerminal = false;
+                return true;
+            }
+        }
+
+        public bool TryEndPsbcContinuation()
+        {
+            lock (_sync)
+            {
+                if (!_psbcContinuation || _continuationEnded) return false;
+                _continuationEnded = true;
+                _navigationTerminal = true;
+                return true;
+            }
+        }
 
         public void MarkAuthenticationBindingFailed()
         {

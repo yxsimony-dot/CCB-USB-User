@@ -5,6 +5,85 @@ namespace UsbWebLauncher.Tests.Presentation;
 
 public sealed class LocalPinCommandsBrokerPrerequisiteTests
 {
+    [Theory]
+    [InlineData(BrokerPath)]
+    [InlineData(PolicyPath)]
+    public async Task InstallAsync_MissingPackageFileExplainsRepairWithoutRequestingElevation(string missingPath)
+    {
+        var launcher = new RecordingElevationLauncher();
+        var manager = new RecordingBrokerManager();
+        var prerequisites = Create(manager, launcher, path => path != missingPath);
+        var changes = 0;
+        prerequisites.StateChanged += (_, _) => changes++;
+
+        Assert.False(await prerequisites.InstallAsync());
+
+        Assert.Contains(System.IO.Path.GetFileName(missingPath), prerequisites.CurrentState.StatusText);
+        Assert.Contains("完整发布目录", prerequisites.CurrentState.StatusText);
+        Assert.False(prerequisites.CurrentState.IsInstalled);
+        Assert.False(prerequisites.CurrentState.IsHealthy);
+        Assert.Equal(0, launcher.CallCount);
+        Assert.Equal(0, manager.HealthCount);
+        Assert.Equal(1, changes);
+    }
+
+    [Fact]
+    public async Task InstallAsync_PackageRestoredAllowsRetry()
+    {
+        var packageAvailable = false;
+        var launcher = new RecordingElevationLauncher();
+        var prerequisites = Create(launcher: launcher, fileExists: _ => packageAvailable);
+
+        Assert.False(await prerequisites.InstallAsync());
+        packageAvailable = true;
+
+        Assert.True(await prerequisites.InstallAsync());
+        Assert.True(prerequisites.CurrentState.IsHealthy);
+        Assert.Equal(1, launcher.CallCount);
+    }
+
+    [Fact]
+    public async Task InstallAsync_DefaultFileCheckRejectsMissingPackage()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        var launcher = new RecordingElevationLauncher();
+        var prerequisites = new WindowsNativePromptBrokerPrerequisites(
+            true,
+            System.IO.Path.Combine(directory, "broker", WindowsNativePromptBrokerInstaller.BrokerFileName),
+            System.IO.Path.Combine(directory, "broker", WindowsNativePromptBrokerInstaller.PolicyFileName),
+            new RecordingBrokerManager(),
+            launcher);
+
+        Assert.False(await prerequisites.InstallAsync());
+        Assert.Equal(0, launcher.CallCount);
+        Assert.Contains("完整安装包", prerequisites.CurrentState.StatusText);
+    }
+
+    [Fact]
+    public async Task UninstallAsync_MissingBrokerDoesNotRequestElevationOrClearInstalledState()
+    {
+        var launcher = new RecordingElevationLauncher();
+        var prerequisites = Create(launcher: launcher, fileExists: _ => false);
+        Assert.True(await prerequisites.RefreshHealthAsync());
+
+        Assert.False(await prerequisites.UninstallAsync());
+
+        Assert.Equal(0, launcher.CallCount);
+        Assert.True(prerequisites.CurrentState.IsInstalled);
+        Assert.True(prerequisites.CurrentState.IsHealthy);
+        Assert.Contains(WindowsNativePromptBrokerInstaller.BrokerFileName, prerequisites.CurrentState.StatusText);
+    }
+
+    [Fact]
+    public async Task UninstallAsync_DoesNotRequirePackagePolicy()
+    {
+        var launcher = new RecordingElevationLauncher();
+        var prerequisites = Create(launcher: launcher, fileExists: path => path != PolicyPath);
+
+        Assert.True(await prerequisites.UninstallAsync());
+        Assert.Equal(["--uninstall"], launcher.Arguments);
+    }
+
     [Fact]
     public async Task InstallAsync_UsesOnlyFixedInstallVerbAndAbsolutePolicyPath()
     {
@@ -131,13 +210,15 @@ public sealed class LocalPinCommandsBrokerPrerequisiteTests
 
     private static WindowsNativePromptBrokerPrerequisites Create(
         RecordingBrokerManager? manager = null,
-        RecordingElevationLauncher? launcher = null) =>
+        RecordingElevationLauncher? launcher = null,
+        Func<string, bool>? fileExists = null) =>
         new(
             isRequired: true,
             BrokerPath,
             PolicyPath,
             manager ?? new RecordingBrokerManager(),
-            launcher ?? new RecordingElevationLauncher());
+            launcher ?? new RecordingElevationLauncher(),
+            fileExists ?? (_ => true));
 
     private sealed class RecordingBrokerManager : INativePromptBrokerManager
     {

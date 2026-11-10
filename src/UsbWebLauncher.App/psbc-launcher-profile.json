@@ -12,7 +12,7 @@
       "brokerPipeName": "UsbWebLauncher.NativePromptBroker.v1",
       "policyId": "psbc-uk-password-v1",
       "processPath": "",
-      "processSha256": "8B6FABDF9F4EBB331CB7325BB9947E4E3F9A2B5345602FEEACF277B1F9F355BE",
+      "processSha256": "51B4CD503D669D8F7F6FF6E9E22EFFEEBD28CCE11262DDEC815972A424474533",
       "publisherCertificateThumbprint": "4028CAD637509D4744B17EC5B42AED8D7A31E6AF",
       "windowTitle": "校验UK密码",
       "windowClass": "#32770",

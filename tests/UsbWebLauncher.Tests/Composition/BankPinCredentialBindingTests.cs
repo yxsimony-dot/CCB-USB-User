@@ -8,7 +8,7 @@ namespace UsbWebLauncher.Tests.Composition;
 public sealed class BankPinCredentialBindingTests
 {
     [Fact]
-    public async Task ReadStatus_UsesOnlyTheSelectedBankCredentialTarget()
+    public async Task ReadPin_UsesOnlyTheSelectedBankCredentialTarget()
     {
         var store = new RecordingPinStore();
         store.Seed(
@@ -25,11 +25,12 @@ public sealed class BankPinCredentialBindingTests
                 BankCredentialTargetResolver.PostalSavingsBankAuthenticationId,
                 BankCredentialTargetResolver.PostalSavingsBankCredentialTarget));
 
-        var ccbStatus = await ccb.ReadStatusAsync(store);
-        var psbcStatus = await psbc.ReadStatusAsync(store);
+        using var ccbPin = await ccb.ReadPinAsync(store);
+        using var psbcPin = await psbc.ReadPinAsync(store);
 
-        Assert.Equal(PinCredentialStatus.NotSet, ccbStatus);
-        Assert.Equal(PinCredentialStatus.Set, psbcStatus);
+        Assert.Null(ccbPin);
+        Assert.NotNull(psbcPin);
+        Assert.True(psbcPin.AsMemory().Span.SequenceEqual("synthetic-psbc-pin"));
         Assert.Equal(
             [
                 BankCredentialTargetResolver.ChinaConstructionBankCredentialTarget,

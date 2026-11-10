@@ -55,13 +55,12 @@ public partial class PinSetupDialog : Window, ILocalPinDialog
                 return Task.FromResult<ClientCertificatePin?>(null);
             }
 
-            using var securePassword = PinPasswordBox.SecurePassword;
             return Task.FromResult<ClientCertificatePin?>(
-                SecurePasswordPinReader.CopyFrom(securePassword));
+                ClientCertificatePin.CopyOf(PinTextBox.Text.AsSpan()));
         }
         finally
         {
-            PinPasswordBox.Clear();
+            PinTextBox.Clear();
         }
     }
 

@@ -1,9 +1,13 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 using UsbWebLauncher.Core.Devices;
+using UsbWebLauncher.Core.Authentication;
+using UsbWebLauncher.Windows.Authentication;
 
 namespace UsbWebLauncher.Windows.Devices;
 
@@ -346,6 +350,8 @@ internal interface IWindowsCryptoProviderProbeNative
         uint flags);
 
     bool Release(IntPtr provider, uint flags);
+
+    int GetLastError();
 }
 
 internal sealed class WindowsCryptoProviderProbeNative : IWindowsCryptoProviderProbeNative
@@ -373,6 +379,8 @@ internal sealed class WindowsCryptoProviderProbeNative : IWindowsCryptoProviderP
 
     public bool Release(IntPtr provider, uint flags) =>
         CryptReleaseContext(provider, flags);
+
+    public int GetLastError() => Marshal.GetLastWin32Error();
 
     [DllImport("Advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -402,11 +410,15 @@ internal sealed class WindowsCspTokenEvidenceReader : IWindowsPsbcTokenEvidenceR
     private const uint CryptVerifyContext = 0xF0000000;
     private const uint CryptSilent = 0x00000040;
     private const uint ProviderParameterEnumerateContainers = 2;
+    private const uint ProviderParameterContainer = 6;
     private const uint CryptFirst = 1;
     private const int MaximumContainerNameBytes = 16 * 1024;
+    private const int MaximumContainers = 64;
+    private const int ErrorNoMoreItems = 259;
 
     private readonly IWindowsCryptographicProviderReader _providerReader;
     private readonly IWindowsCryptoProviderProbeNative _native;
+    private readonly Func<string, uint, IReadOnlyList<string>> _readCertificateContainers;
 
     public WindowsCspTokenEvidenceReader(
         IWindowsCryptographicProviderReader providerReader)
@@ -416,11 +428,13 @@ internal sealed class WindowsCspTokenEvidenceReader : IWindowsPsbcTokenEvidenceR
 
     internal WindowsCspTokenEvidenceReader(
         IWindowsCryptographicProviderReader providerReader,
-        IWindowsCryptoProviderProbeNative native)
+        IWindowsCryptoProviderProbeNative native,
+        Func<string, uint, IReadOnlyList<string>>? readCertificateContainers = null)
     {
         _providerReader = providerReader ??
             throw new ArgumentNullException(nameof(providerReader));
         _native = native ?? throw new ArgumentNullException(nameof(native));
+        _readCertificateContainers = readCertificateContainers ?? ReadCertificateContainers;
     }
 
     public PsbcTokenEvidence Query(PsbcTokenQuery query)
@@ -447,36 +461,37 @@ internal sealed class WindowsCspTokenEvidenceReader : IWindowsPsbcTokenEvidenceR
                     continue;
                 }
 
-                uint containerLength = 0;
-                if (!_native.GetProviderParameter(
-                        provider,
-                        ProviderParameterEnumerateContainers,
-                        data: null,
-                        ref containerLength,
-                        CryptFirst) ||
-                    containerLength is 0 or > MaximumContainerNameBytes)
+                var containers = ReadContainers(provider);
+                if (containers is null || containers.Count == 0)
                 {
                     continue;
                 }
 
-                var container = new byte[checked((int)containerLength)];
-                if (!_native.GetProviderParameter(
-                        provider,
-                        ProviderParameterEnumerateContainers,
-                        container,
-                        ref containerLength,
-                        CryptFirst))
+                var identities = new HashSet<string>(containers, StringComparer.Ordinal);
+                foreach (var qualifiedName in _readCertificateContainers(providerName, providerType)
+                             .Distinct(StringComparer.Ordinal)
+                             .Take(MaximumContainers))
                 {
-                    continue;
+                    var shortName = GetQualifiedContainerShortName(qualifiedName);
+                    if (shortName is not null &&
+                        containers.Contains(shortName) &&
+                        VerifyQualifiedContainer(providerName, providerType, qualifiedName, shortName))
+                    {
+                        identities.Add(qualifiedName);
+                    }
                 }
 
-                var usedLength = Math.Min(container.Length, checked((int)containerLength));
-                var terminator = Array.IndexOf(container, (byte)0, 0, usedLength);
-                var identityLength = terminator >= 0 ? terminator : usedLength;
-                var identity = Encoding.Default.GetString(container, 0, identityLength);
+                var ordered = identities.Order(StringComparer.Ordinal).ToArray();
+                // Include every container/alias in the binding so a changed set invalidates it.
+                var identity = ordered.Length == 1
+                    ? ordered[0]
+                    : "csp-containers:" + Convert.ToHexString(SHA256.HashData(
+                        Encoding.UTF8.GetBytes(string.Concat(
+                            ordered.Select(value => $"{value.Length}:{value}")))));
                 return new PsbcTokenEvidence(
                     IsPresent: true,
-                    TokenIdentity: string.IsNullOrWhiteSpace(identity) ? null : identity);
+                    TokenIdentity: identity,
+                    ContainerIdentities: Array.AsReadOnly(ordered));
             }
             finally
             {
@@ -494,5 +509,131 @@ internal sealed class WindowsCspTokenEvidenceReader : IWindowsPsbcTokenEvidenceR
         }
 
         return new PsbcTokenEvidence(IsPresent: false);
+    }
+
+    private HashSet<string>? ReadContainers(IntPtr provider)
+    {
+        var containers = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index <= MaximumContainers; index++)
+        {
+            var data = new byte[MaximumContainerNameBytes];
+            var length = checked((uint)data.Length);
+            if (!_native.GetProviderParameter(
+                    provider, ProviderParameterEnumerateContainers, data, ref length,
+                    index == 0 ? CryptFirst : 0))
+            {
+                return _native.GetLastError() == ErrorNoMoreItems ? containers : null;
+            }
+
+            var name = ReadContainerName(data, length);
+            if (index == MaximumContainers || name is null || !containers.Add(name))
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private bool VerifyQualifiedContainer(
+        string providerName, uint providerType, string qualifiedName, string shortName)
+    {
+        IntPtr provider = IntPtr.Zero;
+        try
+        {
+            // Resolve the reader-qualified alias through the CSP, never by suffix alone.
+            if (!_native.Acquire(
+                    out provider, qualifiedName, providerName, providerType,
+                    CryptVerifyContext | CryptSilent) ||
+                provider == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var data = new byte[MaximumContainerNameBytes];
+            var length = checked((uint)data.Length);
+            return _native.GetProviderParameter(
+                       provider, ProviderParameterContainer, data, ref length, flags: 0) &&
+                   string.Equals(ReadContainerName(data, length), shortName, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (provider != IntPtr.Zero)
+            {
+                _native.Release(provider, flags: 0);
+            }
+        }
+    }
+
+    private static string? ReadContainerName(byte[] data, uint length)
+    {
+        if (length == 0 || length > data.Length)
+        {
+            return null;
+        }
+
+        var terminator = Array.IndexOf(data, (byte)0, 0, checked((int)length));
+        if (terminator <= 0)
+        {
+            return null;
+        }
+
+        // CSP string parameters use the Windows ANSI code page, not .NET's UTF-8 default.
+        var pinned = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try
+        {
+            var name = Marshal.PtrToStringAnsi(pinned.AddrOfPinnedObject(), terminator);
+            return string.IsNullOrWhiteSpace(name) ? null : name;
+        }
+        finally
+        {
+            pinned.Free();
+        }
+    }
+
+    private static string? GetQualifiedContainerShortName(string name)
+    {
+        if (!name.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var separator = name.IndexOf('\\', 4);
+        return separator > 4 &&
+               separator < name.Length - 1 &&
+               name.IndexOf('\\', separator + 1) < 0
+            ? name[(separator + 1)..]
+            : null;
+    }
+
+    private static IReadOnlyList<string> ReadCertificateContainers(
+        string providerName, uint providerType)
+    {
+        try
+        {
+            using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+            store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+            var names = new List<string>();
+            foreach (var certificate in store.Certificates)
+            {
+                using (certificate)
+                {
+                    var metadata = WindowsCertificateProviderMetadataReader.Instance.Read(certificate);
+                    if (metadata.Failure == ClientCertificateProviderMetadataFailure.None &&
+                        metadata.ProviderKind == ClientCertificateProviderKind.Csp &&
+                        metadata.ProviderType == providerType &&
+                        string.Equals(metadata.ProviderName, providerName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        names.Add(metadata.ContainerOrKeyName);
+                    }
+                }
+            }
+
+            return names;
+        }
+        catch (CryptographicException)
+        {
+            return [];
+        }
     }
 }

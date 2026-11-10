@@ -339,7 +339,12 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
     private bool HasAuthenticationFailure => _started && _authenticationState.Stage is
         AuthenticationStage.Failed or AuthenticationStage.Incompatible;
 
-    private string AuthenticationFailureMessage => !string.IsNullOrWhiteSpace(_authenticationState.Message)
+    private bool HasPsbcConnectionFailure => IsPostalSavingsBank &&
+        _authenticationState.ErrorCategory == AuthenticationErrorCategory.TlsFailed;
+
+    private string AuthenticationFailureMessage => HasPsbcConnectionFailure
+        ? "银行安全连接未完成，请查看下方页面错误码。"
+        : !string.IsNullOrWhiteSpace(_authenticationState.Message)
         ? _authenticationState.Message
         : "本次认证未完成，请检查 USB Key 后重新插入。";
 
@@ -395,13 +400,16 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         : _bankFlowUnavailableMessage is not null
             ? $"请先配置{SelectedBankFlow.DisplayName} Key 的识别信息、登录地址和认证参数。"
         : HasAuthenticationFailure
-        ? "请检查设备和 PIN 设置，再拔出并重新插入 USB Key。"
+        ? HasPsbcConnectionFailure
+            ? "此错误不等同于 PIN 错误，请勿反复提交。"
+            : "请检查设备和 PIN 设置，再拔出并重新插入 USB Key。"
         : !_initialized ? "请等待初始化完成；如遇错误，可点击重试。" :
         !_started ? "可先完成所需准备，再点击上方按钮启动业务。" :
         _awaitingExplicitStart ? "完成所需准备后，再次点击“启动业务”。" :
         "识别成功后，目标页面会在此窗口自动打开。";
 
-    public string? ErrorDetail => HasAuthenticationFailure ? AuthenticationFailureMessage : _state.ErrorDetail;
+    public string? ErrorDetail => _state.ErrorDetail ??
+        (HasAuthenticationFailure ? AuthenticationFailureMessage : null);
 
     public bool IsUsbPresent => _state.IsUsbPresent;
 
@@ -441,6 +449,7 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         : !_isAuthenticationConfigured
         ? "PIN 设置不适用：当前配置未启用认证。"
         : !_started ? "可提前设置 PIN；保存后请手动启动业务。"
+        : HasPsbcConnectionFailure ? AuthenticationFailureMessage
         : _authenticationState.Message ?? string.Empty;
 
     public bool IsAuthenticationBusy => _authenticationState.Stage is
@@ -539,6 +548,18 @@ public sealed class LauncherViewModel : INotifyPropertyChanged
         RaisePropertyChanged(nameof(IsExportBusy));
         RaisePropertyChanged(nameof(ExportStatusText));
         PublishCommandAvailability();
+    }
+
+    public void UpdateCurrentPin(ClientCertificatePin? pin)
+    {
+        if (pin is null || pin.AsMemory().IsEmpty)
+        {
+            UpdateCurrentPinStatus(PinCredentialStatus.NotSet);
+            return;
+        }
+
+        _currentPinText = "当前 PIN：" + new string(pin.AsMemory().Span);
+        RaisePropertyChanged(nameof(CurrentPinText));
     }
 
     public void UpdateCurrentPinStatus(PinCredentialStatus status)

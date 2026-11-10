@@ -11,6 +11,66 @@ namespace UsbWebLauncher.Tests.Authentication;
 public sealed class AuthenticationCoordinatorTests
 {
     [Fact]
+    public async Task BrowserFailure_PreservesTlsFailureAndDoesNotResetPsbcAttempt()
+    {
+        var authentication = PsbcAuthenticationWithContinuation();
+        var continuation = new RecordingNativePromptContinuation(
+            new(ClientCertificateNativePromptArmStatus.Armed, new RecordingNativePromptAttempt()));
+        await using var coordinator = CreateCoordinator(
+            new RecordingPinStore(RandomPinCharacters()),
+            new RecordingStampStore(CreatePendingStamp(authentication)),
+            new RecordingUnlocker(), continuation, authentication,
+            new MutablePsbcRuntimeContext(PsbcSnapshot()));
+        await coordinator.HandleDevicePresenceAsync(true);
+        await coordinator.ReportNavigationStartedAsync(601);
+        var request = new ClientCertificateRequestSnapshot(
+            new Uri("https://corpebank.psbc.com/#/login"), false,
+            [PsbcCandidate("SYNTHETIC_PSBC_CONTAINER")], 601);
+        var selection = await coordinator.HandleAsync(request);
+        var authorization = await coordinator.ReportCertificateSelectedAsync(selection.Attempt!);
+        await coordinator.ReportTlsFailureAsync(selection.Attempt!);
+        var failure = coordinator.CurrentState;
+
+        var gate = new AuthenticationLauncherGate(
+            BankAuthenticationRuntimeKind.PostalSavingsBank,
+            coordinator);
+        var manual = new ManualAuthenticationGate(gate, coordinator);
+        await manual.AllowBusinessAsync();
+        await manual.ReleaseAfterBrowserFailureAsync();
+        await coordinator.HandleDevicePresenceAsync(true);
+
+        Assert.Same(failure, coordinator.CurrentState);
+        Assert.Equal(AuthenticationErrorCategory.TlsFailed, coordinator.CurrentState.ErrorCategory);
+        Assert.True(manual.RequiresExplicitStart);
+        Assert.False(authorization!.TryCommit(() => throw new Exception("Revoked selection")));
+        Assert.Equal(ClientCertificateRequestMatchStatus.InvalidRequest,
+            (await coordinator.HandleAsync(request)).Status);
+    }
+
+    [Fact]
+    public async Task BrowserInitializationFailure_ReleasesPreparedPinWithoutPretendingDeviceWasRemoved()
+    {
+        var authentication = PsbcAuthenticationWithContinuation();
+        await using var coordinator = CreateCoordinator(
+            new RecordingPinStore(RandomPinCharacters()),
+            new RecordingStampStore(CreatePendingStamp(authentication)),
+            new RecordingUnlocker(),
+            new RecordingNativePromptContinuation(new(ClientCertificateNativePromptArmStatus.BrokerUnavailable)),
+            authentication, new MutablePsbcRuntimeContext(PsbcSnapshot()));
+        await coordinator.HandleDevicePresenceAsync(true);
+        var cycle = coordinator.CurrentState.InsertionCycleId;
+
+        await coordinator.ReleaseAfterBrowserFailureAsync();
+        await coordinator.HandleDevicePresenceAsync(true);
+
+        Assert.Equal(AuthenticationStage.Failed, coordinator.CurrentState.Stage);
+        Assert.Equal(cycle, coordinator.CurrentState.InsertionCycleId);
+        Assert.NotEqual(AuthenticationErrorCategory.DeviceUnavailable, coordinator.CurrentState.ErrorCategory);
+        await coordinator.HandleDevicePresenceAsync(false);
+        Assert.Equal(AuthenticationStage.WaitingForDevice, coordinator.CurrentState.Stage);
+    }
+
+    [Fact]
     public async Task PsbcAuthenticationObservation_UsesOnlyApprovedFields()
     {
         var tokenIdentity = $"SYNTHETIC_TOKEN_{Guid.NewGuid():N}";
@@ -138,16 +198,23 @@ public sealed class AuthenticationCoordinatorTests
         Assert.Same(correlated, result.SelectedCertificate);
     }
 
-    [Fact]
-    public async Task PsbcCertificateRequest_WithoutConfiguredPin_UsesRepeatableBrowserSelection()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PsbcCertificateRequest_WithoutConfiguredPin_SelectsOnceWithoutArmingPrompt(
+        bool hasPendingStamp)
     {
         var authentication = PsbcAuthenticationWithContinuation();
+        var pins = new RecordingPinStore();
+        var stamps = new RecordingStampStore(
+            hasPendingStamp ? CreatePendingStamp(authentication) : null);
+        var continuation = new RecordingNativePromptContinuation(
+            new(ClientCertificateNativePromptArmStatus.BrokerUnavailable));
         await using var coordinator = CreateCoordinator(
-            new RecordingPinStore(),
-            new RecordingStampStore(null),
+            pins,
+            stamps,
             new RecordingUnlocker(),
-            new RecordingNativePromptContinuation(
-                new(ClientCertificateNativePromptArmStatus.BrokerUnavailable)),
+            continuation,
             authentication,
             new MutablePsbcRuntimeContext(PsbcSnapshot()));
         await coordinator.HandleDevicePresenceAsync(true);
@@ -160,18 +227,88 @@ public sealed class AuthenticationCoordinatorTests
         var second = await coordinator.HandleAsync(CreatePsbcRequest(6011));
 
         Assert.Equal(
-            ClientCertificateRequestMatchStatus.BrowserSelectionRequired,
+            ClientCertificateRequestMatchStatus.Selected,
             first.Status);
-        Assert.Null(first.SelectedCertificate);
-        Assert.Null(first.Attempt);
+        Assert.NotNull(first.SelectedCertificate);
+        Assert.NotNull(first.Attempt);
         Assert.Equal(
-            ClientCertificateRequestMatchStatus.BrowserSelectionRequired,
+            ClientCertificateRequestMatchStatus.InvalidRequest,
             second.Status);
         Assert.Null(second.SelectedCertificate);
         Assert.Null(second.Attempt);
         Assert.Equal(
-            AuthenticationStage.RequiresPinSetup,
+            AuthenticationStage.Authenticating,
             coordinator.CurrentState.Stage);
+        var authorization = await coordinator.ReportCertificateSelectedAsync(first.Attempt!);
+        Assert.NotNull(authorization);
+        Assert.Same(authorization, await coordinator.ReportCertificateSelectedAsync(first.Attempt!));
+        Assert.True(authorization.TryCommit(() => { }));
+        Assert.Equal(0, continuation.ArmCount);
+        Assert.Equal(1, pins.ReadCount);
+
+        await coordinator.ReportTlsCompletedAsync(first.Attempt!);
+
+        Assert.Equal(AuthenticationStage.Ready, coordinator.CurrentState.Stage);
+        Assert.Equal(0, stamps.SaveCount);
+        Assert.False(pins.HasStoredPin);
+        Assert.Equal(0, continuation.ArmCount);
+    }
+
+    [Theory]
+    [InlineData("key")]
+    [InlineData("bank")]
+    [InlineData("session")]
+    [InlineData("stop")]
+    [InlineData("removal")]
+    [InlineData("timeout")]
+    [InlineData("tls-failure")]
+    public async Task PsbcManualPinAttempt_InvalidationRevokesCertificateAuthorization(string scenario)
+    {
+        var context = new MutablePsbcRuntimeContext(PsbcSnapshot());
+        var continuation = new RecordingNativePromptContinuation(
+            new(ClientCertificateNativePromptArmStatus.BrokerUnavailable));
+        var stamps = new RecordingStampStore(null);
+        await using var coordinator = CreateCoordinator(
+            new RecordingPinStore(), stamps, new RecordingUnlocker(),
+            continuation, PsbcAuthenticationWithContinuation(), context);
+        await coordinator.HandleDevicePresenceAsync(true);
+        await coordinator.ReportNavigationStartedAsync(6013);
+        var result = await coordinator.HandleAsync(CreatePsbcRequest(6013));
+        Assert.NotNull(result.Attempt);
+        var authorization = await coordinator.ReportCertificateSelectedAsync(result.Attempt);
+        Assert.NotNull(authorization);
+
+        switch (scenario)
+        {
+            case "key":
+                context.Update(PsbcSnapshot(contextRevision: 2, tokenIdentity: "REPLACEMENT"));
+                break;
+            case "bank":
+                context.Update(PsbcSnapshot(contextRevision: 2, isPostalSavingsBank: false));
+                break;
+            case "session":
+                context.Update(PsbcSnapshot(contextRevision: 2, currentRevision: 3));
+                break;
+            case "stop":
+                await coordinator.SetBusinessSuspendedAsync(true);
+                break;
+            case "removal":
+                await coordinator.HandleDevicePresenceAsync(false);
+                break;
+            case "timeout":
+                await coordinator.ReportTimeoutAsync(result.Attempt);
+                break;
+            case "tls-failure":
+                await coordinator.ReportTlsFailureAsync(result.Attempt);
+                break;
+        }
+
+        Assert.False(authorization.TryCommit(() => { }));
+        Assert.Null(await coordinator.ReportCertificateSelectedAsync(result.Attempt));
+        await coordinator.ReportTlsCompletedAsync(result.Attempt);
+        Assert.NotEqual(AuthenticationStage.Ready, coordinator.CurrentState.Stage);
+        Assert.Equal(0, stamps.SaveCount);
+        Assert.Equal(0, continuation.ArmCount);
     }
 
     [Theory]
@@ -487,7 +624,7 @@ public sealed class AuthenticationCoordinatorTests
     }
 
     [Fact]
-    public async Task PsbcTlsSuccess_UpgradesPendingStampWithoutDeletingPin()
+    public async Task PsbcTlsSuccess_DoesNotRequireOrModifyLegacyStamp()
     {
         var authentication = PsbcAuthenticationWithContinuation();
         var pins = new RecordingPinStore(RandomPinCharacters());
@@ -510,8 +647,9 @@ public sealed class AuthenticationCoordinatorTests
 
         Assert.Equal(AuthenticationStage.Ready, coordinator.CurrentState.Stage);
         Assert.True(pins.HasStoredPin);
-        Assert.Equal(CreateValidStamp(authentication), stamps.StoredStamp);
-        Assert.Equal(1, stamps.SaveCount);
+        Assert.Equal(CreatePendingStamp(authentication), stamps.StoredStamp);
+        Assert.Equal(0, stamps.ReadCount);
+        Assert.Equal(0, stamps.SaveCount);
         Assert.Equal(0, pins.DeleteCount);
         Assert.Equal(0, stamps.DeleteCount);
     }
@@ -795,7 +933,7 @@ public sealed class AuthenticationCoordinatorTests
         await using var coordinator = CreateCoordinator(pins, stamps, unlocker, continuation, authentication);
         await coordinator.HandleDevicePresenceAsync(true);
         Assert.Equal(AuthenticationStage.AwaitingCertificate, coordinator.CurrentState.Stage);
-        Assert.Equal(1, stamps.ReadCount);
+        Assert.Equal(0, stamps.ReadCount);
         Assert.Equal(0, unlocker.AttemptCount);
         await coordinator.ReportNavigationStartedAsync(201);
         var result = await coordinator.HandleAsync(CreateAuthorizedRequest(201));
@@ -805,8 +943,9 @@ public sealed class AuthenticationCoordinatorTests
         prompt.Complete(new(ClientCertificateNativePromptStatus.Success));
         await coordinator.ReportTlsCompletedAsync(result.Attempt!);
         Assert.Equal(AuthenticationStage.Ready, coordinator.CurrentState.Stage);
-        Assert.Equal(pendingStamp ? 1 : 0, stamps.SaveCount);
-        Assert.Equal(CreateValidStamp(authentication), stamps.StoredStamp);
+        Assert.Equal(0, stamps.SaveCount);
+        Assert.Equal(pendingStamp ? CreatePendingStamp(authentication) : CreateValidStamp(authentication),
+            stamps.StoredStamp);
         Assert.All(continuation.PinPassedToArm!.AsMemory().ToArray(), c => Assert.Equal('\0', c));
     }
 
@@ -821,17 +960,16 @@ public sealed class AuthenticationCoordinatorTests
             new RecordingNativePromptContinuation(new(ClientCertificateNativePromptArmStatus.BrokerUnavailable)), authentication);
         await coordinator.HandleDevicePresenceAsync(true);
         Assert.Equal(AuthenticationStage.RequiresPinSetup, coordinator.CurrentState.Stage);
-        Assert.Equal(1, stamps.ReadCount);
+        Assert.Equal(0, stamps.ReadCount);
         Assert.Equal(1, pins.ReadCount);
         Assert.Equal(0, unlocker.AttemptCount);
     }
 
     [Theory]
-    [InlineData(false, AuthenticationErrorCategory.CredentialsUnavailable)]
-    [InlineData(true, AuthenticationErrorCategory.ValidationStampInvalid)]
-    public async Task BrowserNative_MissingOrInvalidStampDoesNotReadStoredPin(
-        bool invalidStamp,
-        AuthenticationErrorCategory expectedCategory)
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BrowserNative_MissingOrInvalidLegacyStampStillReadsStoredPin(
+        bool invalidStamp)
     {
         var authentication = AuthenticationWithContinuation() with { AuthenticationMode = "BrowserNative" };
         var pins = new RecordingPinStore(RandomPinCharacters());
@@ -850,10 +988,10 @@ public sealed class AuthenticationCoordinatorTests
 
         await coordinator.HandleDevicePresenceAsync(true);
 
-        Assert.Equal(AuthenticationStage.RequiresPinSetup, coordinator.CurrentState.Stage);
-        Assert.Equal(expectedCategory, coordinator.CurrentState.ErrorCategory);
-        Assert.Equal(1, stamps.ReadCount);
-        Assert.Equal(0, pins.ReadCount);
+        Assert.Equal(AuthenticationStage.AwaitingCertificate, coordinator.CurrentState.Stage);
+        Assert.Equal(AuthenticationErrorCategory.None, coordinator.CurrentState.ErrorCategory);
+        Assert.Equal(0, stamps.ReadCount);
+        Assert.Equal(1, pins.ReadCount);
         Assert.Equal(0, unlocker.AttemptCount);
     }
 

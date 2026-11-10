@@ -627,6 +627,34 @@ public sealed class LauncherProfileJsonTests
     }
 
     [Fact]
+    public void ShippedPsbcPrompt_MatchesVerifiedWebView157IdentityWithoutRelaxingChecks()
+    {
+        var profilePath = FindRepoRootPath("src", "UsbWebLauncher.App", "psbc-launcher-profile.json");
+        var authentication = Assert.IsType<ClientCertificateAuthenticationOptions>(
+            LauncherProfileJson.Parse(File.ReadAllText(profilePath)).ClientCertificateAuthentication);
+        var prompt = Assert.IsType<ClientCertificateNativePromptOptions>(
+            authentication.NativePromptContinuation);
+        var candidate = UsbWebLauncher.Tests.Windows.Authentication.NativePromptWindowMatcherTests
+            .PsbcStrictTopLevelCandidate() with
+        {
+            ProcessPath = @"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\157.0.4341.42\msedgewebview2.exe",
+            ProcessSha256 = "51B4CD503D669D8F7F6FF6E9E22EFFEEBD28CCE11262DDEC815972A424474533"
+        };
+        const int trustedClientProcessId =
+            UsbWebLauncher.Tests.Windows.Authentication.NativePromptWindowMatcherTests.TrustedClientProcessId;
+
+        Assert.True(NativePromptWindowMatcher.IsMatch(prompt, candidate, trustedClientProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            prompt, candidate with { ProcessSha256 = new string('F', 64) }, trustedClientProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            prompt, candidate with { IsAuthenticodeValid = false }, trustedClientProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            prompt, candidate with { ParentProcessId = trustedClientProcessId + 1 }, trustedClientProcessId));
+        Assert.False(NativePromptWindowMatcher.IsMatch(
+            prompt, candidate with { InputControlId = 3006 }, trustedClientProcessId));
+    }
+
+    [Fact]
     public void ShippedNativePromptPolicy_ExactlyMatchesAllShippedAuthenticationProfiles()
     {
         var policyPath = FindRepoRootPath(

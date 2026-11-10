@@ -1,4 +1,3 @@
-using UsbWebLauncher.App.Presentation;
 using UsbWebLauncher.Core.Authentication;
 using UsbWebLauncher.Core.Configuration;
 
@@ -42,17 +41,13 @@ internal sealed class BankPinCredentialBinding
         return new(runtimeKind, authentication.Id, targetName);
     }
 
-    public async ValueTask<PinCredentialStatus> ReadStatusAsync(
+    public ValueTask<ClientCertificatePin?> ReadPinAsync(
         IClientCertificatePinStore pinStore,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(pinStore);
-        using var pin = await pinStore.ReadAsync(
+        return pinStore.ReadAsync(
                 CredentialTargetName,
-                cancellationToken)
-            .ConfigureAwait(false);
-        return pin is null
-            ? PinCredentialStatus.NotSet
-            : PinCredentialStatus.Set;
+                cancellationToken);
     }
 }

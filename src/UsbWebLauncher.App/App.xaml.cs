@@ -32,6 +32,7 @@ public partial class App : Application
     private WpfCurrentCompanyDisplay? _currentCompanyDisplay;
     private ApplicationLaunchOptions _launchOptions = new(false);
     private BankPinCredentialBinding? _pinCredentialBinding;
+    private long _pinRefreshRevision;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
     private bool _initializing;
@@ -92,6 +93,12 @@ public partial class App : Application
             }
 
             _window = new MainWindow();
+            if (PsbcInputTrace.ManualObservation)
+            {
+                _window.Title = "USB Web Launcher - 邮储真实页面诊断（手动）";
+                PsbcInputTrace.Write("psbc-real-input-process-start",
+                    new { processId = Environment.ProcessId, mode = "manual" });
+            }
             MainWindow = _window;
             _window.Closing += OnMainWindowClosing;
             _window.RetryRequested += OnRetryRequested;
@@ -339,16 +346,22 @@ public partial class App : Application
                     authenticationRuntime.BrokerPrerequisites);
                 var pageLogin = authenticationRuntime.PinStore is { } pinStore &&
                     profile.ClientCertificateAuthentication is { } authenticationOptions
-                    ? _runtime.BankComponents.CreateCcbPageCoordinator(
-                        () => new CertificatePageLoginCoordinator(
+                    ? bankFlow.Kind == BankFlowKind.PostalSavingsBank
+                        ? new CertificatePageLoginCoordinator(
                             pinStore,
                             authenticationOptions.CredentialTargetName,
-                            new WpfCertificateLoginPage(
-                                browser,
-                                new Uri(profile.TargetUrl),
-                                authenticationOptions,
-                                sessionToken),
-                            sessionToken: sessionToken))
+                            new WpfPsbcCertificateLoginPage(browser, sessionToken),
+                            sessionToken: sessionToken)
+                        : _runtime.BankComponents.CreateCcbPageCoordinator(
+                            () => new CertificatePageLoginCoordinator(
+                                pinStore,
+                                authenticationOptions.CredentialTargetName,
+                                new WpfCertificateLoginPage(
+                                    browser,
+                                    new Uri(profile.TargetUrl),
+                                    authenticationOptions,
+                                    sessionToken),
+                                sessionToken: sessionToken))
                     : null;
                 _actions = new ManualLauncherActions(_coordinator, localPinCommands,
                     authenticationRuntime.BrokerPrerequisites,
@@ -765,20 +778,22 @@ public partial class App : Application
             return;
         }
 
+        var refreshRevision = Interlocked.Increment(ref _pinRefreshRevision);
         try
         {
-            var status = await credentialBinding.ReadStatusAsync(
+            using var pin = await credentialBinding.ReadPinAsync(
                     pinStore,
                     callbackGuard.Owner.Session.Token)
                 .ConfigureAwait(false);
             await Dispatcher.InvokeAsync(() =>
                 callbackGuard.TryPublish(() =>
                 {
-                    if (ReferenceEquals(
+                    if (refreshRevision == Volatile.Read(ref _pinRefreshRevision) &&
+                        ReferenceEquals(
                             authenticationRuntime,
                             _authenticationRuntime))
                     {
-                        window.ViewModel.UpdateCurrentPinStatus(status);
+                        window.ViewModel.UpdateCurrentPin(pin);
                     }
                 }));
         }
@@ -792,7 +807,8 @@ public partial class App : Application
             await Dispatcher.InvokeAsync(() =>
                 callbackGuard.TryPublish(() =>
                 {
-                    if (ReferenceEquals(
+                    if (refreshRevision == Volatile.Read(ref _pinRefreshRevision) &&
+                        ReferenceEquals(
                             authenticationRuntime,
                             _authenticationRuntime))
                     {

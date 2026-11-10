@@ -156,8 +156,14 @@ public sealed class WindowsClientCertificateAuthenticationRuntime :
 internal sealed class AuthenticationLauncherGate(
     BankAuthenticationRuntimeKind runtimeKind,
     AuthenticationCoordinator coordinator)
-    : ILauncherAuthenticationGate, ILauncherAuthenticationMetadataInvalidationGate
+    : ILauncherAuthenticationGate, ILauncherAuthenticationMetadataInvalidationGate,
+      ILauncherAuthenticationBrowserFailureGate
 {
+    public Task ReleaseAfterBrowserFailureAsync(CancellationToken cancellationToken = default) =>
+        runtimeKind == BankAuthenticationRuntimeKind.PostalSavingsBank
+            ? coordinator.ReleaseAfterBrowserFailureAsync(cancellationToken)
+            : coordinator.HandleDevicePresenceAsync(false, cancellationToken);
+
     public Task InvalidateDeviceMetadataAsync(CancellationToken cancellationToken = default) =>
         coordinator.InvalidateDeviceMetadataAsync(cancellationToken);
 

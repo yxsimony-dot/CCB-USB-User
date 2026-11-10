@@ -13,6 +13,7 @@ public interface IManualAuthenticationControl
 
 public sealed class ManualAuthenticationGate
     : ILauncherAuthenticationGate, ILauncherAuthenticationMetadataInvalidationGate,
+      ILauncherAuthenticationBrowserFailureGate,
       IClientCertificatePinSetupLifecycleObserver, IManualAuthenticationControl
 {
     private readonly ILauncherAuthenticationGate _innerGate;
@@ -32,6 +33,16 @@ public sealed class ManualAuthenticationGate
     public event EventHandler? StateChanged;
 
     public bool RequiresExplicitStart => _requiresExplicitStart;
+
+    public Task ReleaseAfterBrowserFailureAsync(CancellationToken cancellationToken = default) =>
+        TransitionAsync(async () =>
+        {
+            _requiresExplicitStart = true;
+            if (_innerGate is ILauncherAuthenticationBrowserFailureGate failureGate)
+                await failureGate.ReleaseAfterBrowserFailureAsync(cancellationToken).ConfigureAwait(false);
+            else
+                await _innerGate.HandleDevicePresenceAsync(false, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
 
     public Task InvalidateDeviceMetadataAsync(CancellationToken cancellationToken = default) =>
         TransitionAsync(async () =>

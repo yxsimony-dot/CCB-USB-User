@@ -157,10 +157,21 @@ public abstract class PsbcUsbKeyProbeBase : IPsbcUsbKeyProbe
         ArgumentNullException.ThrowIfNull(environmentQuery);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var candidate = devices.FirstOrDefault(IsCandidate);
+        var candidates = devices
+            .Where(IsCandidate)
+            .DistinctBy(device => device.InstanceId, StringComparer.OrdinalIgnoreCase)
+            .Take(2)
+            .ToArray();
+        var candidate = candidates.FirstOrDefault();
         if (candidate is null)
         {
             return UsbKeyDetectionResult.Absent(VendorFamily);
+        }
+
+        // Provider-wide enumeration cannot attribute containers to one of two keys.
+        if (candidates.Length != 1)
+        {
+            return EnvironmentUnavailable(candidate, UsbKeyDiagnosticCode.TokenUnavailable);
         }
 
         if (RequiredServiceName is { } serviceName)
@@ -235,7 +246,8 @@ public abstract class PsbcUsbKeyProbeBase : IPsbcUsbKeyProbe
         return UsbKeyDetectionResult.Ready(
             VendorFamily,
             candidate.InstanceId,
-            token.TokenIdentity);
+            token.TokenIdentity,
+            token.ContainerIdentities);
     }
 
     private UsbKeyDetectionResult EnvironmentUnavailable(

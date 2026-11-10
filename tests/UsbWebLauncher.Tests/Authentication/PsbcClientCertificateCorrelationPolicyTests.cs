@@ -143,6 +143,47 @@ public sealed class PsbcClientCertificateCorrelationPolicyTests
         Assert.Same(candidates[1], matches[0]);
     }
 
+    [Fact]
+    public void Correlate_MatchesSecondContainerAndItsDriverVerifiedQualifiedName()
+    {
+        const string qualified = @"\\.\Synthetic Reader\SIGNING";
+        var key = UsbKeyDetectionResult.Ready(
+            UsbKeyVendorFamily.Tendyron,
+            @"USB\VID_1780&PID_0401\SYNTHETIC",
+            "csp-containers:synthetic-binding",
+            ["EXCHANGE", "SIGNING", qualified]);
+
+        Assert.True(Correlate(key, Candidate(container: "SIGNING")).IsMatch);
+        Assert.True(Correlate(key, Candidate(container: qualified)).IsMatch);
+        Assert.Equal(
+            PsbcClientCertificateCorrelationStatus.ContainerMismatch,
+            Correlate(key, Candidate(container: @"\\.\Different Reader\SIGNING")).Status);
+    }
+
+    [Fact]
+    public void Correlate_DoesNotStripReaderPrefixWithoutDriverVerifiedAlias()
+    {
+        var key = UsbKeyDetectionResult.Ready(
+            UsbKeyVendorFamily.Tendyron,
+            @"USB\VID_1780&PID_0401\SYNTHETIC",
+            "binding",
+            ["EXCHANGE", "SIGNING"]);
+
+        Assert.Equal(
+            PsbcClientCertificateCorrelationStatus.ContainerMismatch,
+            Correlate(key, Candidate(container: @"\\.\Synthetic Reader\SIGNING")).Status);
+        Assert.False(Correlate(key, Candidate(container: "binding")).IsMatch);
+        Assert.False(Correlate(key, Candidate(container: "signing")).IsMatch);
+    }
+
+    [Fact]
+    public void Correlate_ExplicitEmptyContainerEvidenceDoesNotFallBackToTokenIdentity()
+    {
+        var key = ReadyKey("SYNTHETIC_PSBC_CONTAINER") with { ContainerIdentities = [] };
+
+        Assert.False(Correlate(key, Candidate()).IsMatch);
+    }
+
     private static PsbcClientCertificateCorrelationResult Correlate(
         UsbKeyDetectionResult key,
         ClientCertificateCandidate candidate) =>

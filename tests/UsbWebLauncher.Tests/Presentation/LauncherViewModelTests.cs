@@ -6,6 +6,21 @@ namespace UsbWebLauncher.Tests.Presentation;
 
 public sealed class LauncherViewModelTests
 {
+    [Fact]
+    public void BrowserFailureDetailIsNotHiddenByGenericAuthenticationFailure()
+    {
+        var viewModel = new LauncherViewModel();
+        viewModel.UpdateBusinessState(true, true, false, false);
+        viewModel.UpdateState(new(LauncherStage.Error, true, "Navigation failed.",
+            "Unknown (ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED)"));
+        viewModel.UpdateAuthenticationState(new(AuthenticationStage.Failed, 1,
+            AuthenticationErrorCategory.TlsFailed, Message: "Authentication failed."));
+
+        Assert.Equal("Unknown (ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED)", viewModel.ErrorDetail);
+        Assert.Contains("认证", viewModel.IdleTitle);
+        Assert.True(viewModel.IsUsbPresent);
+    }
+
     [Theory]
     [InlineData(AuthenticationStage.Failed)]
     [InlineData(AuthenticationStage.Incompatible)]
@@ -262,6 +277,28 @@ public sealed class LauncherViewModelTests
         viewModel.UpdateCurrentPinStatus(PinCredentialStatus.ReadFailed);
 
         Assert.Equal("当前 PIN：读取失败", viewModel.CurrentPinText);
+    }
+
+    [Fact]
+    public void CurrentPin_DisplaysSavedValueAndClearsOnDeleteFailureOrBankSwitch()
+    {
+        var viewModel = new LauncherViewModel();
+        using var pin = ClientCertificatePin.CopyOf("synthetic-visible-pin".AsSpan());
+        var changedProperties = new List<string?>();
+        viewModel.PropertyChanged += (_, args) => changedProperties.Add(args.PropertyName);
+
+        viewModel.UpdateCurrentPin(pin);
+        Assert.Equal("当前 PIN：synthetic-visible-pin", viewModel.CurrentPinText);
+        Assert.Contains(nameof(LauncherViewModel.CurrentPinText), changedProperties);
+
+        viewModel.UpdateCurrentPin(null);
+        Assert.Equal("当前 PIN：未设置", viewModel.CurrentPinText);
+        viewModel.UpdateCurrentPin(pin);
+        viewModel.UpdateCurrentPinStatus(PinCredentialStatus.ReadFailed);
+        Assert.Equal("当前 PIN：读取失败", viewModel.CurrentPinText);
+        viewModel.UpdateCurrentPin(pin);
+        viewModel.BeginBankFlowSwitch();
+        Assert.Equal("当前 PIN：未设置", viewModel.CurrentPinText);
     }
 
     [Fact]

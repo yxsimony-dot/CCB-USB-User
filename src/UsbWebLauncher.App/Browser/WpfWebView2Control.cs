@@ -32,6 +32,10 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
     private readonly TaskCompletionSource<uint> _browserProcessExited =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CoreWebView2Environment? _environment;
+    private WpfPsbcNavigationDiagnostics? _psbcNavigationDiagnostics;
+    private WpfPsbcInputTrace? _psbcInputTrace;
+    private long _navigationTargetId;
+    private Uri? _navigationTarget;
 
     public WpfWebView2Control(WebView2 control, DownloadDirectorySettings? downloadSettings = null,
         Action<string>? downloadError = null, BrowserSessionDirectory? sessionDirectory = null,
@@ -212,6 +216,12 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         _lifetime.ThrowIfDisposed();
         var coreWebView2 = _control.CoreWebView2 ??
             throw new InvalidOperationException("WebView2 initialization did not produce a browser profile.");
+        if (_browserCapabilities.EnablePsbcClientCertificateHandling)
+            _psbcNavigationDiagnostics ??=
+                await WpfPsbcNavigationDiagnostics.TryCreateAsync(coreWebView2);
+        _lifetime.ThrowIfDisposed();
+        if (_browserCapabilities.EnablePsbcClientCertificateHandling && PsbcInputTrace.ManualObservation)
+            _psbcInputTrace ??= new WpfPsbcInputTrace(coreWebView2, _sessionToken);
         if (_browserCapabilities.EnablePsbcClientCertificateHandling &&
             _psbcCertificateDiagnostics is not null &&
             !_clientCertificateHandlerRegistered)
@@ -386,6 +396,8 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         Release("stop-navigation", () => _control.CoreWebView2?.Stop());
         Release("download-handler", () => _downloadDirectory?.Dispose());
         Release("popup-handler", () => _popupHandler?.Dispose());
+        Release("navigation-diagnostics", () => _psbcNavigationDiagnostics?.Dispose());
+        Release("input-diagnostics", () => _psbcInputTrace?.Dispose());
         var pendingNavigationStart = _pendingNavigationStart;
         _pendingNavigationStart = null;
         pendingNavigationStart?.TrySetException(
@@ -460,6 +472,15 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         CoreWebView2NavigationStartingEventArgs eventArgs)
     {
         var navigationId = checked((long)eventArgs.NavigationId);
+        _navigationTargetId = navigationId;
+        _navigationTarget = Uri.TryCreate(eventArgs.Uri, UriKind.Absolute, out var target)
+            ? target
+            : null;
+        _psbcNavigationDiagnostics?.BeginNavigation(navigationId);
+        if (_browserCapabilities.EnablePsbcClientCertificateHandling)
+            CertificateLoginDiagnostics.Write("psbc-navigation-started",
+                new { navigationId, isRedirect = eventArgs.IsRedirected,
+                    isPsbcOrigin = PsbcNavigationContinuation.IsBankOrigin(_navigationTarget) });
         var pending = _pendingNavigationStart;
         _pendingNavigationStart = null;
         if (_navigationSessions.TryBindNavigationId(navigationId))
@@ -537,6 +558,19 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
         var navigationId = checked((long)eventArgs.NavigationId);
         var isSuccess = eventArgs.IsSuccess;
         var errorStatus = eventArgs.WebErrorStatus.ToString();
+        var target = _navigationTargetId == navigationId ? _navigationTarget : null;
+        var networkError = _psbcNavigationDiagnostics?.GetError(navigationId);
+        if (_browserCapabilities.EnablePsbcClientCertificateHandling)
+        {
+            CertificateLoginDiagnostics.Write("psbc-navigation-completed",
+                new { navigationId, isSuccess, errorStatus, networkError,
+                    httpStatusCode = eventArgs.HttpStatusCode,
+                    isPsbcOrigin = PsbcNavigationContinuation.IsBankOrigin(target) });
+            if (!isSuccess && networkError is not null)
+                errorStatus = $"{errorStatus} ({networkError})";
+            else if (!isSuccess && eventArgs.HttpStatusCode >= 400)
+                errorStatus = $"{errorStatus} (HTTP {eventArgs.HttpStatusCode})";
+        }
         try
         {
             // WebView2 does not attach a NavigationId to ClientCertificateRequested.
@@ -549,7 +583,8 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             {
                 NavigationCompleted?.Invoke(
                     this,
-                    new(navigationId, isSuccess, errorStatus));
+                    new(navigationId, isSuccess, errorStatus,
+                        eventArgs.HttpStatusCode, target, networkError));
             }
         }
         catch
@@ -576,6 +611,10 @@ public sealed class WpfWebView2Control : IWebView2Control, IAsyncDisposable
             var belongsToActiveSession = _navigationSessions.TryEnterCertificateRequest(
                 out certificateRequestLease,
                 out var authenticationBindingTask);
+            if (_browserCapabilities.EnablePsbcClientCertificateHandling)
+                CertificateLoginDiagnostics.Write("psbc-certificate-request",
+                    new { belongsToActiveSession, isProxy = eventArgs.IsProxy,
+                        candidateCount = eventArgs.MutuallyTrustedCertificates.Count });
             var handler = belongsToActiveSession
                 ? _clientCertificateHandler ?? ((_, _) =>
                     ValueTask.FromResult(WebClientCertificateSelection.Deny()))

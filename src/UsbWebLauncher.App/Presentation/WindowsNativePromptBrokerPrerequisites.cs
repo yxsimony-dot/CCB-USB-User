@@ -127,6 +127,7 @@ internal sealed class WindowsNativePromptBrokerPrerequisites
     private readonly string _policyPath;
     private readonly INativePromptBrokerManager _manager;
     private readonly INativePromptBrokerElevationLauncher _elevation;
+    private readonly Func<string, bool> _fileExists;
     private readonly SemaphoreSlim _operation = new(1, 1);
     private NativePromptBrokerPrerequisiteState _state;
 
@@ -151,12 +152,14 @@ internal sealed class WindowsNativePromptBrokerPrerequisites
         string brokerExecutablePath,
         string policyPath,
         INativePromptBrokerManager manager,
-        INativePromptBrokerElevationLauncher elevation)
+        INativePromptBrokerElevationLauncher elevation,
+        Func<string, bool>? fileExists = null)
     {
         _brokerExecutablePath = Path.GetFullPath(brokerExecutablePath);
         _policyPath = Path.GetFullPath(policyPath);
         _manager = manager ?? throw new ArgumentNullException(nameof(manager));
         _elevation = elevation ?? throw new ArgumentNullException(nameof(elevation));
+        _fileExists = fileExists ?? File.Exists;
         _state = isRequired
             ? new(true, false, false, "正在检查本机认证组件。")
             : NativePromptBrokerPrerequisiteState.NotRequired;
@@ -176,6 +179,11 @@ internal sealed class WindowsNativePromptBrokerPrerequisites
         await _operation.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
+            if (!CheckPackage(requirePolicy: true))
+            {
+                return false;
+            }
+
             Publish(CurrentState with { StatusText = "正在请求管理员确认。" });
             var result = await _elevation.RunAsync(
                 _brokerExecutablePath,
@@ -295,6 +303,11 @@ internal sealed class WindowsNativePromptBrokerPrerequisites
         await _operation.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
+            if (!CheckPackage(requirePolicy: false))
+            {
+                return false;
+            }
+
             Publish(CurrentState with { StatusText = "正在请求管理员确认卸载。" });
             var result = await _elevation.RunAsync(
                 _brokerExecutablePath,
@@ -320,6 +333,25 @@ internal sealed class WindowsNativePromptBrokerPrerequisites
         {
             _operation.Release();
         }
+    }
+
+    private bool CheckPackage(bool requirePolicy)
+    {
+        var missingFile = !_fileExists(_brokerExecutablePath)
+            ? WindowsNativePromptBrokerInstaller.BrokerFileName
+            : requirePolicy && !_fileExists(_policyPath)
+                ? WindowsNativePromptBrokerInstaller.PolicyFileName
+                : null;
+        if (missingFile is null)
+        {
+            return true;
+        }
+
+        Publish(CurrentState with
+        {
+            StatusText = $"程序文件不完整：缺少 broker\\{missingFile}。请从完整发布目录启动，或使用完整安装包修复。"
+        });
+        return false;
     }
 
     private void Publish(NativePromptBrokerPrerequisiteState state)

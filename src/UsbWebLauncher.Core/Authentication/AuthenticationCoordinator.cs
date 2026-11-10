@@ -25,6 +25,7 @@ public sealed class AuthenticationCoordinator :
     private readonly Queue<AuthenticationState> _pendingStateChanges = new();
     private IClientCertificateTokenUnlockSession? _unlockSession;
     private bool _browserNativePrepared;
+    private bool _psbcManualPinAttempt;
     private bool _businessSuspended;
     private bool HasPreparedAuthentication => _browserNativePrepared || _unlockSession is not null;
     private ClientCertificatePin? _continuationPin;
@@ -128,6 +129,32 @@ public sealed class AuthenticationCoordinator :
         null,
         Message: "Waiting for the configured security device.");
 
+    public async Task ReleaseAfterBrowserFailureAsync(CancellationToken cancellationToken = default)
+    {
+        await _transitionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            // A failed navigation is not a removal. Keep presence and the attempt
+            // budget, and do not overwrite a more specific authentication failure.
+            await ReleaseAuthenticationResourcesAsync().ConfigureAwait(false);
+            _activeAttempt = null;
+            if (_devicePresent && CurrentState.Stage is not (
+                AuthenticationStage.Failed or AuthenticationStage.Incompatible or
+                AuthenticationStage.RequiresPinSetup))
+                SetState(new(
+                    AuthenticationStage.Failed,
+                    CurrentState.InsertionCycleId,
+                    AuthenticationErrorCategory.UnknownFailure,
+                    Message: "银行页面加载未完成，本轮认证已停止。"));
+        }
+        finally
+        {
+            _transitionGate.Release();
+            PublishPendingStateChanges();
+        }
+    }
+
     public async Task HandleDevicePresenceAsync(
         bool isTargetDevicePresent,
         CancellationToken cancellationToken = default)
@@ -225,11 +252,14 @@ public sealed class AuthenticationCoordinator :
                 result.Status == ClientCertificateRequestMatchStatus.CertificateMissing ||
                 result.Status == ClientCertificateRequestMatchStatus.CertificateConflict)
             {
-                if (CurrentState.Stage != AuthenticationStage.AwaitingCertificate)
+                var useManualPin = result.Status == ClientCertificateRequestMatchStatus.Selected &&
+                    CanSelectPsbcCertificateWithManualPin;
+                if (CurrentState.Stage != AuthenticationStage.AwaitingCertificate && !useManualPin)
                 {
                     return ClientCertificateRequestMatchResult.TokenNotUnlocked();
                 }
 
+                _psbcManualPinAttempt = useManualPin;
                 _activeAttempt = new(
                     CurrentState.InsertionCycleId!.Value,
                     ++_nextCertificateRequestId,
@@ -329,13 +359,13 @@ public sealed class AuthenticationCoordinator :
         try
         {
             ThrowIfDisposed();
-            var canUsePsbcBrowserSelection = CanUsePsbcBrowserCertificateSelection;
+            var canSelectWithManualPin = CanSelectPsbcCertificateWithManualPin;
             if (_businessSuspended || !_devicePresent ||
-                (!HasPreparedAuthentication && !canUsePsbcBrowserSelection) ||
+                (!HasPreparedAuthentication && !canSelectWithManualPin) ||
                 (_psbcRuntimeContext is not null && _psbcAttemptConsumed) ||
                 (CurrentState.Stage != AuthenticationStage.AwaitingCertificate &&
                  !(_browserNativePrepared && CurrentState.Stage == AuthenticationStage.Ready) &&
-                 !canUsePsbcBrowserSelection) ||
+                 !canSelectWithManualPin) ||
                 CurrentState.InsertionCycleId is not long cycleId)
             {
                 return;
@@ -400,7 +430,9 @@ public sealed class AuthenticationCoordinator :
                 return existingAuthorization;
             }
 
-            if (_authentication.NativePromptContinuation is not { Enabled: true })
+            // Certificate authorization does not require an automatically supplied PIN.
+            if (_psbcManualPinAttempt ||
+                _authentication.NativePromptContinuation is not { Enabled: true })
             {
                 var authorization = new ClientCertificateSelectionAuthorization();
                 Interlocked.Exchange(ref _selectionAuthorization, authorization);
@@ -947,25 +979,10 @@ public sealed class AuthenticationCoordinator :
             }
         }
 
-        ClientCertificateValidationStamp? stamp;
         try
         {
-            stamp = await _stampStore.ReadAsync(_authentication.Id, cancellationToken)
-                .ConfigureAwait(false);
-            var hasMatchingStamp = HasMatchingStamp(stamp);
-            var hasPendingStamp = HasPendingStamp(stamp);
-            if (!hasMatchingStamp && !hasPendingStamp)
-            {
-                SetState(new(
-                    AuthenticationStage.RequiresPinSetup,
-                    cycleId,
-                    stamp is null
-                        ? AuthenticationErrorCategory.CredentialsUnavailable
-                        : AuthenticationErrorCategory.ValidationStampInvalid,
-                    Message: "未设置邮储 PIN；登录网站仍会打开，自动认证暂不可用。"));
-                return;
-            }
-
+            // Browser-native stores intentionally have no local-unlock validation stamp.
+            // Authorization is bound to the certificate request and trusted prompt instead.
             using var pin = await _pinStore.ReadAsync(_authentication.CredentialTargetName, cancellationToken)
                 .ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
@@ -983,11 +1000,11 @@ public sealed class AuthenticationCoordinator :
             {
                 SetState(new(AuthenticationStage.RequiresPinSetup, cycleId,
                     AuthenticationErrorCategory.CredentialsUnavailable,
-                    Message: "未设置邮储 PIN；登录网站仍会打开，自动认证暂不可用。"));
+                    Message: "未设置邮储 PIN；将自动选择匹配证书，密码请在安全窗口中手动输入。"));
                 return;
             }
 
-            _validationStampPending = hasPendingStamp;
+            _validationStampPending = false;
             Interlocked.Exchange(
                 ref _continuationPin,
                 ClientCertificatePin.CopyOf(pin.AsMemory()))?.Dispose();
@@ -1090,6 +1107,7 @@ public sealed class AuthenticationCoordinator :
     private async ValueTask ReleaseAuthenticationResourcesAsync()
     {
         _browserNativePrepared = false;
+        _psbcManualPinAttempt = false;
         _validationStampPending = false;
         _navigationBinding = null;
         _psbcPreparedBinding = null;
@@ -1220,12 +1238,7 @@ public sealed class AuthenticationCoordinator :
 
         if (selection.Status == PsbcClientCertificateSelectionStatus.Selected)
         {
-            if (CanUsePsbcBrowserCertificateSelection)
-            {
-                return ClientCertificateRequestMatchResult.BrowserSelectionRequired();
-            }
-
-            if (!HasPreparedAuthentication ||
+            if ((!HasPreparedAuthentication && !CanSelectPsbcCertificateWithManualPin) ||
                 !IsCurrentPsbcBinding(_psbcPreparedBinding))
             {
                 return ClientCertificateRequestMatchResult.TokenNotUnlocked();
@@ -1376,9 +1389,11 @@ public sealed class AuthenticationCoordinator :
         return AuthenticationErrorCategory.DeviceUnavailable;
     }
 
-    private bool CanUsePsbcBrowserCertificateSelection =>
+    private bool CanSelectPsbcCertificateWithManualPin =>
         _psbcRuntimeContext is not null &&
+        _authentication.UsesBrowserNativeAuthentication &&
         _devicePresent &&
+        !_pinReuseBlocked &&
         CurrentState.Stage == AuthenticationStage.RequiresPinSetup &&
         IsCurrentPsbcBinding(_psbcPreparedBinding);
 

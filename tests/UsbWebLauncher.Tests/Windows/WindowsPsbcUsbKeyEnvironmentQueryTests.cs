@@ -84,7 +84,7 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
             registered: true,
             providerType: 1);
         var native = new StubCryptoProviderProbeNative("PSBC-CONTAINER");
-        var reader = new WindowsCspTokenEvidenceReader(provider, native);
+        var reader = new WindowsCspTokenEvidenceReader(provider, native, (_, _) => []);
 
         var result = reader.Query(new PsbcTokenQuery(
             UsbKeyVendorFamily.Tendyron,
@@ -92,6 +92,7 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
 
         Assert.True(result.IsPresent);
         Assert.Equal("PSBC-CONTAINER", result.TokenIdentity);
+        Assert.Equal(["PSBC-CONTAINER"], result.ContainerIdentities);
         Assert.Equal(1, native.AcquireCount);
         Assert.Equal(2, native.ReadCount);
         Assert.Equal(1, native.ReleaseCount);
@@ -103,8 +104,8 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
         var provider = new StubProviderReader(
             registered: true,
             providerType: 1);
-        var native = new StubCryptoProviderProbeNative(containerIdentity: null);
-        var reader = new WindowsCspTokenEvidenceReader(provider, native);
+        var native = new StubCryptoProviderProbeNative();
+        var reader = new WindowsCspTokenEvidenceReader(provider, native, (_, _) => []);
 
         var result = reader.Query(new PsbcTokenQuery(
             UsbKeyVendorFamily.Tendyron,
@@ -114,6 +115,117 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
         Assert.Null(result.TokenIdentity);
         Assert.Equal(1, native.ReleaseCount);
     }
+
+    [Fact]
+    public void CspTokenReader_EnumeratesAllContainersAndVerifiesReaderQualifiedAlias()
+    {
+        const string qualified = @"\\.\Synthetic Reader\SIGNING";
+        var native = new StubCryptoProviderProbeNative("EXCHANGE", "SIGNING");
+        var result = ReadToken(native, [qualified]);
+
+        Assert.True(result.IsPresent);
+        Assert.Equal(["EXCHANGE", "SIGNING", qualified], result.ContainerIdentities);
+        Assert.StartsWith("csp-containers:", result.TokenIdentity);
+        Assert.Equal(2, native.AcquireCount);
+        Assert.Equal(2, native.ReleaseCount);
+        Assert.Equal(new uint[] { 1, 0, 0 }, native.EnumerationFlags);
+        Assert.All(native.AcquireFlags, flags => Assert.Equal(0xF0000040u, flags));
+    }
+
+    [Theory]
+    [InlineData(false, "SIGNING")]
+    [InlineData(true, "OTHER")]
+    public void CspTokenReader_RejectsAliasWhenDriverCannotVerifyIt(bool acquireSucceeds, string resolvedName)
+    {
+        const string qualified = @"\\.\Synthetic Reader\SIGNING";
+        var native = new StubCryptoProviderProbeNative("EXCHANGE", "SIGNING")
+        {
+            AliasAcquireSucceeds = acquireSucceeds,
+            ResolvedAliasName = resolvedName
+        };
+
+        var result = ReadToken(native, [qualified]);
+
+        Assert.DoesNotContain(qualified, result.ContainerIdentities!);
+        Assert.Equal(["EXCHANGE", "SIGNING"], result.ContainerIdentities);
+        Assert.Equal(acquireSucceeds ? 2 : 1, native.ReleaseCount);
+    }
+
+    [Theory]
+    [InlineData(@"\\.\Other Reader\UNENUMERATED")]
+    [InlineData(@"\\.\Reader\folder\SIGNING")]
+    [InlineData(@"\\.\Reader\")]
+    [InlineData(@"\\.\SIGNING")]
+    [InlineData(@"\\.\\SIGNING")]
+    [InlineData(@"Other Reader\SIGNING")]
+    public void CspTokenReader_DoesNotOpenUnrelatedOrMalformedAliases(string qualified)
+    {
+        var native = new StubCryptoProviderProbeNative("SIGNING");
+
+        var result = ReadToken(native, [qualified]);
+
+        Assert.Equal(["SIGNING"], result.ContainerIdentities);
+        Assert.Equal(1, native.AcquireCount);
+    }
+
+    [Fact]
+    public void CspTokenReader_IdentityIsOrderIndependentAndChangesWhenAnyContainerChanges()
+    {
+        var original = ReadToken(new("FIRST", "SECOND"));
+        var reordered = ReadToken(new("SECOND", "FIRST"));
+        var changed = ReadToken(new("FIRST", "THIRD"));
+        var aliasChanged = ReadToken(new("FIRST", "SECOND"), [@"\\.\Reader\SECOND"]);
+
+        Assert.Equal(original.TokenIdentity, reordered.TokenIdentity);
+        Assert.NotEqual(original.TokenIdentity, changed.TokenIdentity);
+        Assert.NotEqual(original.TokenIdentity, aliasChanged.TokenIdentity);
+    }
+
+    [Fact]
+    public void CspTokenReader_DiscardsPartialEnumerationOnNativeError()
+    {
+        var native = new StubCryptoProviderProbeNative("FIRST") { EnumerationError = 5 };
+
+        var result = ReadToken(native);
+
+        Assert.False(result.IsPresent);
+        Assert.Null(result.ContainerIdentities);
+        Assert.Equal(1, native.ReleaseCount);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("FIRST")]
+    public void CspTokenReader_RejectsEmptyOrRepeatedContainer(string second)
+    {
+        var native = new StubCryptoProviderProbeNative("FIRST", second);
+
+        var result = ReadToken(native);
+
+        Assert.False(result.IsPresent);
+        Assert.Equal(1, native.ReleaseCount);
+    }
+
+    [Fact]
+    public void CspTokenReader_BoundsEnumerationAndReleasesProvider()
+    {
+        var native = new StubCryptoProviderProbeNative(
+            Enumerable.Range(0, 65).Select(index => $"CONTAINER-{index}").ToArray());
+
+        var result = ReadToken(native);
+
+        Assert.False(result.IsPresent);
+        Assert.Equal(65, native.ReadCount);
+        Assert.Equal(1, native.ReleaseCount);
+    }
+
+    private static PsbcTokenEvidence ReadToken(
+        StubCryptoProviderProbeNative native,
+        IReadOnlyList<string>? aliases = null) =>
+        new WindowsCspTokenEvidenceReader(
+                new StubProviderReader(true, 1), native, (_, _) => aliases ?? [])
+            .Query(new(UsbKeyVendorFamily.Tendyron, @"USB\VID_1780&PID_0401\SYNTHETIC"));
 
     private sealed class StubServiceReader(PsbcServiceState state)
         : IWindowsServiceStateReader
@@ -170,12 +282,19 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
         }
     }
 
-    private sealed class StubCryptoProviderProbeNative(string? containerIdentity)
+    private sealed class StubCryptoProviderProbeNative(params string[] containers)
         : IWindowsCryptoProviderProbeNative
     {
+        private int containerIndex;
+        private string? alias;
         public int AcquireCount { get; private set; }
         public int ReadCount { get; private set; }
         public int ReleaseCount { get; private set; }
+        public List<uint> EnumerationFlags { get; } = [];
+        public List<uint> AcquireFlags { get; } = [];
+        public bool AliasAcquireSucceeds { get; init; } = true;
+        public string? ResolvedAliasName { get; init; }
+        public int EnumerationError { get; init; } = 259;
 
         public bool Acquire(
             out IntPtr provider,
@@ -185,8 +304,12 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
             uint flags)
         {
             AcquireCount++;
-            provider = new IntPtr(1);
-            return true;
+            AcquireFlags.Add(flags);
+            alias = containerName;
+            provider = containerName is null
+                ? new IntPtr(1)
+                : AliasAcquireSucceeds ? new IntPtr(2) : IntPtr.Zero;
+            return provider != IntPtr.Zero;
         }
 
         public bool GetProviderParameter(
@@ -197,13 +320,29 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
             uint flags)
         {
             ReadCount++;
-            if (containerIdentity is null)
+            string name;
+            if (parameter == 2)
             {
-                dataLength = 0;
-                return false;
+                EnumerationFlags.Add(flags);
+                if (flags == 1)
+                {
+                    containerIndex = 0;
+                }
+                if (containerIndex >= containers.Length)
+                {
+                    dataLength = 0;
+                    return false;
+                }
+                name = containers[containerIndex++];
+            }
+            else
+            {
+                Assert.Equal(6u, parameter);
+                Assert.Equal(new IntPtr(2), provider);
+                name = ResolvedAliasName ?? alias!.Split('\\')[^1];
             }
 
-            var encoded = Encoding.Default.GetBytes(containerIdentity + "\0");
+            var encoded = Encoding.ASCII.GetBytes(name + "\0");
             dataLength = checked((uint)encoded.Length);
             if (data is not null)
             {
@@ -218,5 +357,7 @@ public sealed class WindowsPsbcUsbKeyEnvironmentQueryTests
             ReleaseCount++;
             return true;
         }
+
+        public int GetLastError() => EnumerationError;
     }
 }

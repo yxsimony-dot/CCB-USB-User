@@ -6,8 +6,31 @@ using System.Collections.Concurrent;
 
 namespace UsbWebLauncher.Tests.Browser;
 
-public sealed class WebView2BrowserHostTests
+public sealed partial class WebView2BrowserHostTests
 {
+    [Fact]
+    public async Task NavigationFailureWaitsForAuthenticationCleanupBeforeReachingCaller()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var control = new RecordingWebViewControl();
+        var reporter = new RecordingAuthenticationReporter { FailureCleanup = release.Task };
+        var handler = new RecordingCertificateHandler(true) { ResultAttempt = new(1, 1, 1) };
+        await using var host = new WebView2BrowserHost(control);
+        await host.ConfigureClientCertificateAuthenticationAsync(handler, reporter, TimeSpan.FromSeconds(30));
+        await host.InitializeAsync();
+        var navigation = host.NavigateAsync(new Uri("https://b2b.ccb.com/"));
+        await control.NavigationInvoked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await control.RaiseClientCertificateRequestAsync(CreateMatchingWebRequest());
+        control.CompleteNavigation(success: false, "Unknown (ERR_CONNECTION_CLOSED)");
+        await reporter.FailureReported.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var completedBeforeCleanup = navigation.IsCompleted;
+        release.TrySetResult();
+        var error = await Assert.ThrowsAsync<BrowserNavigationException>(() => navigation);
+
+        Assert.False(completedBeforeCleanup);
+        Assert.Contains("ERR_CONNECTION_CLOSED", error.Message);
+    }
+
     [Fact]
     public async Task SuccessfulLandingPageWithoutCertificate_AllowsWebTriggeredCertificateNavigation()
     {
@@ -1575,12 +1598,13 @@ public sealed class WebView2BrowserHostTests
 
         public WebNavigationStartingEventArgs RaiseExternalNavigationStarting(
             long navigationId,
-            Uri? target = null)
+            Uri? target = null,
+            bool isUserInitiated = true)
         {
             LastNavigationId = navigationId;
             var eventArgs = new WebNavigationStartingEventArgs(
                 navigationId,
-                isUserInitiated: true,
+                isUserInitiated,
                 target);
             NavigationStarting?.Invoke(this, eventArgs);
             return eventArgs;
@@ -1594,8 +1618,10 @@ public sealed class WebView2BrowserHostTests
         public void CompleteNavigation(bool success, string? error = null) =>
             CompleteNavigation(LastNavigationId, success, error);
 
-        public void CompleteNavigation(long navigationId, bool success, string? error = null) =>
-            NavigationCompleted?.Invoke(this, new(navigationId, success, error));
+        public void CompleteNavigation(long navigationId, bool success, string? error = null,
+            int httpStatusCode = 0, Uri? target = null, string? networkError = null) =>
+            NavigationCompleted?.Invoke(this, new(navigationId, success, error,
+                httpStatusCode, target, networkError));
 
         public void AllowRegistration() => _continueRegistration.TrySetResult();
 
@@ -1670,6 +1696,8 @@ public sealed class WebView2BrowserHostTests
 
     private sealed class RecordingAuthenticationReporter : IBrowserClientCertificateAuthenticationReporter
     {
+        public Task FailureCleanup { get; init; } = Task.CompletedTask;
+
         public AuthenticationAttempt? CertificateSelectedAttempt { get; private set; }
 
         public AuthenticationAttempt? SuccessAttempt { get; private set; }
@@ -1750,7 +1778,7 @@ public sealed class WebView2BrowserHostTests
         {
             FailureAttempt = attempt;
             FailureReported.TrySetResult();
-            return Task.CompletedTask;
+            return FailureCleanup;
         }
 
         public Task ReportTimeoutAsync(AuthenticationAttempt attempt, CancellationToken cancellationToken = default)
